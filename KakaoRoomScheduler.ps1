@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.6.0'
+$script:AppVersion = '4.7.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -1026,8 +1026,12 @@ function Open-KakaoSearchBox([object]$Layout, [object[]]$Words) {
 
 # 검색 결과에는 '친구' '채팅방' 같은 구분 머리글이 섞여 있어 첫 줄이 방이 아닐 수 있습니다.
 # 읽은 글자 중 검색어와 가장 비슷한 줄을 찾아 그 줄을 누릅니다.
+# 이름을 견주기 위한 형태로 다듬습니다.
+# ☆ ♥ 이모지 같은 기호는 화면에서 읽히지 않는 경우가 많아,
+# 양쪽 모두에서 떼어 내고 글자와 숫자만으로 견줍니다.
 function ConvertTo-CompareKey([string]$Text) {
-    return (([string]$Text) -replace '\s', '').ToLowerInvariant()
+    $clean = ([string]$Text) -replace '[^0-9A-Za-z가-힣]', ''
+    return $clean.ToLowerInvariant()
 }
 
 # OCR 은 글자를 조금씩 틀리게 읽습니다. 겹치는 글자 비율로 비슷한 정도를 봅니다.
@@ -2029,6 +2033,7 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
             }
             if ($null -eq $hit) { break }
 
+            if (Test-RunInterrupted) { break }
             $remaining.Remove($hitName)
             $processed++
             Set-StatusPill ("발송 중 $($processed)/$($Targets.Count) — $($hitName)") 'run'
@@ -2046,12 +2051,11 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
                 if ($BatchSize -gt 0 -and $BatchRestMinutes -gt 0 -and ($processed % $BatchSize) -eq 0) {
                     Write-RunLog "묶음 $($BatchSize)개를 처리했습니다. $($BatchRestMinutes)분 쉽니다."
                     Set-StatusPill "$($BatchRestMinutes)분 쉬는 중 — $($processed)/$($Targets.Count)" 'wait'
-                    for ($s = 0; $s -lt ($BatchRestMinutes * 60); $s++) {
-                        Start-Sleep -Seconds 1
-                        [System.Windows.Forms.Application]::DoEvents()
-                    }
+                    if (Wait-Interruptible ($BatchRestMinutes * 60)) { break }
+                } elseif ($IntervalSeconds -gt 0) {
+                    if (Wait-Interruptible $IntervalSeconds) { break }
                 } else {
-                    Start-Sleep -Seconds $IntervalSeconds
+                    if (Test-RunInterrupted) { break }
                 }
             }
         }
@@ -2439,6 +2443,17 @@ if ($SelfTest) {
         if (-not $special.Contains($token)) { throw "특수 기호 변환 실패: $token 이 없습니다 — $special" }
     }
     if ((ConvertTo-SendKeysText '보통 문구') -ne '보통 문구') { throw '일반 문구가 잘못 변환되었습니다' }
+
+    # 특수문자가 섞인 방 이름도 찾아야 합니다. 화면에서는 ☆ 같은 기호가 안 읽힙니다.
+    if ((ConvertTo-CompareKey '☆자유로운 홍보방☆') -ne '자유로운홍보방') { throw '기호 제거 실패' }
+    if ((ConvertTo-CompareKey '마케팅 초이스&핫소스') -ne '마케팅초이스핫소스') { throw '앰퍼샌드 제거 실패' }
+    if ((ConvertTo-CompareKey '[공지] A/S 문의') -ne '공지as문의') { throw '괄호·슬래시 제거 실패' }
+    $starSample = @([pscustomobject]@{ Text = '자유로운 홍보방'; Left = 80; Top = 20 })
+    if ($null -eq (Find-SearchResultLine $starSample '☆자유로운 홍보방☆' 325)) { throw '기호 있는 이름 매칭 실패' }
+    $ampSample = @([pscustomobject]@{ Text = '마케팅 초이스 핫소스'; Left = 80; Top = 20 })
+    if ($null -eq (Find-SearchResultLine $ampSample '마케팅 초이스&핫소스' 325)) { throw '앰퍼샌드 이름 매칭 실패' }
+    $wrongSample = @([pscustomobject]@{ Text = '전혀 다른 방'; Left = 80; Top = 20 })
+    if ($null -ne (Find-SearchResultLine $wrongSample '☆자유로운 홍보방☆' 325)) { throw '다른 방을 잘못 매칭' }
 
     if ($script:TourSteps.Count -lt 3) { throw '가이드 투어 단계가 비어 있습니다' }
     foreach ($step in $script:TourSteps) {
@@ -2897,7 +2912,7 @@ $sidebar.Controls.Add($lblHint)
 # ----- 헤더 -----
 $header = New-Object System.Windows.Forms.Panel
 $header.Location = New-Object System.Drawing.Point(220, 0)
-$header.Size = New-Object System.Drawing.Size(840, 80)
+$header.Size = New-Object System.Drawing.Size(840, 96)
 $header.BackColor = $Theme.Bg
 $script:form.Controls.Add($header)
 
@@ -2906,13 +2921,13 @@ $script:lblPageTitle.Text = '발송 준비'
 $script:lblPageTitle.Font = $FontPage
 $script:lblPageTitle.ForeColor = $Theme.Ink
 $script:lblPageTitle.BackColor = $Theme.Bg
-$script:lblPageTitle.Location = New-Object System.Drawing.Point(28, 26)
-$script:lblPageTitle.Size = New-Object System.Drawing.Size(230, 36)
+$script:lblPageTitle.Location = New-Object System.Drawing.Point(28, 12)
+$script:lblPageTitle.Size = New-Object System.Drawing.Size(440, 32)
 $header.Controls.Add($script:lblPageTitle)
 
 $script:pillStatus = New-Object System.Windows.Forms.Panel
-$script:pillStatus.Location = New-Object System.Drawing.Point(266, 26)
-$script:pillStatus.Size = New-Object System.Drawing.Size(250, 38)
+$script:pillStatus.Location = New-Object System.Drawing.Point(28, 50)
+$script:pillStatus.Size = New-Object System.Drawing.Size(184, 32)
 $script:pillStatus.BackColor = $Theme.Bg
 $script:pillStatus.Add_Paint({
     param($sender, $e)
@@ -2938,10 +2953,24 @@ $script:pillStatus.Add_Paint({
 })
 $header.Controls.Add($script:pillStatus)
 
+# 지금 예약과 반복 설정을 위쪽에 한 줄로 보여 줍니다.
+$script:lblHeaderPlan = New-Object System.Windows.Forms.Label
+$script:lblHeaderPlan.Font = $FontSmall
+$script:lblHeaderPlan.ForeColor = $Theme.Sub
+$script:lblHeaderPlan.BackColor = $Theme.Bg
+$script:lblHeaderPlan.Location = New-Object System.Drawing.Point(222, 46)
+$script:lblHeaderPlan.Size = New-Object System.Drawing.Size(268, 40)
+$script:lblHeaderPlan.Cursor = [System.Windows.Forms.Cursors]::Hand
+$header.Controls.Add($script:lblHeaderPlan)
+
 # 어느 화면에 있든 바로 누를 수 있게 위쪽에 둡니다.
-$btnHeaderEdit  = New-AppButton $header '내용 수정' 528 24 112 42
-$btnHeaderStart = New-AppButton $header '발송 시작' 648 24 124 42 'primary'
-$btnHelp = New-AppButton $header '?' 780 24 36 42 'default'
+$btnHeaderEdit  = New-AppButton $header '내용 수정' 498 26 104 46
+$btnHeaderStart = New-AppButton $header '발송 시작' 610 26 132 46 'primary'
+# 예약 대기 중이거나 발송 중일 때 [발송 시작] 자리에 나타납니다.
+$script:btnHeaderStop = New-AppButton $header '중지' 610 26 132 46 'danger'
+$script:btnHeaderStop.Visible = $false
+
+$btnHelp = New-AppButton $header '?' 750 26 36 46 'default'
 $btnHelp.Font = $FontStrong
 $tipHelp = New-Object System.Windows.Forms.ToolTip
 $tipHelp.SetToolTip($btnHelp, '사용 가이드 다시 보기')
@@ -2950,8 +2979,8 @@ $tipHelp.SetToolTip($btnHeaderEdit, '보낼 문구와 첨부를 고칩니다')
 
 # ----- 페이지 컨테이너 -----
 $pageHost = New-Object System.Windows.Forms.Panel
-$pageHost.Location = New-Object System.Drawing.Point(220, 80)
-$pageHost.Size = New-Object System.Drawing.Size(840, 660)
+$pageHost.Location = New-Object System.Drawing.Point(220, 96)
+$pageHost.Size = New-Object System.Drawing.Size(840, 644)
 $pageHost.BackColor = $Theme.Bg
 $script:form.Controls.Add($pageHost)
 
@@ -2959,7 +2988,7 @@ $script:pages = @{}
 function New-Page([string]$Key) {
     $panel = New-Object System.Windows.Forms.Panel
     $panel.Location = New-Object System.Drawing.Point(0, 0)
-    $panel.Size = New-Object System.Drawing.Size(840, 660)
+    $panel.Size = New-Object System.Drawing.Size(840, 644)
     $panel.BackColor = $Theme.Bg
     $panel.Visible = $false
     # 카드가 화면보다 길어지면 스크롤로 볼 수 있게 합니다.
@@ -3100,7 +3129,120 @@ $btnTestSend = New-AppButton $cardTest '테스트 발송' 24 156 200 40 'primary
 $btnTestDry  = New-AppButton $cardTest '방 확인만 (전송 안 함)' 236 156 200 40
 [void](New-CardLabel $cardTest '기본값은 나와의 채팅이라 아무에게도 가지 않습니다.' 452 162 308 30 $FontSmall $Theme.Muted)
 
-$cardLimit = New-Card $pageRun 28 400 784 306 '발송 제한 및 묶음 발송' '보내면 안 되는 시간과 날짜, 그리고 몇 개마다 쉴지 정할 수 있습니다.'
+$cardSchedule = New-Card $pageRun 28 400 784 350 '지금 실행 및 예약'
+[void](New-CardLabel $cardSchedule '예약 시각' 24 56 100 22 $FontSmall $Theme.Muted)
+$script:dtSchedule = New-Object System.Windows.Forms.DateTimePicker
+$script:dtSchedule.Format = 'Custom'
+$script:dtSchedule.CustomFormat = 'yyyy-MM-dd  HH:mm:ss'
+$script:dtSchedule.ShowUpDown = $true
+$script:dtSchedule.Location = New-Object System.Drawing.Point(24, 80)
+$script:dtSchedule.Size = New-Object System.Drawing.Size(222, 32)
+$script:dtSchedule.Font = $FontBase
+try { $script:dtSchedule.Value = [datetime]::ParseExact([string]$script:config.ScheduledAt, 'yyyy-MM-dd HH:mm:ss', $null) }
+catch { $script:dtSchedule.Value = (Get-Date).Date.AddDays(1) }
+if ($script:dtSchedule.Value -lt $script:dtSchedule.MinDate -or $script:dtSchedule.Value -le (Get-Date)) { $script:dtSchedule.Value = (Get-Date).Date.AddDays(1) }
+$cardSchedule.Controls.Add($script:dtSchedule)
+
+$btnPickSchedule = New-AppButton $cardSchedule '달력에서 고르기' 254 78 148 32
+[void](New-CardLabel $cardSchedule '방 사이 간격(초) — 0이면 쉬지 않음' 424 56 300 22 $FontSmall $Theme.Muted)
+$script:numInterval = New-Object System.Windows.Forms.NumericUpDown
+$script:numInterval.Minimum = 0
+$script:numInterval.Maximum = 300
+$script:numInterval.Value = [Math]::Max(0, [Math]::Min(300, [int]$script:config.IntervalSeconds))
+$script:numInterval.Location = New-Object System.Drawing.Point(424, 80)
+$script:numInterval.Size = New-Object System.Drawing.Size(94, 30)
+$script:numInterval.Font = $FontBase
+$script:numInterval.BorderStyle = 'FixedSingle'
+$cardSchedule.Controls.Add($script:numInterval)
+
+$btnRunNow    = New-AppButton $cardSchedule '지금 실행' 24 134 164 46 'primary'
+$btnArm       = New-AppButton $cardSchedule '예약 시작' 200 134 164 46
+$btnCancelArm = New-AppButton $cardSchedule '예약 취소' 376 134 164 46
+$btnSave      = New-AppButton $cardSchedule '설정 저장' 552 134 164 46 'ghost'
+$btnCancelArm.Enabled = $false
+
+# ----- 반복 발송 -----
+$script:chkRepeat = New-Object System.Windows.Forms.CheckBox
+$script:chkRepeat.Text = '반복 발송 — 한 번 다 보낸 뒤 일정 시간마다 다시 보내기'
+$script:chkRepeat.Checked = [bool]$script:config.RepeatEnabled
+$script:chkRepeat.Location = New-Object System.Drawing.Point(24, 192)
+$script:chkRepeat.Size = New-Object System.Drawing.Size(430, 28)
+$script:chkRepeat.BackColor = $Theme.Card
+$script:chkRepeat.Font = $FontBase
+$cardSchedule.Controls.Add($script:chkRepeat)
+
+$script:numRepeatMinutes = New-Object System.Windows.Forms.NumericUpDown
+$script:numRepeatMinutes.Minimum = 1
+$script:numRepeatMinutes.Maximum = 1440
+$script:numRepeatMinutes.Value = [Math]::Max(1, [Math]::Min(1440, [int]$script:config.RepeatMinutes))
+$script:numRepeatMinutes.Location = New-Object System.Drawing.Point(462, 190)
+$script:numRepeatMinutes.Size = New-Object System.Drawing.Size(80, 30)
+$script:numRepeatMinutes.Font = $FontBase
+$script:numRepeatMinutes.BorderStyle = 'FixedSingle'
+$cardSchedule.Controls.Add($script:numRepeatMinutes)
+[void](New-CardLabel $cardSchedule '분마다 ·  최대' 548 194 92 24 $FontSmall $Theme.Muted)
+
+$script:numRepeatCount = New-Object System.Windows.Forms.NumericUpDown
+$script:numRepeatCount.Minimum = 0
+$script:numRepeatCount.Maximum = 999
+$script:numRepeatCount.Value = [Math]::Max(0, [Math]::Min(999, [int]$script:config.RepeatCount))
+$script:numRepeatCount.Location = New-Object System.Drawing.Point(642, 190)
+$script:numRepeatCount.Size = New-Object System.Drawing.Size(70, 30)
+$script:numRepeatCount.Font = $FontBase
+$script:numRepeatCount.BorderStyle = 'FixedSingle'
+$cardSchedule.Controls.Add($script:numRepeatCount)
+[void](New-CardLabel $cardSchedule '회' 718 194 30 24 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardSchedule '최대 횟수를 0으로 두면 [예약 취소]를 누를 때까지 계속 반복합니다.' 24 224 736 22 $FontSmall $Theme.Muted)
+
+$script:lblCountdown = New-CardLabel $cardSchedule '예약이 설정되지 않았습니다.' 24 250 736 26 $FontStrong $Theme.Muted
+[void](New-CardLabel $cardSchedule '방해금지 시간대, 주말·공휴일 제외, 묶음 발송 같은 상세 설정은 [설정] 화면에 있습니다.' 24 282 736 22 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardSchedule '예약 시각까지 이 프로그램과 PC 카카오톡을 모두 켜 두어야 합니다. 화면 잠금·절전 상태에서는 동작하지 않습니다.' 24 304 736 22 $FontSmall $Theme.Muted)
+
+# ===========================================================================
+# 페이지 4 — 설정
+# ===========================================================================
+$pageSettings = New-Page 'settings'
+
+$cardStatus = New-Card $pageSettings 28 12 784 240 '카카오톡 연결 상태' '좌표를 맞출 필요는 없습니다. 카카오톡 화면 구조를 그때그때 읽어 자동으로 찾습니다.'
+$script:lblKakaoState = New-CardLabel $cardStatus '확인 중입니다...' 24 78 736 104 $FontBase $Theme.Sub
+$btnCheckKakao = New-AppButton $cardStatus '지금 확인' 24 190 150 40 'primary'
+$btnOpenKakao = New-AppButton $cardStatus '카카오톡 창 앞으로 가져오기' 184 190 220 40
+
+$cardUpdate = New-Card $pageSettings 28 264 784 236 '업데이트' '최신 배포를 확인합니다.'
+$script:lblUpdateState = New-CardLabel $cardUpdate "현재 버전 v$($script:AppVersion)" 24 76 736 46 $FontBase $Theme.Ink
+$btnCheckUpdate  = New-AppButton $cardUpdate '업데이트 확인' 24 130 160 40
+$script:btnDoUpdate = New-AppButton $cardUpdate '지금 업데이트' 194 130 160 40 'primary'
+$script:btnDoUpdate.Enabled = $false
+$btnClearLogFiles = New-AppButton $cardUpdate '로그 파일 모두 지우기' 364 130 200 40 'danger'
+$script:chkAutoUpdate = New-Object System.Windows.Forms.CheckBox
+$script:chkAutoUpdate.Text = '시작할 때 자동 확인'
+$script:chkAutoUpdate.Checked = [bool]$script:config.AutoCheckUpdate
+$script:chkAutoUpdate.Location = New-Object System.Drawing.Point(24, 182)
+$script:chkAutoUpdate.Size = New-Object System.Drawing.Size(240, 28)
+$script:chkAutoUpdate.BackColor = $Theme.Card
+$script:chkAutoUpdate.Font = $FontBase
+$cardUpdate.Controls.Add($script:chkAutoUpdate)
+
+$script:chkAutoDownload = New-Object System.Windows.Forms.CheckBox
+$script:chkAutoDownload.Text = '새 버전이 있으면 물어보고 바로 받기'
+$script:chkAutoDownload.Checked = [bool]$script:config.AutoDownloadUpdate
+$script:chkAutoDownload.Location = New-Object System.Drawing.Point(280, 182)
+$script:chkAutoDownload.Size = New-Object System.Drawing.Size(320, 28)
+$script:chkAutoDownload.BackColor = $Theme.Card
+$script:chkAutoDownload.Font = $FontBase
+$cardUpdate.Controls.Add($script:chkAutoDownload)
+
+$cardFolders = New-Card $pageSettings 28 512 784 176 '도움말 및 관리'
+$btnGuide      = New-AppButton $cardFolders '가이드 다시 보기' 24 62 160 40 'primary'
+$btnOpenApp    = New-AppButton $cardFolders '프로그램 폴더 열기' 194 62 170 40
+$btnOpenLogs   = New-AppButton $cardFolders '로그 폴더 열기' 374 62 150 40
+$btnResetConf  = New-AppButton $cardFolders '설정 초기화' 534 62 150 40 'danger'
+[void](New-CardLabel $cardFolders "설정 파일 위치: $ConfigPath" 24 114 736 22 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardFolders '카카오 계정, 비밀번호, 인증 정보는 저장하지 않습니다. 설정은 이 PC 안에만 보관됩니다.' 24 136 736 22 $FontSmall $Theme.Muted)
+
+# ===========================================================================
+
+$cardLimit = New-Card $pageSettings 28 704 784 306 '발송 제한 및 묶음 발송' '보내면 안 되는 시간과 날짜, 그리고 몇 개마다 쉴지 정할 수 있습니다.'
 $script:chkQuiet = New-Object System.Windows.Forms.CheckBox
 $script:chkQuiet.Text = '방해금지 시간대에는 보내지 않기'
 $script:chkQuiet.Checked = [bool]$script:config.QuietEnabled
@@ -3174,117 +3316,6 @@ $cardLimit.Controls.Add($script:numBatchRest)
 
 $script:lblLimitState = New-CardLabel $cardLimit '' 24 234 736 56 $FontSmall $Theme.Sub
 
-$cardSchedule = New-Card $pageRun 28 718 784 350 '지금 실행 및 예약'
-[void](New-CardLabel $cardSchedule '예약 시각' 24 56 100 22 $FontSmall $Theme.Muted)
-$script:dtSchedule = New-Object System.Windows.Forms.DateTimePicker
-$script:dtSchedule.Format = 'Custom'
-$script:dtSchedule.CustomFormat = 'yyyy-MM-dd  HH:mm:ss'
-$script:dtSchedule.ShowUpDown = $true
-$script:dtSchedule.Location = New-Object System.Drawing.Point(24, 80)
-$script:dtSchedule.Size = New-Object System.Drawing.Size(222, 32)
-$script:dtSchedule.Font = $FontBase
-try { $script:dtSchedule.Value = [datetime]::ParseExact([string]$script:config.ScheduledAt, 'yyyy-MM-dd HH:mm:ss', $null) }
-catch { $script:dtSchedule.Value = (Get-Date).Date.AddDays(1) }
-if ($script:dtSchedule.Value -lt $script:dtSchedule.MinDate -or $script:dtSchedule.Value -le (Get-Date)) { $script:dtSchedule.Value = (Get-Date).Date.AddDays(1) }
-$cardSchedule.Controls.Add($script:dtSchedule)
-
-$btnPickSchedule = New-AppButton $cardSchedule '달력에서 고르기' 254 78 148 32
-[void](New-CardLabel $cardSchedule '방 사이 간격(초) — 0이면 쉬지 않음' 424 56 300 22 $FontSmall $Theme.Muted)
-$script:numInterval = New-Object System.Windows.Forms.NumericUpDown
-$script:numInterval.Minimum = 0
-$script:numInterval.Maximum = 300
-$script:numInterval.Value = [Math]::Max(0, [Math]::Min(300, [int]$script:config.IntervalSeconds))
-$script:numInterval.Location = New-Object System.Drawing.Point(424, 80)
-$script:numInterval.Size = New-Object System.Drawing.Size(94, 30)
-$script:numInterval.Font = $FontBase
-$script:numInterval.BorderStyle = 'FixedSingle'
-$cardSchedule.Controls.Add($script:numInterval)
-
-$btnRunNow    = New-AppButton $cardSchedule '지금 실행' 24 134 164 46 'primary'
-$btnArm       = New-AppButton $cardSchedule '예약 시작' 200 134 164 46
-$btnCancelArm = New-AppButton $cardSchedule '예약 취소' 376 134 164 46
-$btnSave      = New-AppButton $cardSchedule '설정 저장' 552 134 164 46 'ghost'
-$btnCancelArm.Enabled = $false
-
-# ----- 반복 발송 -----
-$script:chkRepeat = New-Object System.Windows.Forms.CheckBox
-$script:chkRepeat.Text = '반복 발송 — 한 번 다 보낸 뒤 일정 시간마다 다시 보내기'
-$script:chkRepeat.Checked = [bool]$script:config.RepeatEnabled
-$script:chkRepeat.Location = New-Object System.Drawing.Point(24, 192)
-$script:chkRepeat.Size = New-Object System.Drawing.Size(430, 28)
-$script:chkRepeat.BackColor = $Theme.Card
-$script:chkRepeat.Font = $FontBase
-$cardSchedule.Controls.Add($script:chkRepeat)
-
-$script:numRepeatMinutes = New-Object System.Windows.Forms.NumericUpDown
-$script:numRepeatMinutes.Minimum = 1
-$script:numRepeatMinutes.Maximum = 1440
-$script:numRepeatMinutes.Value = [Math]::Max(1, [Math]::Min(1440, [int]$script:config.RepeatMinutes))
-$script:numRepeatMinutes.Location = New-Object System.Drawing.Point(462, 190)
-$script:numRepeatMinutes.Size = New-Object System.Drawing.Size(80, 30)
-$script:numRepeatMinutes.Font = $FontBase
-$script:numRepeatMinutes.BorderStyle = 'FixedSingle'
-$cardSchedule.Controls.Add($script:numRepeatMinutes)
-[void](New-CardLabel $cardSchedule '분마다 ·  최대' 548 194 92 24 $FontSmall $Theme.Muted)
-
-$script:numRepeatCount = New-Object System.Windows.Forms.NumericUpDown
-$script:numRepeatCount.Minimum = 0
-$script:numRepeatCount.Maximum = 999
-$script:numRepeatCount.Value = [Math]::Max(0, [Math]::Min(999, [int]$script:config.RepeatCount))
-$script:numRepeatCount.Location = New-Object System.Drawing.Point(642, 190)
-$script:numRepeatCount.Size = New-Object System.Drawing.Size(70, 30)
-$script:numRepeatCount.Font = $FontBase
-$script:numRepeatCount.BorderStyle = 'FixedSingle'
-$cardSchedule.Controls.Add($script:numRepeatCount)
-[void](New-CardLabel $cardSchedule '회' 718 194 30 24 $FontSmall $Theme.Muted)
-[void](New-CardLabel $cardSchedule '최대 횟수를 0으로 두면 [예약 취소]를 누를 때까지 계속 반복합니다.' 24 224 736 22 $FontSmall $Theme.Muted)
-
-$script:lblCountdown = New-CardLabel $cardSchedule '예약이 설정되지 않았습니다.' 24 250 736 26 $FontStrong $Theme.Muted
-[void](New-CardLabel $cardSchedule '예약 시각까지 이 프로그램과 PC 카카오톡을 모두 켜 두어야 합니다. 화면 잠금·절전 상태에서는 동작하지 않으며, 실행 중에는 마우스와 키보드를 사용하지 마세요.' 24 282 736 44 $FontSmall $Theme.Muted)
-
-# ===========================================================================
-# 페이지 4 — 설정
-# ===========================================================================
-$pageSettings = New-Page 'settings'
-
-$cardStatus = New-Card $pageSettings 28 12 784 240 '카카오톡 연결 상태' '좌표를 맞출 필요는 없습니다. 카카오톡 화면 구조를 그때그때 읽어 자동으로 찾습니다.'
-$script:lblKakaoState = New-CardLabel $cardStatus '확인 중입니다...' 24 78 736 104 $FontBase $Theme.Sub
-$btnCheckKakao = New-AppButton $cardStatus '지금 확인' 24 190 150 40 'primary'
-$btnOpenKakao = New-AppButton $cardStatus '카카오톡 창 앞으로 가져오기' 184 190 220 40
-
-$cardUpdate = New-Card $pageSettings 28 264 784 236 '업데이트' '최신 배포를 확인합니다.'
-$script:lblUpdateState = New-CardLabel $cardUpdate "현재 버전 v$($script:AppVersion)" 24 76 736 46 $FontBase $Theme.Ink
-$btnCheckUpdate  = New-AppButton $cardUpdate '업데이트 확인' 24 130 160 40
-$script:btnDoUpdate = New-AppButton $cardUpdate '지금 업데이트' 194 130 160 40 'primary'
-$script:btnDoUpdate.Enabled = $false
-$btnClearLogFiles = New-AppButton $cardUpdate '로그 파일 모두 지우기' 364 130 200 40 'danger'
-$script:chkAutoUpdate = New-Object System.Windows.Forms.CheckBox
-$script:chkAutoUpdate.Text = '시작할 때 자동 확인'
-$script:chkAutoUpdate.Checked = [bool]$script:config.AutoCheckUpdate
-$script:chkAutoUpdate.Location = New-Object System.Drawing.Point(24, 182)
-$script:chkAutoUpdate.Size = New-Object System.Drawing.Size(240, 28)
-$script:chkAutoUpdate.BackColor = $Theme.Card
-$script:chkAutoUpdate.Font = $FontBase
-$cardUpdate.Controls.Add($script:chkAutoUpdate)
-
-$script:chkAutoDownload = New-Object System.Windows.Forms.CheckBox
-$script:chkAutoDownload.Text = '새 버전이 있으면 물어보고 바로 받기'
-$script:chkAutoDownload.Checked = [bool]$script:config.AutoDownloadUpdate
-$script:chkAutoDownload.Location = New-Object System.Drawing.Point(280, 182)
-$script:chkAutoDownload.Size = New-Object System.Drawing.Size(320, 28)
-$script:chkAutoDownload.BackColor = $Theme.Card
-$script:chkAutoDownload.Font = $FontBase
-$cardUpdate.Controls.Add($script:chkAutoDownload)
-
-$cardFolders = New-Card $pageSettings 28 512 784 176 '도움말 및 관리'
-$btnGuide      = New-AppButton $cardFolders '가이드 다시 보기' 24 62 160 40 'primary'
-$btnOpenApp    = New-AppButton $cardFolders '프로그램 폴더 열기' 194 62 170 40
-$btnOpenLogs   = New-AppButton $cardFolders '로그 폴더 열기' 374 62 150 40
-$btnResetConf  = New-AppButton $cardFolders '설정 초기화' 534 62 150 40 'danger'
-[void](New-CardLabel $cardFolders "설정 파일 위치: $ConfigPath" 24 114 736 22 $FontSmall $Theme.Muted)
-[void](New-CardLabel $cardFolders '카카오 계정, 비밀번호, 인증 정보는 저장하지 않습니다. 설정은 이 PC 안에만 보관됩니다.' 24 136 736 22 $FontSmall $Theme.Muted)
-
-# ===========================================================================
 # 페이지 5 — 실행 기록
 # ===========================================================================
 $pageLog = New-Page 'log'
@@ -3482,6 +3513,25 @@ function Get-EstimatedRunText {
     return "체크한 $($count)개 · 간격 $($interval)초 → 예상 소요 약 $text$restText"
 }
 
+# 위쪽 요약: 언제 보내고, 몇 분마다 반복하는지
+function Update-HeaderSummary {
+    if ($null -eq $script:lblHeaderPlan) { return }
+    $when = if ($script:armed) {
+        "예약  $($script:dtSchedule.Value.ToString('MM-dd HH:mm')) 대기 중"
+    } else {
+        "예약  $($script:dtSchedule.Value.ToString('MM-dd HH:mm')) (시작 안 함)"
+    }
+    $repeat = if ([bool]$script:chkRepeat.Checked) {
+        $limit = [int]$script:numRepeatCount.Value
+        $limitText = if ($limit -gt 0) { "최대 $($limit)회" } else { '계속' }
+        "반복  $([int]$script:numRepeatMinutes.Value)분마다 · $limitText"
+    } else {
+        "반복  안 함 · 방 간격 $([int]$script:numInterval.Value)초"
+    }
+    $script:lblHeaderPlan.Text = "$when`r`n$repeat"
+    $script:lblHeaderPlan.ForeColor = if ($script:armed) { $Theme.Info } else { $Theme.Muted }
+}
+
 function Update-LimitStateLabel {
     $now = Get-Date
     $lines = New-Object System.Collections.Generic.List[string]
@@ -3548,6 +3598,7 @@ foreach ($room in @(@($script:config.KnownRooms) + @($script:config.Rooms) | For
 Update-RoomListView
 Update-GroupCombo
 Update-LimitStateLabel
+Update-HeaderSummary
 $script:lblMessageCount.Text = "$($script:txtMessage.Text.Length)자"
 
 # ===========================================================================
@@ -3608,6 +3659,42 @@ $script:lstRooms.Add_ItemChecked({
 })
 
 $btnHelp.Add_Click({ Show-GuideTour })
+$script:btnHeaderStop.Add_Click({
+    if ($script:running) {
+        if ($script:pauseRequested) {
+            $script:pauseRequested = $false
+            Write-RunLog '발송을 다시 진행합니다.'
+            Set-StatusPill '실행 중' 'run'
+            Update-RunButtons
+            return
+        }
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "발송을 어떻게 할까요?`r`n`r`n[예] 잠깐 멈추기 (나중에 이어서 진행)`r`n[아니오] 완전히 중지 (남은 방은 보내지 않음)`r`n[취소] 계속 진행",
+            '발송 중지', 'YesNoCancel', 'Warning')
+        if ($answer -eq 'Yes') {
+            $script:pauseRequested = $true
+            Write-RunLog '발송을 잠깐 멈췄습니다.'
+            Update-RunButtons
+        } elseif ($answer -eq 'No') {
+            $script:pauseRequested = $false
+            $script:cancelRequested = $true
+            Write-RunLog '발송을 완전히 중지했습니다.'
+            Set-StatusPill '중지됨' 'error'
+        }
+        return
+    }
+    if ($script:armed) {
+        if ([System.Windows.Forms.MessageBox]::Show('예약을 취소할까요?', '예약 취소', 'YesNo', 'Question') -ne 'Yes') { return }
+        $script:armed = $false
+        $script:repeatDone = 0
+        $btnArm.Enabled = $true
+        $btnCancelArm.Enabled = $false
+        $script:lblCountdown.Text = '예약이 취소되었습니다.'
+        Set-StatusPill '예약 취소됨' 'idle'
+        Write-RunLog '예약을 취소했습니다.'
+        Update-RunButtons
+    }
+})
 $btnHeaderEdit.Add_Click({ Show-AppPage 'compose' })
 $btnHeaderStart.Add_Click({
     try {
@@ -4106,6 +4193,40 @@ function Confirm-LiveRun([string]$Action) {
 }
 
 $script:repeatDone = 0
+$script:cancelRequested = $false
+$script:pauseRequested = $false
+
+# 발송 중에도 위쪽 [중지] 버튼이 눌리도록 화면을 갱신하고, 멈춤 요청을 확인합니다.
+# $true 를 돌려주면 그만두라는 뜻입니다.
+function Test-RunInterrupted {
+    [System.Windows.Forms.Application]::DoEvents()
+    if ($script:cancelRequested) { return $true }
+    while ($script:pauseRequested -and -not $script:cancelRequested) {
+        Set-StatusPill '일시정지 중 — [계속]을 누르면 이어서 진행합니다' 'wait'
+        Start-Sleep -Milliseconds 200
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    return $script:cancelRequested
+}
+
+# 잠깐 기다리는 동안에도 중지 버튼이 동작하게 합니다.
+function Wait-Interruptible([int]$Seconds) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-RunInterrupted) { return $true }
+        Start-Sleep -Milliseconds 150
+    }
+    return $false
+}
+
+function Update-RunButtons {
+    $busy = ($script:running -or $script:armed)
+    $script:btnHeaderStop.Visible = $busy
+    $btnHeaderStart.Visible = -not $busy
+    $script:btnHeaderStop.Tag.Label = if ($script:pauseRequested) { '계속하기' } else { '중지' }
+    $script:btnHeaderStop.Invalidate()
+    Update-HeaderSummary
+}
 
 # 반복 발송이 켜져 있으면 다음 차례를 예약합니다.
 function Start-RepeatIfNeeded {
@@ -4134,8 +4255,13 @@ function Start-BroadcastAsync {
     $script:armed = $false
     $btnArm.Enabled = $true
     $btnCancelArm.Enabled = $false
+    $script:cancelRequested = $false
+    $script:pauseRequested = $false
     Set-StatusPill '실행 중' 'run'
-    $script:form.Enabled = $false
+    $pageHost.Enabled = $false
+    $sidebar.Enabled = $false
+    $btnHeaderEdit.Enabled = $false
+    Update-RunButtons
     try {
         $count = Invoke-Broadcast
         Set-StatusPill "작업 완료 · 성공 $($count)개" 'done'
@@ -4145,8 +4271,12 @@ function Start-BroadcastAsync {
         Set-StatusPill '오류로 중단' 'error'
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '작업 중단') | Out-Null
     } finally {
-        $script:form.Enabled = $true
+        $pageHost.Enabled = $true
+        $sidebar.Enabled = $true
+        $btnHeaderEdit.Enabled = $true
         $script:running = $false
+        $script:pauseRequested = $false
+        Update-RunButtons
         $script:form.Activate()
     }
 }
@@ -4167,6 +4297,7 @@ $btnArm.Add_Click({
         $btnArm.Enabled = $false
         $btnCancelArm.Enabled = $true
         Write-RunLog ("예약 시작: {0}" -f $script:dtSchedule.Value.ToString('yyyy-MM-dd HH:mm:ss'))
+        Update-RunButtons
     } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '예약 실패') | Out-Null }
 })
 $btnCancelArm.Add_Click({
@@ -4177,6 +4308,7 @@ $btnCancelArm.Add_Click({
     $script:lblCountdown.Text = '예약이 취소되었습니다.'
     Set-StatusPill '예약 취소됨' 'idle'
     Write-RunLog '예약을 취소했습니다.'
+    Update-RunButtons
 })
 
 $btnTestSend.Add_Click({
