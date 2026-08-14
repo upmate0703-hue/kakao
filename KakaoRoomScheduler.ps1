@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.7.0'
+$script:AppVersion = '4.8.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -3039,7 +3039,7 @@ $lblComposeHint.BackColor = $Theme.Bg
 # 페이지 2 — 채팅방 선택
 # ===========================================================================
 $pageRooms = New-Page 'rooms'
-$cardRooms = New-Card $pageRooms 28 12 784 700 '발송 대상 채팅방' '카카오톡에서 보고 있는 탭의 목록을 읽어옵니다. 채팅 탭과 오픈채팅 탭을 각각 한 번씩 읽으면 됩니다.'
+$cardRooms = New-Card $pageRooms 28 12 784 700 '발송 대상 채팅방' '[오픈채팅] 탭을 먼저 읽고 그다음 [채팅] 탭을 읽으면 종류가 정확히 나뉩니다.'
 
 $script:txtRoomFilter = New-AppTextBox $cardRooms 24 80 216 38
 $btnScanRooms  = New-AppButton $cardRooms '카카오톡에서 읽기' 252 80 170 38 'primary'
@@ -3346,7 +3346,13 @@ function Add-RoomEntry([string]$Name, [string]$Type, [bool]$Checked) {
     if (-not $clean) { return $false }
     foreach ($entry in $script:roomEntries) {
         if ($entry.Name -eq $clean) {
-            if ($Type -and $Type -ne $script:RoomTypeUnknown) { $entry.Type = $Type }
+            # [채팅] 목록에는 오픈채팅방도 함께 들어 있습니다.
+            # 그래서 이미 오픈채팅으로 확인된 방을 일반채팅으로 덮어쓰지 않습니다.
+            if ($Type -and $Type -ne $script:RoomTypeUnknown) {
+                if (-not ($entry.Type -eq $script:RoomTypeOpen -and $Type -eq $script:RoomTypeNormal)) {
+                    $entry.Type = $Type
+                }
+            }
             return $false
         }
     }
@@ -3889,14 +3895,26 @@ $btnScanRooms.Add_Click({
         Set-StatusPill '준비됨' 'idle'
         Write-RunLog "목록 읽기 완료: $($type) / 화면 $($scan.Pages)개 / 후보 $(@($scan.Names).Count)개 중 새 항목 $($added)개"
 
-        $other = if ($type -eq $script:RoomTypeOpen) { '채팅' } else { '오픈채팅' }
         $result = "$($type) 방 $(@($scan.Names).Count)개를 읽었습니다. (새로 추가 $($added)개)"
         if (@($scan.Names).Count -eq 0) {
             $result += "`r`n`r`n한 개도 읽지 못했습니다. 카카오톡에서 목록이 실제로 보이는 상태인지 확인하고, 창을 조금 크게 한 뒤 다시 시도해 보세요."
         } else {
             $result += "`r`n`r`n① 보낼 방만 체크하세요.`r`n② [이름 확인·보정]을 누르면 실제 이름으로 자동 교정됩니다."
         }
-        $result += "`r`n`r`n$($other) 방도 보내려면 카카오톡에서 [$($other)] 탭으로 바꾼 뒤 [카카오톡에서 읽기]를 한 번 더 누르세요."
+        # 카카오톡 [채팅] 목록에는 오픈채팅방도 섞여 있어, 탭만으로는 방마다 종류를 알 수 없습니다.
+        # [오픈채팅] 탭을 먼저 읽어 두면 그 방들이 오픈으로 표시되고,
+        # 그다음 [채팅] 탭을 읽을 때 나머지만 일반채팅이 됩니다.
+        if ($type -eq $script:RoomTypeNormal) {
+            $openCount = @($script:roomEntries | Where-Object { $_.Type -eq $script:RoomTypeOpen }).Count
+            if ($openCount -eq 0) {
+                $result += "`r`n`r`n[종류를 정확히 나누려면]`r`n[채팅] 목록에는 오픈채팅방도 함께 들어 있습니다."
+                $result += "`r`n카카오톡에서 [오픈채팅] 탭으로 바꿔 한 번 더 읽으면, 그 방들만 오픈채팅으로 바뀌고 나머지는 일반채팅으로 남습니다."
+            } else {
+                $result += "`r`n`r`n오픈채팅으로 표시된 방 $($openCount)개는 그대로 유지했습니다."
+            }
+        } else {
+            $result += "`r`n`r`n오픈채팅으로 표시했습니다. 아직 [채팅] 탭을 읽지 않으셨다면, 그쪽도 한 번 읽어 두시면 목록이 완성됩니다."
+        }
         [System.Windows.Forms.MessageBox]::Show($result, '목록 읽기 완료') | Out-Null
     } catch {
         $script:form.Enabled = $true
