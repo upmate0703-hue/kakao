@@ -2240,9 +2240,13 @@ function Install-AppUpdate([object]$Release) {
 
     $backup = Join-Path $BackupDir $stamp
     New-Item -ItemType Directory -Path $backup -Force | Out-Null
-    foreach ($name in @('KakaoRoomScheduler.ps1', 'Start-KakaoRoomScheduler.cmd', 'README.md', 'Publish-Release.ps1')) {
+    foreach ($name in @('KakaoRoomScheduler.ps1', 'README.md', 'Publish-Release.ps1')) {
         $existing = Join-Path $AppDir $name
         if (Test-Path -LiteralPath $existing) { Copy-Item -LiteralPath $existing -Destination $backup -Force }
+    }
+    # 실행용 .cmd 는 이름을 바꿔 쓰는 경우가 있어 폴더의 모든 .cmd 를 백업합니다.
+    foreach ($cmd in @(Get-ChildItem -LiteralPath $AppDir -Filter '*.cmd' -File -ErrorAction SilentlyContinue)) {
+        Copy-Item -LiteralPath $cmd.FullName -Destination $backup -Force
     }
 
     $copied = 0
@@ -2256,9 +2260,18 @@ function Install-AppUpdate([object]$Release) {
     return $backup
 }
 
+# 실행용 .cmd 파일을 찾습니다. 사용자가 이름을 바꿔도 동작하도록 폴더에서 찾습니다.
+function Find-Launcher {
+    $preferred = Join-Path $AppDir 'Start-KakaoRoomScheduler.cmd'
+    if (Test-Path -LiteralPath $preferred) { return $preferred }
+    $found = @(Get-ChildItem -LiteralPath $AppDir -Filter '*.cmd' -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    if ($found.Count -gt 0) { return $found[0].FullName }
+    return $null
+}
+
 function Restart-App {
-    $launcher = Join-Path $AppDir 'Start-KakaoRoomScheduler.cmd'
-    if (Test-Path -LiteralPath $launcher) { Start-Process -FilePath $launcher -WorkingDirectory $AppDir }
+    $launcher = Find-Launcher
+    if ($launcher) { Start-Process -FilePath $launcher -WorkingDirectory $AppDir }
     else { Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', (Join-Path $AppDir 'KakaoRoomScheduler.ps1')) -WorkingDirectory $AppDir }
     $script:armed = $false
     $script:form.Close()
