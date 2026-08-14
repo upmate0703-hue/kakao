@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.8.0'
+$script:AppVersion = '4.9.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -274,6 +274,25 @@ public static class NativeKakao {
     public static void CloseWindow(IntPtr hWnd) {
         PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
     }
+
+    // 제목이 특정 글자로 시작하는 창을 찾습니다. 이미 실행 중인 우리 창을 찾을 때 씁니다.
+    public static IntPtr FindWindowByTitlePrefix(string prefix, int excludeProcessId) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr hWnd, IntPtr ignored) {
+            if (!IsWindowVisible(hWnd)) { return true; }
+            uint pid;
+            GetWindowThreadProcessId(hWnd, out pid);
+            if ((int)pid == excludeProcessId) { return true; }
+            var title = new StringBuilder(512);
+            GetWindowText(hWnd, title, title.Capacity);
+            if (title.ToString().StartsWith(prefix, StringComparison.Ordinal)) {
+                found = hWnd;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
 }
 "@
 }
@@ -418,8 +437,22 @@ function New-DefaultConfig {
     }
 }
 
+# 설정을 임시 파일에 먼저 쓰고 바꿔치기합니다.
+# 저장 도중 프로그램이 꺼지거나 다른 곳에서 읽어도 파일이 깨지지 않습니다.
 function Save-Config([object]$Config) {
-    $Config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+    $json = $Config | ConvertTo-Json -Depth 8
+    $temp = "$ConfigPath.tmp"
+    for ($attempt = 0; $attempt -lt 4; $attempt++) {
+        try {
+            Set-Content -LiteralPath $temp -Value $json -Encoding UTF8 -ErrorAction Stop
+            Move-Item -LiteralPath $temp -Destination $ConfigPath -Force -ErrorAction Stop
+            return
+        } catch {
+            Start-Sleep -Milliseconds 120
+        }
+    }
+    # 마지막으로 직접 써 봅니다.
+    try { Set-Content -LiteralPath $ConfigPath -Value $json -Encoding UTF8 -ErrorAction Stop } catch { }
 }
 
 function Add-ConfigPropertyIfMissing([object]$Object, [string]$Name, [object]$Value) {
@@ -2537,6 +2570,50 @@ if ($SendBench) {
     Write-Output 'SENDBENCH_OK'
     exit 0
 }
+
+# ---------------------------------------------------------------------------
+# 중복 실행 막기
+# ---------------------------------------------------------------------------
+# 두 개가 동시에 돌면 같은 config.json 을 서로 덮어쓰고,
+# 무엇보다 같은 카카오톡을 동시에 조작해 엉뚱한 방에 보내질 수 있습니다.
+# 그래서 한 번에 하나만 실행되도록 막고, 이미 있으면 그 창을 앞으로 가져옵니다.
+$script:instanceLock = $null
+
+function Enter-SingleInstance {
+    $createdNew = $false
+    try {
+        $script:instanceLock = New-Object System.Threading.Mutex($true, 'Local\KakaoRoomScheduler.SingleInstance', [ref]$createdNew)
+    } catch {
+        return $true
+    }
+    if ($createdNew) { return $true }
+
+    # 이미 실행 중입니다. 기존 창을 찾아 앞으로 가져옵니다.
+    $existing = [IntPtr]::Zero
+    try { $existing = [NativeKakao]::FindWindowByTitlePrefix('카카오 발송기', $PID) } catch { }
+    if ($existing -ne [IntPtr]::Zero) {
+        [void][NativeKakao]::ForceForeground($existing)
+        [System.Windows.Forms.MessageBox]::Show(
+            "카카오 발송기가 이미 실행 중입니다.`r`n`r`n실행 중인 창을 앞으로 가져왔습니다.`r`n`r`n두 개를 동시에 켜면 설정이 서로 덮어써지고, 같은 카카오톡을 동시에 조작해 잘못 발송될 수 있어 막았습니다.",
+            '이미 실행 중입니다', 'OK', 'Information') | Out-Null
+    } else {
+        [System.Windows.Forms.MessageBox]::Show(
+            "카카오 발송기가 이미 실행 중입니다.`r`n`r`n작업 표시줄에서 기존 창을 찾아 주세요.`r`n창이 보이지 않으면 작업 관리자에서 powershell 을 종료한 뒤 다시 실행해 주세요.",
+            '이미 실행 중입니다', 'OK', 'Warning') | Out-Null
+    }
+    return $false
+}
+
+function Exit-SingleInstance {
+    if ($null -ne $script:instanceLock) {
+        try { $script:instanceLock.ReleaseMutex() } catch { }
+        try { $script:instanceLock.Dispose() } catch { }
+        $script:instanceLock = $null
+    }
+}
+
+# 진단용 실행은 막지 않습니다.
+if (-not (Enter-SingleInstance)) { exit 0 }
 
 # ---------------------------------------------------------------------------
 # 디자인 토큰
@@ -4724,6 +4801,7 @@ $script:form.Add_FormClosing({
         }
     }
     try { Sync-ConfigFromForm } catch { }
+    Exit-SingleInstance
 })
 
 $startupTimer = New-Object System.Windows.Forms.Timer
