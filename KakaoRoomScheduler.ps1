@@ -4,6 +4,8 @@
     [switch]$NoUpdateCheck,
     [switch]$ScanTest,
     [switch]$MaskNames,
+    [switch]$SendBench,
+    [int]$BenchCount = 3,
     [string]$ScreenshotDir = ''
 )
 
@@ -13,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '3.3.0'
+$script:AppVersion = '3.4.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -219,12 +221,7 @@ function New-DefaultConfig {
         AutoCheckUpdate = $true
         TourDone = $false
         Calibration = [pscustomobject]@{
-            ChatTabX = -1.0
-            ChatTabY = -1.0
-            ChatViewName = ''
-            OpenChatTabX = -1.0
-            OpenChatTabY = -1.0
-            OpenChatViewName = ''
+            SearchIconOffset = 0
         }
     }
 }
@@ -607,6 +604,197 @@ function Get-RoomTypeFromViewName([string]$ViewName) {
     return $script:RoomTypeUnknown
 }
 
+# ---------------------------------------------------------------------------
+# 상단 띠(탭 · 검색 아이콘) 자동 인식
+# ---------------------------------------------------------------------------
+# 최신 카카오톡은 [채팅] [오픈채팅] 을 창 위쪽 글자 탭으로, 검색을 돋보기 아이콘으로
+# 보여 줍니다. 글자를 읽어 위치를 스스로 찾으므로 사용자가 알려 줄 필요가 없습니다.
+function Get-TopBandRegion([object]$Layout) {
+    if ($null -eq $Layout.List) { return $null }
+    $children = @([NativeKakao]::GetChildWindows($Layout.Main.Handle))
+    $view = @($children | Where-Object { $_.Visible -and $_.Title -match 'View_0x' -and $_.Title -notmatch 'MainView' } |
+        Sort-Object -Property @{ Expression = { $_.Rect.Top } } | Select-Object -First 1)
+    $top = if ($view.Count -gt 0) { $view[0].Rect.Top } else { $Layout.Main.Rect.Top + 31 }
+    $height = $Layout.List.Rect.Top - $top
+    if ($height -lt 24) { return $null }
+    return [pscustomobject]@{
+        Left = $Layout.List.Rect.Left
+        Top = $top
+        Width = $Layout.List.Width
+        Height = $height
+    }
+}
+
+# 상단 띠를 확대해 글자와 그 화면 좌표를 읽습니다.
+function Get-TopBandWords([object]$Layout, [int]$Scale = 3) {
+    if ($null -eq $Layout -or $null -eq $Layout.Main) { return @() }
+    $band = Get-TopBandRegion $Layout
+    if ($null -eq $band) { return @() }
+    if (-not (Initialize-Ocr)) { return @() }
+    $full = Get-WindowImage $Layout.Main
+    $cropped = $null
+    $scaled = $null
+    $stream = $null
+    try {
+        $rect = New-Object System.Drawing.Rectangle(
+            ($band.Left - $Layout.Main.Rect.Left), ($band.Top - $Layout.Main.Rect.Top), $band.Width, $band.Height)
+        if ($rect.X -lt 0 -or $rect.Y -lt 0 -or
+            ($rect.X + $rect.Width) -gt $full.Width -or ($rect.Y + $rect.Height) -gt $full.Height) { return @() }
+        $cropped = $full.Clone($rect, $full.PixelFormat)
+        $scaled = New-Object System.Drawing.Bitmap(($band.Width * $Scale), ($band.Height * $Scale))
+        $graphics = [System.Drawing.Graphics]::FromImage($scaled)
+        $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.DrawImage($cropped, 0, 0, $scaled.Width, $scaled.Height)
+        $graphics.Dispose()
+
+        $stream = New-Object System.IO.MemoryStream
+        $scaled.Save($stream, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        [void]$stream.Seek(0, 'Begin')
+        $random = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($stream)
+        $decoder = Wait-WinRt ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($random)) ([Windows.Graphics.Imaging.BitmapDecoder])
+        $software = Wait-WinRt ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        $recognized = Wait-WinRt ($script:ocrEngine.RecognizeAsync($software)) ([Windows.Media.Ocr.OcrResult])
+
+        $words = @()
+        foreach ($line in $recognized.Lines) {
+            foreach ($word in $line.Words) {
+                $r = $word.BoundingRect
+                $words += [pscustomobject]@{
+                    Text = [string]$word.Text
+                    X = $band.Left + [int](($r.X + $r.Width / 2) / $Scale)
+                    Y = $band.Top + [int](($r.Y + $r.Height / 2) / $Scale)
+                }
+            }
+        }
+        return $words
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $scaled) { $scaled.Dispose() }
+        if ($null -ne $cropped) { $cropped.Dispose() }
+        $full.Dispose()
+    }
+}
+
+# OCR 이 '오픈치|팅' 처럼 흘려 읽어도 알아보도록 느슨하게 비교합니다.
+function Test-TabWord([string]$Text, [string]$Kind) {
+    $clean = ([string]$Text) -replace '[^가-힣]', ''
+    if (-not $clean) { return $false }
+    if ($Kind -eq 'open') { return ($clean -like '오픈*') }
+    return ($clean -like '채팅*' -and $clean -notlike '오픈*')
+}
+
+function Find-TabPoint([object[]]$Words, [string]$Kind) {
+    $matched = @($Words | Where-Object { Test-TabWord $_.Text $Kind } | Sort-Object Y, X)
+    if ($matched.Count -eq 0) { return $null }
+    return $matched[0]
+}
+
+# 돋보기 아이콘은 글자가 없어 위치를 확정할 수 없습니다.
+# 몇 군데를 눌러 보고 검색 입력칸이 나타나는 자리를 찾아 기억합니다.
+function Get-VisibleSearchEdit([object]$MainWindow) {
+    $edits = @([NativeKakao]::GetChildWindows($MainWindow.Handle) |
+        Where-Object { $_.ClassName -eq 'Edit' -and $_.Visible -and $_.Width -ge 60 -and $_.Height -ge 14 })
+    if ($edits.Count -eq 0) { return $null }
+    return $edits[0]
+}
+
+function Open-KakaoSearchBox([object]$Layout, [object[]]$Words) {
+    $main = $Layout.Main
+    if ($null -ne (Get-VisibleSearchEdit $main)) { return $true }
+
+    # 클릭이 먹으려면 카카오톡이 앞에 있어야 합니다.
+    [void](Enter-KakaoForeground $main)
+    $band = Get-TopBandRegion $Layout
+    if ($null -eq $band) { return $false }
+    $tabChat = Find-TabPoint $Words 'chat'
+    $rowY = if ($null -ne $tabChat) { $tabChat.Y } else { $band.Top + [int]($band.Height * 0.30) }
+    $right = $band.Left + $band.Width
+
+    $offsets = New-Object System.Collections.Generic.List[int]
+    $saved = [int]$script:config.Calibration.SearchIconOffset
+    if ($saved -gt 0) { $offsets.Add($saved) }
+    foreach ($candidate in @(105, 112, 98, 120, 92, 128, 85)) {
+        if (-not $offsets.Contains($candidate)) { $offsets.Add($candidate) }
+    }
+
+    foreach ($offset in $offsets) {
+        $x = $right - $offset
+        if ($x -le $band.Left) { continue }
+        Invoke-PointClick $x $rowY
+        Start-Sleep -Milliseconds 320
+        if ($null -ne (Get-VisibleSearchEdit $main)) {
+            if ($script:config.Calibration.SearchIconOffset -ne $offset) {
+                $script:config.Calibration.SearchIconOffset = $offset
+                try { Save-Config $script:config } catch { }
+                Write-RunLog "검색 아이콘 위치를 찾았습니다. (오른쪽 끝에서 $($offset)px)"
+            }
+            return $true
+        }
+    }
+    return $false
+}
+
+# 검색 결과에는 '친구' '채팅방' 같은 구분 머리글이 섞여 있어 첫 줄이 방이 아닐 수 있습니다.
+# 읽은 글자 중 검색어와 가장 비슷한 줄을 찾아 그 줄을 누릅니다.
+function ConvertTo-CompareKey([string]$Text) {
+    return (([string]$Text) -replace '\s', '').ToLowerInvariant()
+}
+
+function Find-SearchResultLine([object[]]$Lines, [string]$Query, [int]$Width) {
+    $all = @($Lines)
+    if ($all.Count -eq 0) { return $null }
+    $target = ConvertTo-CompareKey $Query
+    if (-not $target) { return $null }
+    $best = $null
+    $bestScore = 0
+    foreach ($line in $all) {
+        if ($line.Left -lt ($Width * 0.10) -or $line.Left -gt ($Width * 0.55)) { continue }
+        $candidate = ConvertTo-CompareKey $line.Text
+        if (-not $candidate) { continue }
+        # 짧은 조각이 우연히 겹쳐 엉뚱한 줄을 고르지 않도록, 길이가 비슷할 때만 인정합니다.
+        $minLength = [Math]::Max(2, [int]([Math]::Ceiling($target.Length * 0.5)))
+        if ($candidate.Length -lt $minLength) { continue }
+        $score = 0
+        if ($candidate -eq $target) { $score = 100 }
+        elseif ($candidate.StartsWith($target) -or $target.StartsWith($candidate)) { $score = 80 }
+        elseif ($candidate.Contains($target) -or $target.Contains($candidate)) { $score = 65 }
+        if ($score -gt $bestScore) { $bestScore = $score; $best = $line }
+    }
+    if ($bestScore -ge 65) { return $best }
+    return $null
+}
+
+function Close-KakaoSearchBox {
+    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    Start-Sleep -Milliseconds 150
+}
+
+# 검색칸에 검색어를 넣습니다.
+# Ctrl+A 를 먼저 보내면 카카오톡이 붙여넣기를 무시합니다. Home + Shift+End 로 지웁니다.
+function Set-KakaoSearchQuery([object]$Layout, [string]$Query, [bool]$Fresh) {
+    $main = $Layout.Main
+    $edit = Get-VisibleSearchEdit $main
+    if ($Fresh -and $null -ne $edit) {
+        Close-KakaoSearchBox
+        Start-Sleep -Milliseconds 220
+        $edit = $null
+    }
+    if ($null -eq $edit) {
+        $words = @(Get-TopBandWords $Layout)
+        if (-not (Open-KakaoSearchBox $Layout $words)) { return $false }
+        Start-Sleep -Milliseconds 260
+        $edit = Get-VisibleSearchEdit $main
+        if ($null -eq $edit) { return $false }
+    }
+    Invoke-PointClick ($edit.Rect.Left + [int]($edit.Width / 2)) ($edit.Rect.Top + [int]($edit.Height / 2))
+    Start-Sleep -Milliseconds 180
+    [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
+    [System.Windows.Forms.SendKeys]::SendWait('+{END}')
+    [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
+    [System.Windows.Forms.SendKeys]::SendWait('^v')
+    return $true
+}
+
 # 목록을 읽는 데는 검색창이 필요하지 않습니다. 보낼 때만 필요합니다.
 # 이 둘을 구분하지 않아 오픈채팅 탭에서 읽기가 막히던 문제가 있었습니다.
 function Test-KakaoReady([bool]$Restore = $false, [bool]$NeedSearch = $false) {
@@ -621,8 +809,8 @@ function Test-KakaoReady([bool]$Restore = $false, [bool]$NeedSearch = $false) {
     if ($null -eq $layout.List) {
         return [pscustomobject]@{ Ok = $false; Reason = '채팅방 목록 영역을 찾지 못했습니다. 카카오톡에서 채팅 또는 오픈채팅 탭을 눌러 목록이 보이게 해 주세요.'; Layout = $layout }
     }
-    if ($NeedSearch -and $null -eq $layout.SearchRow) {
-        return [pscustomobject]@{ Ok = $false; Reason = '검색창을 찾지 못했습니다. 카카오톡 창을 조금 더 크게 해 보세요.'; Layout = $layout }
+    if ($NeedSearch -and $null -eq (Get-TopBandRegion $layout)) {
+        return [pscustomobject]@{ Ok = $false; Reason = '카카오톡 위쪽 탭 영역을 찾지 못했습니다. 창을 조금 더 크게 해 보세요.'; Layout = $layout }
     }
     return [pscustomobject]@{ Ok = $true; Reason = ''; Layout = $layout }
 }
@@ -637,12 +825,6 @@ function Invoke-RatioClick([object]$Window, [double]$XRatio, [double]$YRatio) {
     [NativeKakao]::Click($x, $y, $false)
 }
 
-function Test-TabTaught([string]$Which) {
-    $calibration = $script:config.Calibration
-    if ($Which -eq 'OpenChatTab') { return ([double]$calibration.OpenChatTabX -ge 0) }
-    return ([double]$calibration.ChatTabX -ge 0)
-}
-
 # 필요한 탭으로 전환합니다. 이미 그 탭이면 아무것도 하지 않습니다.
 function Enter-KakaoTab([string]$Type) {
     $main = Get-MainKakaoWindow $true
@@ -653,16 +835,15 @@ function Enter-KakaoTab([string]$Type) {
     if ($wantOpen -and $layout.IsOpenChatList) { return $layout }
     if (-not $wantOpen -and $layout.IsChatList) { return $layout }
 
-    $which = if ($wantOpen) { 'OpenChatTab' } else { 'ChatTab' }
-    if (-not (Test-TabTaught $which)) {
-        $label = if ($wantOpen) { '오픈채팅' } else { '채팅' }
-        throw "카카오톡에서 [$label] 탭을 눌러 목록이 보이게 해 주세요.`r`n(설정 화면에서 [$label] 탭 위치를 한 번 알려 주면 다음부터는 자동으로 눌러 줍니다.)"
-    }
+    $label = if ($wantOpen) { '오픈채팅' } else { '채팅' }
     [void](Enter-KakaoForeground $main)
-    $calibration = $script:config.Calibration
-    if ($wantOpen) { Invoke-RatioClick $main ([double]$calibration.OpenChatTabX) ([double]$calibration.OpenChatTabY) }
-    else { Invoke-RatioClick $main ([double]$calibration.ChatTabX) ([double]$calibration.ChatTabY) }
-    Start-Sleep -Milliseconds 700
+    $words = @(Get-TopBandWords $layout)
+    $tab = Find-TabPoint $words $(if ($wantOpen) { 'open' } else { 'chat' })
+    if ($null -eq $tab) {
+        throw "카카오톡 위쪽에서 [$label] 탭을 찾지 못했습니다.`r`n카카오톡에서 직접 [$label] 탭을 눌러 목록이 보이게 해 주세요."
+    }
+    Invoke-PointClick $tab.X $tab.Y
+    Start-Sleep -Milliseconds 650
     return (Get-KakaoLayout (Get-MainKakaoWindow))
 }
 
@@ -884,6 +1065,7 @@ function Get-WindowImage([object]$Window) {
 }
 
 function Get-OcrLines([object]$Window, [int]$Scale = 2) {
+    if ($null -eq $Window) { return @() }
     if (-not (Initialize-Ocr)) { throw "문자 인식을 사용할 수 없습니다. $($script:ocrError)" }
     $source = Get-WindowImage $Window
     $scaled = $null
@@ -1005,8 +1187,8 @@ function Get-KakaoRoomNames([int]$MaxPages = 30) {
 # ---------------------------------------------------------------------------
 function Open-RoomBySearch([string]$Query, [string]$RoomType, [int]$TimeoutMs = 5000) {
     $layout = Enter-KakaoTab $RoomType
-    if ($null -eq $layout.List -or $null -eq $layout.SearchRow) {
-        throw '채팅 목록과 검색창을 찾지 못했습니다. 카카오톡 창을 조금 더 크게 하고, 채팅 목록이 보이게 해 주세요.'
+    if ($null -eq $layout.List) {
+        throw '채팅 목록을 찾지 못했습니다. 카카오톡 창을 조금 더 크게 하고, 목록이 보이게 해 주세요.'
     }
     $main = $layout.Main
     if (-not (Enter-KakaoForeground $main)) {
@@ -1020,19 +1202,40 @@ function Open-RoomBySearch([string]$Query, [string]$RoomType, [int]$TimeoutMs = 
         }
     }
 
-    # 검색창을 눌러 입력칸에 포커스를 줍니다.
-    $searchX = $layout.SearchRow.Rect.Left + [int]($layout.SearchRow.Width / 2)
-    $searchY = $layout.SearchRow.Rect.Top + [int]($layout.SearchRow.Height / 2)
-    Invoke-PointClick $searchX $searchY
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.SendKeys]::SendWait('^a')
+    # 붙여넣기 직전에 포커스가 흔들리지 않도록 클립보드를 먼저 준비합니다.
     Set-ClipboardTextSafe $Query
-    [System.Windows.Forms.SendKeys]::SendWait('^v')
-    Start-Sleep -Milliseconds 1100
 
-    # 검색 결과 첫 줄을 두 번 눌러 방을 엽니다. 결과 목록은 원래 목록과 같은 자리에 나타납니다.
-    $resultX = $layout.List.Rect.Left + [int]($layout.List.Width * 0.35)
-    $resultY = $layout.List.Rect.Top + 32
+    # 검색어를 넣고, 결과에서 검색어와 맞는 줄을 찾습니다. 한 번 실패하면 검색창을 새로 열어 다시 시도합니다.
+    $matchedLine = $null
+    $list = $layout.List
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        if (-not (Set-KakaoSearchQuery $layout $Query ($attempt -gt 0))) {
+            throw "카카오톡 검색창을 열지 못했습니다.`r`n카카오톡 창을 조금 더 크게 한 뒤 다시 시도해 주세요."
+        }
+        $current = Get-KakaoLayout (Get-MainKakaoWindow)
+        if ($null -ne $current.List) { $list = $current.List }
+        if ($null -eq $list) { continue }
+        $searchDeadline = (Get-Date).AddMilliseconds(2200)
+        while ((Get-Date) -lt $searchDeadline) {
+            Start-Sleep -Milliseconds 200
+            try {
+                $refreshed = Get-KakaoLayout (Get-MainKakaoWindow)
+                if ($null -ne $refreshed.List) { $list = $refreshed.List }
+                $lines = @(Get-OcrLines $list 2)
+                $matchedLine = Find-SearchResultLine $lines $Query $list.Width
+                if ($null -ne $matchedLine) { break }
+            } catch { }
+        }
+        if ($null -ne $matchedLine) { break }
+    }
+
+    if ($null -eq $matchedLine) {
+        Close-KakaoSearchBox
+        return $null
+    }
+
+    $resultX = $list.Rect.Left + [int]($list.Width * 0.35)
+    $resultY = $list.Rect.Top + $matchedLine.Top + 8
     Invoke-PointClick $resultX $resultY $true
 
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
@@ -1042,12 +1245,14 @@ function Open-RoomBySearch([string]$Query, [string]$RoomType, [int]$TimeoutMs = 
                 if (-not $window.Visible -or $window.Handle -eq $main.Handle) { continue }
                 if ($existing.ContainsKey([string]$window.Handle)) { continue }
                 if ([string]::IsNullOrWhiteSpace($window.Title)) { continue }
+                Close-KakaoSearchBox
                 return $window
             }
         }
-        Start-Sleep -Milliseconds 220
+        Start-Sleep -Milliseconds 80
     }
 
+    Close-KakaoSearchBox
     # 이미 열려 있던 창이면 제목으로 찾습니다.
     return (Find-ChatWindow $Query $main.Handle)
 }
@@ -1321,7 +1526,7 @@ if ($SelfTest) {
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
-    foreach ($name in @('ChatTabX', 'ChatTabY', 'ChatViewName', 'OpenChatTabX', 'OpenChatTabY', 'OpenChatViewName')) {
+    foreach ($name in @('SearchIconOffset')) {
         if ($null -eq $script:config.Calibration.PSObject.Properties[$name]) { throw "필수 보정 항목 누락: $name" }
     }
     if ($null -ne (ConvertTo-RoomCandidate '오후 3:20')) { throw '후보 필터 자체 점검 실패 (시각)' }
@@ -1464,6 +1669,39 @@ if ($ScanTest) {
         }
     }
     Write-Output 'SCANTEST_OK'
+    exit 0
+}
+
+# 발송 한 건당 걸리는 시간을 단계별로 재는 진단 모드입니다.
+# 메시지는 보내지 않고 '나와의 채팅' 창을 열고 닫기만 반복합니다.
+if ($SendBench) {
+    $room = if ($env:KAKAO_BENCH_ROOM) { $env:KAKAO_BENCH_ROOM } else { '나와의 채팅' }
+    $ready = Test-KakaoReady $true $true
+    if (-not $ready.Ok) { Write-Output "준비 안 됨: $($ready.Reason)"; exit 1 }
+    Write-Output ("대상: {0} / 반복 {1}회 (전송하지 않음)" -f $room, $BenchCount)
+    $openTimes = @()
+    $closeTimes = @()
+    for ($i = 1; $i -le $BenchCount; $i++) {
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $chat = Open-RoomBySearch $room $script:RoomTypeNormal
+        $watch.Stop()
+        $openMs = $watch.ElapsedMilliseconds
+        if ($null -eq $chat) { Write-Output ("  {0}회: 창을 열지 못했습니다 ({1}ms)" -f $i, $openMs); continue }
+        $watch.Restart()
+        Close-ChatWindow $chat
+        $watch.Stop()
+        $closeMs = $watch.ElapsedMilliseconds
+        $openTimes += $openMs
+        $closeTimes += $closeMs
+        Write-Output ("  {0}회: 열기 {1}ms + 닫기 {2}ms = {3}ms" -f $i, $openMs, $closeMs, ($openMs + $closeMs))
+        Start-Sleep -Milliseconds 400
+    }
+    if ($openTimes.Count -gt 0) {
+        $avgOpen = [int](($openTimes | Measure-Object -Average).Average)
+        $avgClose = [int](($closeTimes | Measure-Object -Average).Average)
+        Write-Output ("평균: 열기 {0}ms + 닫기 {1}ms = 방 하나당 약 {2:N1}초 (메시지 전송 시간 제외)" -f $avgOpen, $avgClose, (($avgOpen + $avgClose) / 1000))
+    }
+    Write-Output 'SENDBENCH_OK'
     exit 0
 }
 
@@ -2086,8 +2324,7 @@ $pageSettings = New-Page 'settings'
 $cardStatus = New-Card $pageSettings 28 12 784 240 '카카오톡 연결 상태' '좌표를 맞출 필요는 없습니다. 카카오톡 화면 구조를 그때그때 읽어 자동으로 찾습니다.'
 $script:lblKakaoState = New-CardLabel $cardStatus '확인 중입니다...' 24 78 736 104 $FontBase $Theme.Sub
 $btnCheckKakao = New-AppButton $cardStatus '지금 확인' 24 190 150 40 'primary'
-$btnTeachChat = New-AppButton $cardStatus '채팅 탭 위치 알려주기' 184 190 190 40
-$btnTeachOpen = New-AppButton $cardStatus '오픈채팅 탭 위치 알려주기' 384 190 210 40
+$btnOpenKakao = New-AppButton $cardStatus '카카오톡 창 앞으로 가져오기' 184 190 220 40
 
 $cardUpdate = New-Card $pageSettings 28 264 784 196 '업데이트' "GitHub 저장소 $($script:RepoOwner)/$($script:RepoName) 의 최신 배포본을 확인합니다."
 $script:lblUpdateState = New-CardLabel $cardUpdate "현재 버전 v$($script:AppVersion)" 24 76 736 46 $FontBase $Theme.Ink
@@ -2385,8 +2622,8 @@ $btnShowHolidays.Add_Click({
         $lines.Add("$($entry.Key) ($(('일','월','화','수','목','금','토')[[int]$date.DayOfWeek]))  $($entry.Value)")
     }
     [System.Windows.Forms.MessageBox]::Show(
-        "$year년 공휴일 ($($lines.Count)일)`r`n`r`n$($lines -join [Environment]::NewLine)`r`n`r`n음력 명절은 Windows 음력 달력으로 계산합니다. 임시공휴일은 포함되지 않습니다.",
-        "$year년 공휴일") | Out-Null
+        "$($year)년 공휴일 ($($lines.Count)일)`r`n`r`n$($lines -join [Environment]::NewLine)`r`n`r`n음력 명절은 Windows 음력 달력으로 계산합니다. 임시공휴일은 포함되지 않습니다.",
+        "$($year)년 공휴일") | Out-Null
 })
 
 $btnTestMyChat.Add_Click({ $script:txtTestRoom.Text = '나와의 채팅'; Sync-ConfigFromForm })
@@ -2773,149 +3010,39 @@ $btnTestDry.Add_Click({
     }
 })
 
-# ----- 카카오톡 연결 확인 및 탭 알려주기 -----
+# ----- 카카오톡 연결 확인 -----
 function Update-KakaoStateLabel {
     $lines = New-Object System.Collections.Generic.List[string]
     $ready = Test-KakaoReady
     if ($ready.Ok) {
-        $lines.Add("[정상] 카카오톡 연결됨 — 지금 보고 있는 화면: $($ready.Layout.ViewName)")
-        $lines.Add("[정상] 채팅 목록과 검색창을 찾았습니다. 좌표 설정은 필요 없습니다.")
+        $lines.Add("[정상] 카카오톡 연결됨 - 지금 보고 있는 화면: $($ready.Layout.ViewName)")
+        $lines.Add("[정상] 채팅방 목록을 찾았습니다.")
     } else {
         $lines.Add("[확인 필요] $($ready.Reason)")
     }
     if (Initialize-Ocr) { $lines.Add('[정상] 한국어 문자 인식 사용 가능') }
-    else { $lines.Add("[확인 필요] 한국어 문자 인식 불가 — $($script:ocrError)") }
-
-    $chatTaught = Test-TabTaught 'ChatTab'
-    $openTaught = Test-TabTaught 'OpenChatTab'
-    $lines.Add("[선택] 채팅 탭 위치: $(if ($chatTaught) { '기억함' } else { '기억 안 함 (직접 탭을 눌러 두면 됩니다)' })")
-    $lines.Add("[선택] 오픈채팅 탭 위치: $(if ($openTaught) { '기억함' } else { '기억 안 함 (직접 탭을 눌러 두면 됩니다)' })")
+    else { $lines.Add("[확인 필요] 한국어 문자 인식 불가 - $($script:ocrError)") }
+    $lines.Add('[안내] 채팅/오픈채팅 탭과 검색 아이콘은 자동으로 찾습니다. 따로 설정할 것이 없습니다.')
 
     $script:lblKakaoState.Text = ($lines -join [Environment]::NewLine)
     $script:lblKakaoState.ForeColor = if ($ready.Ok) { $Theme.Sub } else { $Theme.Danger }
     return $ready
 }
 
-# 창을 숨기지 않고, 항상 위에 보이는 안내 띠를 띄웁니다.
-# 예전에는 메인 창을 숨겨서 프로그램이 꺼진 것처럼 보였습니다.
-function New-TeachOverlay([string]$Label) {
-    $overlay = New-Object System.Windows.Forms.Form
-    $overlay.FormBorderStyle = 'None'
-    $overlay.TopMost = $true
-    $overlay.ShowInTaskbar = $false
-    $overlay.StartPosition = 'Manual'
-    $overlay.BackColor = $Theme.Accent
-    $overlay.Size = New-Object System.Drawing.Size(620, 116)
-    $screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $overlay.Location = New-Object System.Drawing.Point(
-        ($screen.X + [int](($screen.Width - 620) / 2)), ($screen.Y + 40))
-
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = "카카오톡에서 [$Label] 탭을 한 번 클릭해 주세요"
-    $title.Font = New-Object System.Drawing.Font('Malgun Gothic', 13, [System.Drawing.FontStyle]::Bold)
-    $title.ForeColor = $Theme.AccentInk
-    $title.BackColor = $Theme.Accent
-    $title.Location = New-Object System.Drawing.Point(24, 18)
-    $title.Size = New-Object System.Drawing.Size(572, 30)
-    $overlay.Controls.Add($title)
-
-    $hint = New-Object System.Windows.Forms.Label
-    $hint.Font = $FontBase
-    $hint.ForeColor = $Theme.AccentInk
-    $hint.BackColor = $Theme.Accent
-    $hint.Location = New-Object System.Drawing.Point(24, 52)
-    $hint.Size = New-Object System.Drawing.Size(572, 48)
-    $hint.Text = "카카오톡 왼쪽 세로 줄에 있는 아이콘입니다. 클릭한 자리를 기억해 둡니다.`r`n그만두려면 Esc 키를 누르세요."
-    $overlay.Controls.Add($hint)
-
-    return [pscustomobject]@{ Form = $overlay; Hint = $hint }
-}
-
-function Invoke-TabTeach([string]$Which) {
-    $label = if ($Which -eq 'OpenChatTab') { '오픈채팅' } else { '채팅' }
-    $body = "이제 카카오톡 창이 앞으로 나옵니다.`r`n`r`n화면 위쪽에 노란 안내 띠가 나타나면, 카카오톡 왼쪽 세로 줄에서 [$label] 아이콘을 평소처럼 한 번 클릭해 주세요.`r`n`r`n클릭한 자리를 기억해 두었다가 다음부터 자동으로 눌러 줍니다.`r`n이 프로그램 창은 그대로 열려 있습니다. (그만두려면 Esc)"
-    if ([System.Windows.Forms.MessageBox]::Show($body, "$label 탭 위치 알려주기", 'OKCancel', 'Information') -ne 'OK') { return }
-
-    $main = Get-MainKakaoWindow $true
-    if ($null -eq $main) { throw 'PC 카카오톡이 실행되어 있지 않습니다. 카카오톡을 먼저 실행해 주세요.' }
-
-    $overlay = New-TeachOverlay $label
-    $overlay.Form.Show()
-    [System.Windows.Forms.Application]::DoEvents()
-    Start-Sleep -Milliseconds 200
-    [void](Enter-KakaoForeground $main)
-    $overlay.Form.TopMost = $true
-    while (([NativeKakao]::GetAsyncKeyState(0x01) -band 0x8000) -ne 0) { Start-Sleep -Milliseconds 40 }
-
-    $deadline = (Get-Date).AddSeconds(30)
-    $captured = $null
-    $cancelled = $false
-    try {
-        while ((Get-Date) -lt $deadline) {
-            $remaining = [int]([Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
-            $overlay.Hint.Text = "카카오톡 왼쪽 세로 줄에 있는 아이콘입니다. 남은 시간 $($remaining)초`r`n그만두려면 Esc 키를 누르세요."
-            [System.Windows.Forms.Application]::DoEvents()
-            if (([NativeKakao]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0) { $cancelled = $true; break }
-            if (([NativeKakao]::GetAsyncKeyState(0x01) -band 0x8000) -ne 0) {
-                $point = New-Object NativeKakao+POINT
-                [void][NativeKakao]::GetCursorPos([ref]$point)
-                $current = [NativeKakao]::GetWindow($main.Handle)
-                # 안내 띠를 클릭한 경우는 무시합니다.
-                $overlayRect = $overlay.Form.Bounds
-                if ($overlayRect.Contains($point.X, $point.Y)) { Start-Sleep -Milliseconds 200; continue }
-                if ($point.X -ge $current.Rect.Left -and $point.X -le $current.Rect.Right -and
-                    $point.Y -ge $current.Rect.Top -and $point.Y -le $current.Rect.Bottom) {
-                    $captured = [pscustomobject]@{ X = $point.X; Y = $point.Y; Window = $current }
-                    break
-                }
-            }
-            Start-Sleep -Milliseconds 40
-        }
-    } finally {
-        Start-Sleep -Milliseconds 900
-        $overlay.Form.Close()
-        $overlay.Form.Dispose()
-    }
-
-    $viewName = ''
-    $latest = Get-MainKakaoWindow
-    if ($null -ne $latest) { $viewName = (Get-KakaoLayout $latest).ViewName }
-
-    $script:form.Activate()
-
-    if ($cancelled) { Write-RunLog "$label 탭 위치 알려주기를 취소했습니다."; return }
-    if ($null -eq $captured) { throw "클릭을 받지 못했습니다.`r`n카카오톡 창 안쪽을 클릭해야 합니다. 다시 시도해 주세요." }
-
-    $window = $captured.Window
-    $xRatio = [Math]::Round(($captured.X - $window.Rect.Left) / $window.Width, 6)
-    $yRatio = [Math]::Round(($captured.Y - $window.Rect.Top) / $window.Height, 6)
-    $calibration = $script:config.Calibration
-    if ($Which -eq 'OpenChatTab') {
-        $calibration.OpenChatTabX = $xRatio
-        $calibration.OpenChatTabY = $yRatio
-        $calibration.OpenChatViewName = $viewName
-    } else {
-        $calibration.ChatTabX = $xRatio
-        $calibration.ChatTabY = $yRatio
-        $calibration.ChatViewName = $viewName
-    }
-    Save-Config $script:config
-    Write-RunLog "$label 탭 위치를 기억했습니다. (화면: $viewName)"
-    [void](Update-KakaoStateLabel)
-    [System.Windows.Forms.MessageBox]::Show("$label 탭 위치를 기억했습니다.`r`n클릭 후 나타난 화면: $viewName", '완료') | Out-Null
-}
-
 $btnCheckKakao.Add_Click({
     $ready = Update-KakaoStateLabel
     if ($ready.Ok) { Set-StatusPill '카카오톡 연결됨' 'done' } else { Set-StatusPill '카카오톡 확인 필요' 'error' }
 })
-$btnTeachChat.Add_Click({
-    try { Invoke-TabTeach 'ChatTab' }
-    catch { $script:form.Activate(); [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '탭 위치 알려주기 실패') | Out-Null }
-})
-$btnTeachOpen.Add_Click({
-    try { Invoke-TabTeach 'OpenChatTab' }
-    catch { $script:form.Activate(); [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '탭 위치 알려주기 실패') | Out-Null }
+$btnOpenKakao.Add_Click({
+    $main = Get-MainKakaoWindow $true
+    if ($null -eq $main) {
+        [System.Windows.Forms.MessageBox]::Show('PC 카카오톡이 실행되어 있지 않습니다. 카카오톡을 먼저 실행해 주세요.', '카카오톡 없음') | Out-Null
+        return
+    }
+    [void](Enter-KakaoForeground $main)
+    Start-Sleep -Milliseconds 400
+    $script:form.Activate()
+    [void](Update-KakaoStateLabel)
 })
 
 # ----- 업데이트 -----
