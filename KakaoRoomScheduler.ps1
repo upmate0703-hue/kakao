@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '3.4.0'
+$script:AppVersion = '4.0.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -166,6 +166,99 @@ public static class NativeKakao {
         IntPtr lParam = (IntPtr)((screenY << 16) | (screenX & 0xFFFF));
         SendMessage(hWnd, 0x020A, wParam, lParam);
     }
+
+    // ---------------------------------------------------------------
+    // 창 메시지로 직접 조작합니다.
+    // 마우스를 움직이거나 창을 앞으로 가져오지 않아도 되고,
+    // 화면 배율·해상도가 달라도 같은 자리를 정확히 누릅니다.
+    // ---------------------------------------------------------------
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")] static extern IntPtr SendMessageTextW(IntPtr hWnd, uint msg, IntPtr wParam, string lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")] static extern IntPtr SendMessageBufferW(IntPtr hWnd, uint msg, IntPtr wParam, StringBuilder lParam);
+    [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr hWnd, ref POINT point);
+    [DllImport("user32.dll")] static extern IntPtr RealChildWindowFromPoint(IntPtr parent, POINT point);
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hWnd, ref POINT point);
+
+    const uint WM_CLOSE = 0x0010;
+    const uint WM_SETTEXT = 0x000C;
+    const uint WM_GETTEXT = 0x000D;
+    const uint WM_GETTEXTLENGTH = 0x000E;
+    const uint WM_KEYDOWN = 0x0100;
+    const uint WM_KEYUP = 0x0101;
+    const uint WM_CHAR = 0x0102;
+    const uint WM_LBUTTONDOWN = 0x0201;
+    const uint WM_LBUTTONUP = 0x0202;
+    const uint WM_LBUTTONDBLCLK = 0x0203;
+    const uint WM_PASTE = 0x0302;
+
+    static IntPtr MakeLParam(int x, int y) { return (IntPtr)((y << 16) | (x & 0xFFFF)); }
+
+    public static POINT ToClient(IntPtr hWnd, int screenX, int screenY) {
+        POINT p; p.X = screenX; p.Y = screenY;
+        ScreenToClient(hWnd, ref p);
+        return p;
+    }
+
+    // 화면의 한 점 아래에 실제로 있는 자식 컨트롤을 찾습니다.
+    public static IntPtr ChildAtPoint(IntPtr parent, int screenX, int screenY) {
+        POINT p = ToClient(parent, screenX, screenY);
+        IntPtr child = RealChildWindowFromPoint(parent, p);
+        if (child == IntPtr.Zero) { return parent; }
+        // 한 단계 더 내려갑니다.
+        for (int depth = 0; depth < 4 && child != IntPtr.Zero && child != parent; depth++) {
+            POINT inner = ToClient(child, screenX, screenY);
+            IntPtr deeper = RealChildWindowFromPoint(child, inner);
+            if (deeper == IntPtr.Zero || deeper == child) { break; }
+            parent = child;
+            child = deeper;
+        }
+        return child;
+    }
+
+    public static void ClickControl(IntPtr hWnd, int screenX, int screenY, bool doubleClick) {
+        POINT p = ToClient(hWnd, screenX, screenY);
+        IntPtr lp = MakeLParam(p.X, p.Y);
+        PostMessageW(hWnd, WM_LBUTTONDOWN, (IntPtr)1, lp);
+        PostMessageW(hWnd, WM_LBUTTONUP, IntPtr.Zero, lp);
+        if (doubleClick) {
+            System.Threading.Thread.Sleep(40);
+            PostMessageW(hWnd, WM_LBUTTONDBLCLK, (IntPtr)1, lp);
+            PostMessageW(hWnd, WM_LBUTTONUP, IntPtr.Zero, lp);
+        }
+    }
+
+    public static void TypeText(IntPtr hWnd, string text) {
+        foreach (char c in text) {
+            PostMessageW(hWnd, WM_CHAR, (IntPtr)c, (IntPtr)1);
+            System.Threading.Thread.Sleep(6);
+        }
+    }
+
+    public static void SetControlText(IntPtr hWnd, string text) {
+        SendMessageTextW(hWnd, WM_SETTEXT, IntPtr.Zero, text);
+    }
+
+    public static string GetControlText(IntPtr hWnd) {
+        int length = (int)SendMessage(hWnd, WM_GETTEXTLENGTH, IntPtr.Zero, IntPtr.Zero);
+        if (length <= 0) { return string.Empty; }
+        var buffer = new StringBuilder(length + 2);
+        SendMessageBufferW(hWnd, WM_GETTEXT, (IntPtr)(length + 1), buffer);
+        return buffer.ToString();
+    }
+
+    public static void PasteInto(IntPtr hWnd) {
+        SendMessage(hWnd, WM_PASTE, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    public static void PressKey(IntPtr hWnd, int virtualKey) {
+        PostMessageW(hWnd, WM_KEYDOWN, (IntPtr)virtualKey, IntPtr.Zero);
+        System.Threading.Thread.Sleep(25);
+        PostMessageW(hWnd, WM_KEYUP, (IntPtr)virtualKey, IntPtr.Zero);
+    }
+
+    public static void CloseWindow(IntPtr hWnd) {
+        PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+    }
 }
 "@
 }
@@ -191,6 +284,8 @@ $script:statusText = '준비됨'
 $script:statusKind = 'idle'
 $script:pillStatus = $null
 $script:hoverNav = ''
+$script:selectedKakaoProcessId = 0
+$script:activeKakaoWindow = $null
 
 $script:RoomTypeNormal = '일반채팅'
 $script:RoomTypeOpen = '오픈채팅'
@@ -505,22 +600,47 @@ function Get-KakaoProcesses {
     @(Get-Process -Name KakaoTalk -ErrorAction SilentlyContinue)
 }
 
-# 열려 있는 개별 채팅창을 메인 창으로 착각하지 않도록, 제목과 내부 화면 이름으로 확인합니다.
-function Find-KakaoMainHandle {
-    $fallback = @()
+# 카카오톡을 여러 개 켜 두는 경우가 있어, 메인 창을 모두 찾아 목록으로 돌려줍니다.
+function Get-KakaoMainWindows {
+    $found = @()
+    $seen = @{}
     foreach ($process in (Get-KakaoProcesses)) {
         foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
-            if ($window.Title -eq '카카오톡' -or $window.Title -eq 'KakaoTalk') { return $window.Handle }
-            if ($window.Visible -and $window.Width -ge 240 -and $window.Height -ge 320) { $fallback += $window }
+            if ($seen.ContainsKey([string]$window.Handle)) { continue }
+            $isMain = ($window.Title -eq '카카오톡' -or $window.Title -eq 'KakaoTalk')
+            if (-not $isMain) {
+                if (-not $window.Visible -or $window.Width -lt 240 -or $window.Height -lt 320) { continue }
+                $children = @([NativeKakao]::GetChildWindows($window.Handle))
+                if (@($children | Where-Object { $_.Title -match 'ChatRoomListView|ContactListView|OnlineMainView' }).Count -eq 0) { continue }
+            }
+            $seen[[string]$window.Handle] = $true
+            $found += [pscustomobject]@{
+                Handle = $window.Handle
+                ProcessId = $window.ProcessId
+                Title = $window.Title
+                Minimized = (Test-WindowMinimized $window)
+            }
         }
     }
-    foreach ($window in $fallback) {
-        $children = @([NativeKakao]::GetChildWindows($window.Handle))
-        if (@($children | Where-Object { $_.Title -match 'ChatRoomListView|ContactListView|OpenChat|OnlineMainView' }).Count -gt 0) {
-            return $window.Handle
-        }
+    return @($found | Sort-Object -Property ProcessId, Handle)
+}
+
+function Get-KakaoInstanceLabel([object]$Instance) {
+    $state = if ($Instance.Minimized) { '최소화됨' } else { '사용 가능' }
+    return "카카오톡 #$($Instance.ProcessId) ($state)"
+}
+
+function Find-KakaoMainHandle {
+    $instances = @(Get-KakaoMainWindows)
+    if ($instances.Count -eq 0) { return [IntPtr]::Zero }
+    # 사용자가 고른 카카오톡이 아직 살아 있으면 그것을 씁니다.
+    if ($script:selectedKakaoProcessId -gt 0) {
+        $chosen = @($instances | Where-Object { $_.ProcessId -eq $script:selectedKakaoProcessId })
+        if ($chosen.Count -gt 0) { return $chosen[0].Handle }
     }
-    return [IntPtr]::Zero
+    $usable = @($instances | Where-Object { -not $_.Minimized })
+    if ($usable.Count -gt 0) { return $usable[0].Handle }
+    return $instances[0].Handle
 }
 
 function Test-WindowMinimized([object]$Window) {
@@ -531,7 +651,7 @@ function Test-WindowMinimized([object]$Window) {
 
 function Get-MainKakaoWindow([bool]$Restore = $false) {
     $handle = Find-KakaoMainHandle
-    if ($handle -eq [IntPtr]::Zero) { return $null }
+    if ($handle -eq [IntPtr]::Zero) { $script:activeKakaoWindow = $null; return $null }
     $window = [NativeKakao]::GetWindow($handle)
     if ($Restore -and (Test-WindowMinimized $window)) {
         [void][NativeKakao]::ShowWindow($handle, 9)
@@ -539,6 +659,7 @@ function Get-MainKakaoWindow([bool]$Restore = $false) {
         $window = [NativeKakao]::GetWindow($handle)
         Write-RunLog '카카오톡 창이 최소화되어 있어 다시 열었습니다.'
     }
+    $script:activeKakaoWindow = $window
     return $window
 }
 
@@ -702,8 +823,6 @@ function Open-KakaoSearchBox([object]$Layout, [object[]]$Words) {
     $main = $Layout.Main
     if ($null -ne (Get-VisibleSearchEdit $main)) { return $true }
 
-    # 클릭이 먹으려면 카카오톡이 앞에 있어야 합니다.
-    [void](Enter-KakaoForeground $main)
     $band = Get-TopBandRegion $Layout
     if ($null -eq $band) { return $false }
     $tabChat = Find-TabPoint $Words 'chat'
@@ -765,34 +884,49 @@ function Find-SearchResultLine([object[]]$Lines, [string]$Query, [int]$Width) {
 }
 
 function Close-KakaoSearchBox {
-    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+    $main = $script:activeKakaoWindow
+    if ($null -eq $main) { return }
+    $edit = Get-VisibleSearchEdit $main
+    if ($null -ne $edit) {
+        [NativeKakao]::SetControlText($edit.Handle, '')
+        [NativeKakao]::PressKey($edit.Handle, 0x1B)
+    }
     Start-Sleep -Milliseconds 150
 }
 
-# 검색칸에 검색어를 넣습니다.
-# Ctrl+A 를 먼저 보내면 카카오톡이 붙여넣기를 무시합니다. Home + Shift+End 로 지웁니다.
+# 검색칸에 검색어를 넣습니다. 창을 앞으로 가져오지 않고 컨트롤에 직접 보냅니다.
 function Set-KakaoSearchQuery([object]$Layout, [string]$Query, [bool]$Fresh) {
     $main = $Layout.Main
     $edit = Get-VisibleSearchEdit $main
-    if ($Fresh -and $null -ne $edit) {
-        Close-KakaoSearchBox
-        Start-Sleep -Milliseconds 220
-        $edit = $null
-    }
     if ($null -eq $edit) {
         $words = @(Get-TopBandWords $Layout)
         if (-not (Open-KakaoSearchBox $Layout $words)) { return $false }
-        Start-Sleep -Milliseconds 260
+        Start-Sleep -Milliseconds 240
         $edit = Get-VisibleSearchEdit $main
         if ($null -eq $edit) { return $false }
     }
-    Invoke-PointClick ($edit.Rect.Left + [int]($edit.Width / 2)) ($edit.Rect.Top + [int]($edit.Height / 2))
-    Start-Sleep -Milliseconds 180
-    [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
-    [System.Windows.Forms.SendKeys]::SendWait('+{END}')
-    [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
-    [System.Windows.Forms.SendKeys]::SendWait('^v')
-    return $true
+
+    # 입력칸을 눌러 활성화한 뒤 글자를 하나씩 보냅니다.
+    # 카카오톡이 글자마다 검색을 다시 하므로 WM_CHAR 방식이 가장 확실합니다.
+    [NativeKakao]::ClickControl($edit.Handle, ($edit.Rect.Left + [int]($edit.Width / 2)), ($edit.Rect.Top + [int]($edit.Height / 2)), $false)
+    Start-Sleep -Milliseconds 120
+    [NativeKakao]::SetControlText($edit.Handle, '')
+    Start-Sleep -Milliseconds 60
+    [NativeKakao]::TypeText($edit.Handle, $Query)
+    Start-Sleep -Milliseconds 120
+
+    # 실제로 들어갔는지 확인합니다.
+    $written = [NativeKakao]::GetControlText($edit.Handle)
+    if (($written -replace '\s', '') -ne ($Query -replace '\s', '')) {
+        # 한 번 더: 붙여넣기로 시도
+        Set-ClipboardTextSafe $Query
+        [NativeKakao]::SetControlText($edit.Handle, '')
+        Start-Sleep -Milliseconds 60
+        [NativeKakao]::PasteInto($edit.Handle)
+        Start-Sleep -Milliseconds 200
+        $written = [NativeKakao]::GetControlText($edit.Handle)
+    }
+    return (($written -replace '\s', '') -eq ($Query -replace '\s', ''))
 }
 
 # 목록을 읽는 데는 검색창이 필요하지 않습니다. 보낼 때만 필요합니다.
@@ -815,8 +949,21 @@ function Test-KakaoReady([bool]$Restore = $false, [bool]$NeedSearch = $false) {
     return [pscustomobject]@{ Ok = $true; Reason = ''; Layout = $layout }
 }
 
+# 화면 좌표를 그 자리에 있는 컨트롤에 대한 메시지로 바꿔 보냅니다.
+# 마우스를 움직이지 않고, 카카오톡이 뒤에 있어도 동작합니다.
 function Invoke-PointClick([int]$X, [int]$Y, [bool]$DoubleClick = $false) {
-    [NativeKakao]::Click($X, $Y, $DoubleClick)
+    $main = $script:activeKakaoWindow
+    if ($null -eq $main) { $main = Get-MainKakaoWindow }
+    if ($null -eq $main) { return $false }
+    $target = [NativeKakao]::ChildAtPoint($main.Handle, $X, $Y)
+    if ($target -eq [IntPtr]::Zero) { $target = $main.Handle }
+    [NativeKakao]::ClickControl($target, $X, $Y, $DoubleClick)
+    return $true
+}
+
+# 특정 컨트롤에 직접 누르기 (좌표를 아는 컨트롤이 있을 때)
+function Invoke-ControlClick([object]$Control, [int]$X, [int]$Y, [bool]$DoubleClick = $false) {
+    [NativeKakao]::ClickControl($Control.Handle, $X, $Y, $DoubleClick)
 }
 
 function Invoke-RatioClick([object]$Window, [double]$XRatio, [double]$YRatio) {
@@ -836,7 +983,6 @@ function Enter-KakaoTab([string]$Type) {
     if (-not $wantOpen -and $layout.IsChatList) { return $layout }
 
     $label = if ($wantOpen) { '오픈채팅' } else { '채팅' }
-    [void](Enter-KakaoForeground $main)
     $words = @(Get-TopBandWords $layout)
     $tab = Find-TabPoint $words $(if ($wantOpen) { 'open' } else { 'chat' })
     if ($null -eq $tab) {
@@ -888,10 +1034,28 @@ function Find-ChatWindow([string]$Room, [IntPtr]$MainHandle) {
 }
 
 function Close-ChatWindow([object]$Window) {
-    [void][NativeKakao]::ForceForeground($Window.Handle)
-    Start-Sleep -Milliseconds 250
-    [System.Windows.Forms.SendKeys]::SendWait('%{F4}')
-    Start-Sleep -Milliseconds 400
+    # 창을 앞으로 가져오지 않고 닫습니다.
+    [NativeKakao]::CloseWindow($Window.Handle)
+    $deadline = (Get-Date).AddMilliseconds(1500)
+    while ((Get-Date) -lt $deadline) {
+        $still = [NativeKakao]::GetWindow($Window.Handle)
+        if ($null -eq $still -or -not $still.Visible) { return }
+        Start-Sleep -Milliseconds 60
+    }
+}
+
+# 채팅창의 글 입력칸(RICHEDIT50W)을 찾습니다.
+function Get-ChatInputControl([object]$ChatWindow) {
+    $children = @([NativeKakao]::GetChildWindows($ChatWindow.Handle))
+    $rich = @($children | Where-Object {
+        $_.Visible -and $_.ClassName -like 'RICHEDIT*' -and $_.Width -ge 80 -and $_.Height -ge 16
+    } | Sort-Object -Property @{ Expression = { $_.Rect.Top } } -Descending)
+    if ($rich.Count -gt 0) { return $rich[0] }
+    $edits = @($children | Where-Object {
+        $_.Visible -and ($_.ClassName -eq 'Edit' -or $_.ClassName -like '*Edit*') -and $_.Width -ge 80
+    } | Sort-Object -Property @{ Expression = { $_.Rect.Top } } -Descending)
+    if ($edits.Count -gt 0) { return $edits[0] }
+    return $null
 }
 
 # 채팅창 하단의 입력칸을 UI 자동화로 찾아 직접 포커스를 줍니다.
@@ -1185,16 +1349,59 @@ function Get-KakaoRoomNames([int]$MaxPages = 30) {
 # ---------------------------------------------------------------------------
 # 검색으로 방 열기 · 발송
 # ---------------------------------------------------------------------------
+# 목록을 위에서부터 훑어 방을 찾아 엽니다.
+# 검색보다 느리지만, 검색창이 열리지 않는 환경에서도 확실히 동작합니다.
+function Open-RoomFromList([string]$Query, [object]$Layout, [int]$MaxPages = 40) {
+    $list = $Layout.List
+    if ($null -eq $list) { return $null }
+    $main = $Layout.Main
+
+    # 맨 위로 올립니다.
+    for ($i = 0; $i -lt ($MaxPages + 4); $i++) { Move-ListByWheel $list 'up' 8; Start-Sleep -Milliseconds 20 }
+    Start-Sleep -Milliseconds 250
+
+    $existing = @{}
+    foreach ($process in (Get-KakaoProcesses)) {
+        foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
+            if ($window.Visible) { $existing[[string]$window.Handle] = $true }
+        }
+    }
+
+    for ($page = 0; $page -lt $MaxPages; $page++) {
+        $lines = @(Get-OcrLines $list 2)
+        $matched = Find-SearchResultLine $lines $Query $list.Width
+        if ($null -ne $matched) {
+            $x = $list.Rect.Left + [int]($list.Width * 0.35)
+            $y = $list.Rect.Top + $matched.Top + 8
+            Invoke-ControlClick $list $x $y $true
+            $deadline = (Get-Date).AddMilliseconds(3500)
+            while ((Get-Date) -lt $deadline) {
+                foreach ($process in (Get-KakaoProcesses)) {
+                    foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
+                        if (-not $window.Visible -or $window.Handle -eq $main.Handle) { continue }
+                        if ($existing.ContainsKey([string]$window.Handle)) { continue }
+                        if ([string]::IsNullOrWhiteSpace($window.Title)) { continue }
+                        return $window
+                    }
+                }
+                Start-Sleep -Milliseconds 60
+            }
+            return $null
+        }
+        $names = @(Get-RoomNamesFromOcrLines $lines $list.Width)
+        $notches = [Math]::Max(3, [Math]::Min(8, $names.Count - 1))
+        Move-ListByWheel $list 'down' $notches
+        Start-Sleep -Milliseconds 170
+    }
+    return $null
+}
+
 function Open-RoomBySearch([string]$Query, [string]$RoomType, [int]$TimeoutMs = 5000) {
     $layout = Enter-KakaoTab $RoomType
     if ($null -eq $layout.List) {
         throw '채팅 목록을 찾지 못했습니다. 카카오톡 창을 조금 더 크게 하고, 목록이 보이게 해 주세요.'
     }
     $main = $layout.Main
-    if (-not (Enter-KakaoForeground $main)) {
-        Write-RunLog '경고: 카카오톡 창을 앞으로 가져오지 못했습니다. 계속 시도합니다.'
-    }
-
     $existing = @{}
     foreach ($process in (Get-KakaoProcesses)) {
         foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
@@ -1208,9 +1415,11 @@ function Open-RoomBySearch([string]$Query, [string]$RoomType, [int]$TimeoutMs = 
     # 검색어를 넣고, 결과에서 검색어와 맞는 줄을 찾습니다. 한 번 실패하면 검색창을 새로 열어 다시 시도합니다.
     $matchedLine = $null
     $list = $layout.List
+    $searchUsable = $true
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
         if (-not (Set-KakaoSearchQuery $layout $Query ($attempt -gt 0))) {
-            throw "카카오톡 검색창을 열지 못했습니다.`r`n카카오톡 창을 조금 더 크게 한 뒤 다시 시도해 주세요."
+            $searchUsable = $false
+            break
         }
         $current = Get-KakaoLayout (Get-MainKakaoWindow)
         if ($null -ne $current.List) { $list = $current.List }
@@ -1230,8 +1439,12 @@ function Open-RoomBySearch([string]$Query, [string]$RoomType, [int]$TimeoutMs = 
     }
 
     if ($null -eq $matchedLine) {
+        # 검색이 안 되는 환경이면 목록을 훑어 찾습니다.
         Close-KakaoSearchBox
-        return $null
+        Start-Sleep -Milliseconds 200
+        if (-not $searchUsable) { Write-RunLog "검색창을 쓸 수 없어 목록에서 찾습니다: '$Query'" }
+        $fresh = Get-KakaoLayout (Get-MainKakaoWindow)
+        return (Open-RoomFromList $Query $fresh)
     }
 
     $resultX = $list.Rect.Left + [int]($list.Width * 0.35)
@@ -1285,20 +1498,45 @@ function Invoke-OneRoom([string]$Room, [string]$RoomType, [object]$Content) {
         return $true
     }
 
-    [void][NativeKakao]::ForceForeground($chat.Handle)
-    Start-Sleep -Milliseconds 400
-    [void](Set-ChatInputFocus $chat)
+    $input = Get-ChatInputControl $chat
+    if ($null -eq $input) {
+        Write-RunLog "건너뜀: '$Room' — 글 입력칸을 찾지 못했습니다."
+        Close-ChatWindow $chat
+        return $false
+    }
 
     $message = [string]$Content.Message
     if (-not [string]::IsNullOrWhiteSpace($message)) {
-        Set-ClipboardTextSafe $message
-        [System.Windows.Forms.SendKeys]::SendWait('^v')
-        Start-Sleep -Milliseconds 300
-        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-        Start-Sleep -Milliseconds 800
+        # 입력칸에 글을 직접 넣고, 실제로 들어갔는지 읽어서 확인한 뒤에만 보냅니다.
+        [NativeKakao]::SetControlText($input.Handle, $message)
+        Start-Sleep -Milliseconds 150
+        $written = [NativeKakao]::GetControlText($input.Handle)
+        if ([string]::IsNullOrWhiteSpace($written)) {
+            # 일부 버전은 WM_SETTEXT 를 무시하므로 붙여넣기로 다시 시도합니다.
+            Set-ClipboardTextSafe $message
+            [NativeKakao]::ClickControl($input.Handle, ($input.Rect.Left + [int]($input.Width / 2)), ($input.Rect.Top + [int]($input.Height / 2)), $false)
+            Start-Sleep -Milliseconds 120
+            [NativeKakao]::PasteInto($input.Handle)
+            Start-Sleep -Milliseconds 250
+            $written = [NativeKakao]::GetControlText($input.Handle)
+        }
+        if ([string]::IsNullOrWhiteSpace($written)) {
+            Write-RunLog "건너뜀: '$Room' — 글을 입력칸에 넣지 못했습니다. (전송하지 않음)"
+            Close-ChatWindow $chat
+            return $false
+        }
+        # 넣은 글과 다르면 보내지 않습니다. 잘못된 내용이 나가는 것을 막습니다.
+        if (($written -replace '\s', '') -ne ($message -replace '\s', '')) {
+            Write-RunLog "건너뜀: '$Room' — 입력칸 내용이 문구와 다릅니다. (전송하지 않음)"
+            [NativeKakao]::SetControlText($input.Handle, '')
+            Close-ChatWindow $chat
+            return $false
+        }
+        [NativeKakao]::PressKey($input.Handle, 0x0D)
+        Start-Sleep -Milliseconds 400
     }
 
-    $waitMs = [Math]::Max(600, [int]$Content.AttachmentWaitMs)
+    $waitMs = [Math]::Max(500, [int]$Content.AttachmentWaitMs)
     foreach ($attachment in @($Content.Attachments)) {
         $path = [string]$attachment
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -1306,10 +1544,12 @@ function Invoke-OneRoom([string]$Room, [string]$RoomType, [object]$Content) {
             continue
         }
         Set-ClipboardFileSafe $path
-        [System.Windows.Forms.SendKeys]::SendWait('^v')
+        [NativeKakao]::ClickControl($input.Handle, ($input.Rect.Left + [int]($input.Width / 2)), ($input.Rect.Top + [int]($input.Height / 2)), $false)
+        Start-Sleep -Milliseconds 120
+        [NativeKakao]::PasteInto($input.Handle)
         Start-Sleep -Milliseconds $waitMs
-        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-        Start-Sleep -Milliseconds ($waitMs + 300)
+        [NativeKakao]::PressKey($input.Handle, 0x0D)
+        Start-Sleep -Milliseconds ($waitMs + 200)
     }
 
     Write-RunLog "발송 완료: '$Room'"
