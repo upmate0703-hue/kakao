@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.2.0'
+$script:AppVersion = '4.2.1'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -1591,8 +1591,8 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
         return $true
     }
 
-    $input = Get-ChatInputControl $chat
-    if ($null -eq $input) {
+    $inputBox = Get-ChatInputControl $chat
+    if ($null -eq $inputBox) {
         Write-RunLog "건너뜀: '$Room' — 글 입력칸을 찾지 못했습니다."
         Close-ChatWindow $chat
         return $false
@@ -1600,24 +1600,24 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
 
     $message = [string]$Content.Message
     if (-not [string]::IsNullOrWhiteSpace($message)) {
-        if (-not (Set-ChatInputText $input $message)) {
+        if (-not (Set-ChatInputText $inputBox $message)) {
             Write-RunLog "건너뜀: '$Room' — 글을 입력칸에 넣지 못했습니다. (전송하지 않음)"
-            Clear-ChatInput $input
+            Clear-ChatInput $inputBox
             Close-ChatWindow $chat
             return $false
         }
-        $written = [NativeKakao]::GetControlText($input.Handle)
+        $written = [NativeKakao]::GetControlText($inputBox.Handle)
         # 넣은 글과 다르면 보내지 않습니다. 잘못된 내용이 나가는 것을 막습니다.
         if (($written -replace '\s', '') -ne ($message -replace '\s', '')) {
             Write-RunLog "건너뜀: '$Room' — 입력칸 내용이 문구와 다릅니다. (전송하지 않음)"
-            Clear-ChatInput $input
+            Clear-ChatInput $inputBox
             Close-ChatWindow $chat
             return $false
         }
-        $how = Invoke-ChatSend $chat $input
+        $how = Invoke-ChatSend $chat $inputBox
         if (-not $how) {
             Write-RunLog "실패: '$Room' — 입력은 됐지만 전송되지 않았습니다. 입력칸을 비우고 넘어갑니다."
-            Clear-ChatInput $input
+            Clear-ChatInput $inputBox
             Close-ChatWindow $chat
             return $false
         }
@@ -1634,12 +1634,13 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
             Write-RunLog "첨부 건너뜀: 파일 없음 — $path"
             continue
         }
-        Set-ClipboardFileSafe $path
-        [NativeKakao]::ClickControl($input.Handle, ($input.Rect.Left + [int]($input.Width / 2)), ($input.Rect.Top + [int]($input.Height / 2)), $false)
+        try { Set-ClipboardFileSafe $path }
+        catch { Write-RunLog "첨부 건너뜀: 클립보드를 쓰지 못했습니다 — $path"; continue }
+        [NativeKakao]::ClickControl($inputBox.Handle, ($inputBox.Rect.Left + [int]($inputBox.Width / 2)), ($inputBox.Rect.Top + [int]($inputBox.Height / 2)), $false)
         Start-Sleep -Milliseconds 150
-        [NativeKakao]::PasteInto($input.Handle)
+        [NativeKakao]::PasteInto($inputBox.Handle)
         Start-Sleep -Milliseconds $waitMs
-        [void](Invoke-ChatSend $chat $input)
+        [void](Invoke-ChatSend $chat $inputBox)
         Start-Sleep -Milliseconds ($waitMs + 200)
     }
 
@@ -1653,41 +1654,49 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
 # ---------------------------------------------------------------------------
 $script:sendMethodLogged = ''
 
-function Clear-ChatInput([object]$Input) {
-    [NativeKakao]::SelectAllIn($Input.Handle)
-    [NativeKakao]::ClearSelection($Input.Handle)
+function Clear-ChatInput([object]$InputBox) {
+    [NativeKakao]::SelectAllIn($InputBox.Handle)
+    [NativeKakao]::ClearSelection($InputBox.Handle)
     Start-Sleep -Milliseconds 80
-    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle))) {
-        [NativeKakao]::SetControlText($Input.Handle, '')
+    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) {
+        [NativeKakao]::SetControlText($InputBox.Handle, '')
     }
 }
 
 # 붙여넣기로 넣습니다. WM_SETTEXT 만 쓰면 카카오톡 내부 상태가 갱신되지 않아
 # Enter 를 눌러도 전송되지 않는 경우가 있습니다.
-function Set-ChatInputText([object]$Input, [string]$Text) {
-    Set-ClipboardTextSafe $Text
-    [NativeKakao]::ClickControl($Input.Handle, ($Input.Rect.Left + [int]($Input.Width / 2)), ($Input.Rect.Top + [int]($Input.Height / 2)), $false)
+function Set-ChatInputText([object]$InputBox, [string]$Text) {
+    [NativeKakao]::ClickControl($InputBox.Handle, ($InputBox.Rect.Left + [int]($InputBox.Width / 2)), ($InputBox.Rect.Top + [int]($InputBox.Height / 2)), $false)
     Start-Sleep -Milliseconds 140
-    [NativeKakao]::SelectAllIn($Input.Handle)
-    [NativeKakao]::PasteInto($Input.Handle)
-    Start-Sleep -Milliseconds 220
-    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle))) { return $true }
 
-    # 붙여넣기가 막히면 글자를 하나씩 보냅니다.
-    [NativeKakao]::TypeText($Input.Handle, $Text)
-    Start-Sleep -Milliseconds 200
-    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle))) { return $true }
+    # 1순위: 붙여넣기. 실제 Ctrl+V 와 같은 경로라 카카오톡 내부 상태가 정상 갱신됩니다.
+    # 클립보드는 다른 프로그램이 잡고 있을 수 있으므로 실패해도 멈추지 않고 넘어갑니다.
+    $clipboardReady = $false
+    try { Set-ClipboardTextSafe $Text; $clipboardReady = $true } catch { Write-RunLog "클립보드를 쓰지 못해 직접 입력으로 넘어갑니다." }
+    if ($clipboardReady) {
+        [NativeKakao]::SelectAllIn($InputBox.Handle)
+        [NativeKakao]::PasteInto($InputBox.Handle)
+        Start-Sleep -Milliseconds 220
+        if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) { return $true }
+    }
 
-    # 마지막 수단
-    [NativeKakao]::SetControlText($Input.Handle, $Text)
+    # 2순위: 글자를 하나씩 보냅니다. 붙여넣기와 마찬가지로 변경 알림이 발생합니다.
+    [NativeKakao]::SelectAllIn($InputBox.Handle)
+    [NativeKakao]::ClearSelection($InputBox.Handle)
+    [NativeKakao]::TypeText($InputBox.Handle, $Text)
+    Start-Sleep -Milliseconds 250
+    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) { return $true }
+
+    # 3순위: 마지막 수단
+    [NativeKakao]::SetControlText($InputBox.Handle, $Text)
     Start-Sleep -Milliseconds 150
-    return (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle)))
+    return (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle)))
 }
 
-function Wait-ChatInputCleared([object]$Input, [int]$TimeoutMs) {
+function Wait-ChatInputCleared([object]$InputBox, [int]$TimeoutMs) {
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
-        if ([string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle))) { return $true }
+        if ([string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) { return $true }
         Start-Sleep -Milliseconds 70
     }
     return $false
@@ -1696,21 +1705,21 @@ function Wait-ChatInputCleared([object]$Input, [int]$TimeoutMs) {
 # 전송을 여러 방법으로 시도하고, 입력칸이 비워졌는지로 성공을 판단합니다.
 # 카카오톡은 전송에 성공하면 입력칸을 비우므로 확실한 신호가 됩니다.
 # 이미 전송되어 입력칸이 비었으면 다음 시도는 빈 내용이라 아무 일도 하지 않습니다.
-function Invoke-ChatSend([object]$Chat, [object]$Input) {
-    [NativeKakao]::PressKey($Input.Handle, 0x0D)
-    if (Wait-ChatInputCleared $Input 1400) { return '입력칸에 Enter 키' }
+function Invoke-ChatSend([object]$Chat, [object]$InputBox) {
+    [NativeKakao]::PressKey($InputBox.Handle, 0x0D)
+    if (Wait-ChatInputCleared $InputBox 1400) { return '입력칸에 Enter 키' }
 
-    [NativeKakao]::SendChar($Input.Handle, 13)
-    if (Wait-ChatInputCleared $Input 1200) { return '입력칸에 Enter 문자' }
+    [NativeKakao]::SendChar($InputBox.Handle, 13)
+    if (Wait-ChatInputCleared $InputBox 1200) { return '입력칸에 Enter 문자' }
 
     [NativeKakao]::PressKey($Chat.Handle, 0x0D)
-    if (Wait-ChatInputCleared $Input 1200) { return '채팅창에 Enter 키' }
+    if (Wait-ChatInputCleared $InputBox 1200) { return '채팅창에 Enter 키' }
 
     # 마지막으로 실제 키보드 입력을 시도합니다. 이때만 창을 앞으로 가져옵니다.
     if (Enter-KakaoForeground $Chat) {
         [void](Set-ChatInputFocus $Chat)
         [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-        if (Wait-ChatInputCleared $Input 1500) { return '창을 앞으로 가져와 Enter' }
+        if (Wait-ChatInputCleared $InputBox 1500) { return '창을 앞으로 가져와 Enter' }
     }
     return ''
 }
@@ -2973,17 +2982,17 @@ $script:lblKakaoState = New-CardLabel $cardStatus '확인 중입니다...' 24 78
 $btnCheckKakao = New-AppButton $cardStatus '지금 확인' 24 190 150 40 'primary'
 $btnOpenKakao = New-AppButton $cardStatus '카카오톡 창 앞으로 가져오기' 184 190 220 40
 
-$cardUpdate = New-Card $pageSettings 28 264 784 196 '업데이트' '최신 배포를 확인합니다.'
+$cardUpdate = New-Card $pageSettings 28 264 784 236 '업데이트' '최신 배포를 확인합니다.'
 $script:lblUpdateState = New-CardLabel $cardUpdate "현재 버전 v$($script:AppVersion)" 24 76 736 46 $FontBase $Theme.Ink
 $btnCheckUpdate  = New-AppButton $cardUpdate '업데이트 확인' 24 130 160 40
 $script:btnDoUpdate = New-AppButton $cardUpdate '지금 업데이트' 194 130 160 40 'primary'
 $script:btnDoUpdate.Enabled = $false
-$btnClearLogFiles = New-AppButton $cardUpdate '로그 파일 모두 지우기' 364 130 190 40 'danger'
+$btnClearLogFiles = New-AppButton $cardUpdate '로그 파일 모두 지우기' 364 130 200 40 'danger'
 $script:chkAutoUpdate = New-Object System.Windows.Forms.CheckBox
 $script:chkAutoUpdate.Text = '시작할 때 자동 확인'
 $script:chkAutoUpdate.Checked = [bool]$script:config.AutoCheckUpdate
-$script:chkAutoUpdate.Location = New-Object System.Drawing.Point(542, 122)
-$script:chkAutoUpdate.Size = New-Object System.Drawing.Size(216, 26)
+$script:chkAutoUpdate.Location = New-Object System.Drawing.Point(24, 182)
+$script:chkAutoUpdate.Size = New-Object System.Drawing.Size(240, 28)
 $script:chkAutoUpdate.BackColor = $Theme.Card
 $script:chkAutoUpdate.Font = $FontBase
 $cardUpdate.Controls.Add($script:chkAutoUpdate)
@@ -2991,13 +3000,13 @@ $cardUpdate.Controls.Add($script:chkAutoUpdate)
 $script:chkAutoDownload = New-Object System.Windows.Forms.CheckBox
 $script:chkAutoDownload.Text = '새 버전이 있으면 물어보고 바로 받기'
 $script:chkAutoDownload.Checked = [bool]$script:config.AutoDownloadUpdate
-$script:chkAutoDownload.Location = New-Object System.Drawing.Point(542, 150)
-$script:chkAutoDownload.Size = New-Object System.Drawing.Size(230, 26)
+$script:chkAutoDownload.Location = New-Object System.Drawing.Point(280, 182)
+$script:chkAutoDownload.Size = New-Object System.Drawing.Size(320, 28)
 $script:chkAutoDownload.BackColor = $Theme.Card
 $script:chkAutoDownload.Font = $FontBase
 $cardUpdate.Controls.Add($script:chkAutoDownload)
 
-$cardFolders = New-Card $pageSettings 28 472 784 176 '도움말 및 관리'
+$cardFolders = New-Card $pageSettings 28 512 784 176 '도움말 및 관리'
 $btnGuide      = New-AppButton $cardFolders '가이드 다시 보기' 24 62 160 40 'primary'
 $btnOpenApp    = New-AppButton $cardFolders '프로그램 폴더 열기' 194 62 170 40
 $btnOpenLogs   = New-AppButton $cardFolders '로그 폴더 열기' 374 62 150 40
