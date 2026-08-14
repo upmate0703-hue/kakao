@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.1.0'
+$script:AppVersion = '4.2.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -248,6 +248,21 @@ public static class NativeKakao {
 
     public static void PasteInto(IntPtr hWnd) {
         SendMessage(hWnd, WM_PASTE, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    // 입력칸 내용을 전체 선택합니다 (EM_SETSEL).
+    public static void SelectAllIn(IntPtr hWnd) {
+        SendMessage(hWnd, 0x00B1, IntPtr.Zero, (IntPtr)(-1));
+    }
+
+    // 선택 영역을 지웁니다 (WM_CLEAR).
+    public static void ClearSelection(IntPtr hWnd) {
+        SendMessage(hWnd, 0x0303, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    // 글자 하나를 보냅니다. Enter(13) 를 보낼 때도 씁니다.
+    public static void SendChar(IntPtr hWnd, int code) {
+        PostMessageW(hWnd, WM_CHAR, (IntPtr)code, (IntPtr)1);
     }
 
     public static void PressKey(IntPtr hWnd, int virtualKey) {
@@ -1585,33 +1600,31 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
 
     $message = [string]$Content.Message
     if (-not [string]::IsNullOrWhiteSpace($message)) {
-        # 입력칸에 글을 직접 넣고, 실제로 들어갔는지 읽어서 확인한 뒤에만 보냅니다.
-        [NativeKakao]::SetControlText($input.Handle, $message)
-        Start-Sleep -Milliseconds 150
-        $written = [NativeKakao]::GetControlText($input.Handle)
-        if ([string]::IsNullOrWhiteSpace($written)) {
-            # 일부 버전은 WM_SETTEXT 를 무시하므로 붙여넣기로 다시 시도합니다.
-            Set-ClipboardTextSafe $message
-            [NativeKakao]::ClickControl($input.Handle, ($input.Rect.Left + [int]($input.Width / 2)), ($input.Rect.Top + [int]($input.Height / 2)), $false)
-            Start-Sleep -Milliseconds 120
-            [NativeKakao]::PasteInto($input.Handle)
-            Start-Sleep -Milliseconds 250
-            $written = [NativeKakao]::GetControlText($input.Handle)
-        }
-        if ([string]::IsNullOrWhiteSpace($written)) {
+        if (-not (Set-ChatInputText $input $message)) {
             Write-RunLog "건너뜀: '$Room' — 글을 입력칸에 넣지 못했습니다. (전송하지 않음)"
+            Clear-ChatInput $input
             Close-ChatWindow $chat
             return $false
         }
+        $written = [NativeKakao]::GetControlText($input.Handle)
         # 넣은 글과 다르면 보내지 않습니다. 잘못된 내용이 나가는 것을 막습니다.
         if (($written -replace '\s', '') -ne ($message -replace '\s', '')) {
             Write-RunLog "건너뜀: '$Room' — 입력칸 내용이 문구와 다릅니다. (전송하지 않음)"
-            [NativeKakao]::SetControlText($input.Handle, '')
+            Clear-ChatInput $input
             Close-ChatWindow $chat
             return $false
         }
-        [NativeKakao]::PressKey($input.Handle, 0x0D)
-        Start-Sleep -Milliseconds 400
+        $how = Invoke-ChatSend $chat $input
+        if (-not $how) {
+            Write-RunLog "실패: '$Room' — 입력은 됐지만 전송되지 않았습니다. 입력칸을 비우고 넘어갑니다."
+            Clear-ChatInput $input
+            Close-ChatWindow $chat
+            return $false
+        }
+        if ($script:sendMethodLogged -ne $how) {
+            $script:sendMethodLogged = $how
+            Write-RunLog "전송 방식: $how"
+        }
     }
 
     $waitMs = [Math]::Max(500, [int]$Content.AttachmentWaitMs)
@@ -1623,16 +1636,83 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
         }
         Set-ClipboardFileSafe $path
         [NativeKakao]::ClickControl($input.Handle, ($input.Rect.Left + [int]($input.Width / 2)), ($input.Rect.Top + [int]($input.Height / 2)), $false)
-        Start-Sleep -Milliseconds 120
+        Start-Sleep -Milliseconds 150
         [NativeKakao]::PasteInto($input.Handle)
         Start-Sleep -Milliseconds $waitMs
-        [NativeKakao]::PressKey($input.Handle, 0x0D)
+        [void](Invoke-ChatSend $chat $input)
         Start-Sleep -Milliseconds ($waitMs + 200)
     }
 
     Write-RunLog "발송 완료: '$Room'"
     Close-ChatWindow $chat
     return $true
+}
+
+# ---------------------------------------------------------------------------
+# 입력과 전송
+# ---------------------------------------------------------------------------
+$script:sendMethodLogged = ''
+
+function Clear-ChatInput([object]$Input) {
+    [NativeKakao]::SelectAllIn($Input.Handle)
+    [NativeKakao]::ClearSelection($Input.Handle)
+    Start-Sleep -Milliseconds 80
+    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle))) {
+        [NativeKakao]::SetControlText($Input.Handle, '')
+    }
+}
+
+# 붙여넣기로 넣습니다. WM_SETTEXT 만 쓰면 카카오톡 내부 상태가 갱신되지 않아
+# Enter 를 눌러도 전송되지 않는 경우가 있습니다.
+function Set-ChatInputText([object]$Input, [string]$Text) {
+    Set-ClipboardTextSafe $Text
+    [NativeKakao]::ClickControl($Input.Handle, ($Input.Rect.Left + [int]($Input.Width / 2)), ($Input.Rect.Top + [int]($Input.Height / 2)), $false)
+    Start-Sleep -Milliseconds 140
+    [NativeKakao]::SelectAllIn($Input.Handle)
+    [NativeKakao]::PasteInto($Input.Handle)
+    Start-Sleep -Milliseconds 220
+    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle))) { return $true }
+
+    # 붙여넣기가 막히면 글자를 하나씩 보냅니다.
+    [NativeKakao]::TypeText($Input.Handle, $Text)
+    Start-Sleep -Milliseconds 200
+    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle))) { return $true }
+
+    # 마지막 수단
+    [NativeKakao]::SetControlText($Input.Handle, $Text)
+    Start-Sleep -Milliseconds 150
+    return (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle)))
+}
+
+function Wait-ChatInputCleared([object]$Input, [int]$TimeoutMs) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        if ([string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($Input.Handle))) { return $true }
+        Start-Sleep -Milliseconds 70
+    }
+    return $false
+}
+
+# 전송을 여러 방법으로 시도하고, 입력칸이 비워졌는지로 성공을 판단합니다.
+# 카카오톡은 전송에 성공하면 입력칸을 비우므로 확실한 신호가 됩니다.
+# 이미 전송되어 입력칸이 비었으면 다음 시도는 빈 내용이라 아무 일도 하지 않습니다.
+function Invoke-ChatSend([object]$Chat, [object]$Input) {
+    [NativeKakao]::PressKey($Input.Handle, 0x0D)
+    if (Wait-ChatInputCleared $Input 1400) { return '입력칸에 Enter 키' }
+
+    [NativeKakao]::SendChar($Input.Handle, 13)
+    if (Wait-ChatInputCleared $Input 1200) { return '입력칸에 Enter 문자' }
+
+    [NativeKakao]::PressKey($Chat.Handle, 0x0D)
+    if (Wait-ChatInputCleared $Input 1200) { return '채팅창에 Enter 키' }
+
+    # 마지막으로 실제 키보드 입력을 시도합니다. 이때만 창을 앞으로 가져옵니다.
+    if (Enter-KakaoForeground $Chat) {
+        [void](Set-ChatInputFocus $Chat)
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+        if (Wait-ChatInputCleared $Input 1500) { return '창을 앞으로 가져와 Enter' }
+    }
+    return ''
 }
 
 # ---------------------------------------------------------------------------
@@ -1814,73 +1894,47 @@ function Invoke-Broadcast {
     }
     Write-RunLog ("작업 시작: 방 {0}개 / 모드={1} / 간격 {2}초" -f $rooms.Count, $mode, $interval)
 
-    # 오픈채팅과 일반채팅은 서로 다른 탭이라 목록을 따로 훑어야 합니다.
-    # 지금 열려 있는 탭부터 처리하고, 남은 종류는 탭을 바꿔 달라고 안내합니다.
-    $groups = @{}
-    foreach ($room in $rooms) {
-        $type = Get-RoomType $room
-        if ($type -eq $script:RoomTypeUnknown) { $type = $script:RoomTypeNormal }
-        if (-not $groups.ContainsKey($type)) { $groups[$type] = New-Object System.Collections.Generic.List[string] }
-        $groups[$type].Add($room)
-    }
-
+    # PC 카카오톡의 [채팅] 목록에는 일반 채팅방과 오픈채팅방이 함께 들어 있습니다.
+    # 그래서 종류로 나누지 않고, 지금 보이는 목록을 한 번 훑어 찾을 수 있는 방을 모두 처리합니다.
+    # 그러고도 못 찾은 방이 있으면 다른 탭으로 바꿔 한 번 더 훑습니다.
     $ready = Test-KakaoReady $true $false
     if (-not $ready.Ok) { throw $ready.Reason }
-    $currentType = Get-RoomTypeFromViewName $ready.Layout.ViewName
-    if ($currentType -eq $script:RoomTypeUnknown) { $currentType = $script:RoomTypeNormal }
-
-    $order = @()
-    if ($groups.ContainsKey($currentType)) { $order += $currentType }
-    foreach ($key in @($groups.Keys)) { if ($key -ne $currentType) { $order += $key } }
 
     $totalSent = 0
     $totalFailed = 0
-    $notFound = @()
-    $first = $true
-    foreach ($type in $order) {
-        $targets = @($groups[$type])
-        if ($targets.Count -eq 0) { continue }
-        $tabLabel = Get-TabLabelForType $type
+    $pending = @($rooms)
 
-        if (-not $first) {
-            $ask = "이제 $($type) 방 $($targets.Count)개를 보냅니다.`r`n`r`n카카오톡에서 [$tabLabel] 탭을 눌러 목록이 보이게 해 주신 뒤 [확인]을 눌러 주세요.`r`n(그만두려면 [취소])"
-            if ([System.Windows.Forms.MessageBox]::Show($ask, "$tabLabel 탭으로 바꿔 주세요", 'OKCancel', 'Information') -ne 'OK') {
-                Write-RunLog "$($type) $($targets.Count)개는 사용자가 중단했습니다."
-                $notFound += $targets
+    for ($round = 1; $round -le 3; $round++) {
+        if (@($pending).Count -eq 0) { break }
+
+        if ($round -gt 1) {
+            $ask = "아직 못 찾은 방이 $(@($pending).Count)개 있습니다.`r`n`r`n카카오톡에서 다른 탭([채팅] 또는 [오픈채팅])으로 바꾸거나, 목록 위의 분류를 [전체]로 바꿔 주신 뒤 [확인]을 눌러 주세요.`r`n`r`n[취소]를 누르면 남은 방은 건너뜁니다."
+            if ([System.Windows.Forms.MessageBox]::Show($ask, '남은 방을 다른 목록에서 찾기', 'OKCancel', 'Information') -ne 'OK') {
+                Write-RunLog "남은 $(@($pending).Count)개는 사용자가 건너뛰었습니다."
                 break
             }
-        }
-        $first = $false
-
-        $check = Test-KakaoReady $true $false
-        if (-not $check.Ok) { Write-RunLog "중단: $($check.Reason)"; $notFound += $targets; break }
-        $nowType = Get-RoomTypeFromViewName $check.Layout.ViewName
-        if ($nowType -ne $script:RoomTypeUnknown -and $nowType -ne $type) {
-            Write-RunLog "건너뜀: 지금 화면은 $($nowType) 목록입니다. $($type) $($targets.Count)개를 보내지 않았습니다."
-            $notFound += $targets
-            continue
+            $check = Test-KakaoReady $true $false
+            if (-not $check.Ok) { Write-RunLog "중단: $($check.Reason)"; break }
         }
 
         if (-not $dryRun) {
             $blocked = Get-SendBlockReason (Get-Date)
-            if ($blocked) { Write-RunLog "발송 중단: $blocked"; $notFound += $targets; break }
+            if ($blocked) { Write-RunLog "발송 중단: $blocked"; break }
         }
 
-        Write-RunLog "$($type) $($targets.Count)개 처리 시작 (목록 한 번 훑기)"
-        $result = Invoke-SweepOverList $targets $content ([int]$script:config.ScanPages) $interval $batchSize $batchRest
+        $view = (Test-KakaoReady $false $false).Layout.ViewName
+        Write-RunLog "$($round)회차: 방 $(@($pending).Count)개 찾기 (현재 화면 $view)"
+        $result = Invoke-SweepOverList @($pending) $content ([int]$script:config.ScanPages) $interval $batchSize $batchRest
         $totalSent += $result.Sent
         $totalFailed += $result.Failed
-        if (@($result.NotFound).Count -gt 0) {
-            $notFound += @($result.NotFound)
-            Write-RunLog "$($type): 목록에서 찾지 못한 방 $(@($result.NotFound).Count)개"
-        }
-        Write-RunLog "$($type) 결과: 성공 $($result.Sent) / 실패 $($result.Failed)"
+        $pending = @($result.NotFound)
+        Write-RunLog "$($round)회차 결과: 성공 $($result.Sent) / 실패 $($result.Failed) / 못 찾음 $(@($pending).Count)"
     }
 
-    if (@($notFound).Count -gt 0) {
-        Write-RunLog "처리하지 못한 방 $(@($notFound).Count)개: 이름이 다르거나 목록에 없을 수 있습니다. [이름 확인·보정]을 실행해 보세요."
+    if (@($pending).Count -gt 0) {
+        Write-RunLog "처리하지 못한 방 $(@($pending).Count)개: 이름이 카카오톡 표시와 다를 수 있습니다. 체크한 뒤 [이름 확인·보정]을 실행해 보세요."
     }
-    Write-RunLog ("작업 종료: 성공 {0} / 실패 {1} / 미처리 {2} (전체 {3})" -f $totalSent, $totalFailed, @($notFound).Count, $rooms.Count)
+    Write-RunLog ("작업 종료: 성공 {0} / 실패 {1} / 미처리 {2} (전체 {3})" -f $totalSent, $totalFailed, @($pending).Count, $rooms.Count)
     return $totalSent
 }
 
@@ -2422,10 +2476,60 @@ function New-AppButton([object]$Parent, [string]$Text, [int]$X, [int]$Y, [int]$W
             $button.FlatAppearance.MouseOverBackColor = (New-Rgb 246 247 250)
         }
     }
-    $rect = New-Object System.Drawing.Rectangle(0, 0, $W, $H)
-    $path = Get-RoundedPath $rect 8
-    $button.Region = New-Object System.Drawing.Region ($path)
-    $path.Dispose()
+    # Region 으로 모서리를 깎으면 계단현상이 생겨 둥근 모서리가 지저분해 보입니다.
+    # 부모 배경색으로 칠한 뒤 부드럽게 둥근 사각형을 직접 그립니다.
+    $button.Tag = [pscustomobject]@{ Label = $Text; Kind = $Kind; Hover = $false }
+    $button.Text = ''
+    $button.AccessibleName = $Text
+    $button.Add_MouseEnter({ $this.Tag.Hover = $true; $this.Invalidate() })
+    $button.Add_MouseLeave({ $this.Tag.Hover = $false; $this.Invalidate() })
+    $button.Add_Paint({
+        param($sender, $e)
+        $info = $sender.Tag
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $parentColor = if ($null -ne $sender.Parent) { $sender.Parent.BackColor } else { $Theme.Card }
+        $e.Graphics.Clear($parentColor)
+        $rect = New-Object System.Drawing.Rectangle(0, 0, ($sender.Width - 1), ($sender.Height - 1))
+        $path = Get-RoundedPath $rect 8
+
+        $enabled = $sender.Enabled
+        $fill = $Theme.Card
+        $edge = $Theme.FieldEdge
+        $ink = $Theme.Ink
+        $drawEdge = $true
+        switch ($info.Kind) {
+            'primary' {
+                if ($enabled) { $fill = if ($info.Hover) { (New-Rgb 246 222 0) } else { $Theme.Accent }; $ink = $Theme.AccentInk }
+                else { $fill = (New-Rgb 236 238 241); $ink = (New-Rgb 158 163 171) }
+                $drawEdge = $false
+            }
+            'danger' {
+                $fill = if ($info.Hover -and $enabled) { (New-Rgb 253 244 244) } else { [System.Drawing.Color]::White }
+                $edge = (New-Rgb 240 202 202)
+                $ink = if ($enabled) { $Theme.Danger } else { (New-Rgb 190 160 160) }
+            }
+            'ghost' {
+                $fill = if ($info.Hover -and $enabled) { $Theme.Bg } else { $parentColor }
+                $ink = if ($enabled) { $Theme.Sub } else { $Theme.Muted }
+                $drawEdge = $false
+            }
+            default {
+                $fill = if ($info.Hover -and $enabled) { (New-Rgb 246 247 250) } else { [System.Drawing.Color]::White }
+                $ink = if ($enabled) { $Theme.Ink } else { (New-Rgb 165 170 178) }
+            }
+        }
+        $brush = New-Object System.Drawing.SolidBrush ($fill)
+        $e.Graphics.FillPath($brush, $path)
+        $brush.Dispose()
+        if ($drawEdge) {
+            $pen = New-Object System.Drawing.Pen ($edge)
+            $e.Graphics.DrawPath($pen, $path)
+            $pen.Dispose()
+        }
+        $path.Dispose()
+        Write-Text $e.Graphics $info.Label $sender.Font $ink (New-Object System.Drawing.Rectangle(2, 0, ($sender.Width - 4), $sender.Height)) $TextCenter
+    })
+    $button.Add_EnabledChanged({ $this.Invalidate() })
     $Parent.Controls.Add($button)
     return $button
 }
@@ -2869,12 +2973,12 @@ $script:lblKakaoState = New-CardLabel $cardStatus '확인 중입니다...' 24 78
 $btnCheckKakao = New-AppButton $cardStatus '지금 확인' 24 190 150 40 'primary'
 $btnOpenKakao = New-AppButton $cardStatus '카카오톡 창 앞으로 가져오기' 184 190 220 40
 
-$cardUpdate = New-Card $pageSettings 28 264 784 196 '업데이트' "GitHub 저장소 $($script:RepoOwner)/$($script:RepoName) 의 최신 배포본을 확인합니다."
+$cardUpdate = New-Card $pageSettings 28 264 784 196 '업데이트' '최신 배포를 확인합니다.'
 $script:lblUpdateState = New-CardLabel $cardUpdate "현재 버전 v$($script:AppVersion)" 24 76 736 46 $FontBase $Theme.Ink
 $btnCheckUpdate  = New-AppButton $cardUpdate '업데이트 확인' 24 130 160 40
 $script:btnDoUpdate = New-AppButton $cardUpdate '지금 업데이트' 194 130 160 40 'primary'
 $script:btnDoUpdate.Enabled = $false
-$btnOpenRepo     = New-AppButton $cardUpdate '저장소 열기' 364 130 160 40
+$btnClearLogFiles = New-AppButton $cardUpdate '로그 파일 모두 지우기' 364 130 190 40 'danger'
 $script:chkAutoUpdate = New-Object System.Windows.Forms.CheckBox
 $script:chkAutoUpdate.Text = '시작할 때 자동 확인'
 $script:chkAutoUpdate.Checked = [bool]$script:config.AutoCheckUpdate
@@ -3667,7 +3771,7 @@ function Start-UpdateInstall([object]$Release) {
         $script:form.Enabled = $true
         Set-StatusPill '업데이트 실패' 'error'
         Write-RunLog "업데이트 실패: $($_.Exception.Message)"
-        [System.Windows.Forms.MessageBox]::Show("업데이트에 실패했습니다.`r`n$($_.Exception.Message)`r`n`r`n[저장소 열기]에서 직접 내려받을 수도 있습니다.", '업데이트 실패') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("업데이트에 실패했습니다.`r`n$($_.Exception.Message)`r`n`r`n인터넷 연결을 확인한 뒤 다시 시도해 주세요.", '업데이트 실패') | Out-Null
     }
 }
 
@@ -3677,7 +3781,22 @@ $btnCheckUpdate.Add_Click({
     Set-StatusPill '준비됨' 'idle'
     if ($null -ne $script:latestRelease) { Start-UpdateInstall $script:latestRelease }
 })
-$btnOpenRepo.Add_Click({ Start-Process $script:RepoUrl })
+$btnClearLogFiles.Add_Click({
+    $files = @(Get-ChildItem -LiteralPath $LogDir -Filter '*.log' -File -ErrorAction SilentlyContinue)
+    if ($files.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('지울 로그 파일이 없습니다.', '로그 지우기') | Out-Null
+        return
+    }
+    $body = "로그 파일 $($files.Count)개를 지웁니다.`r`n`r`n실행 기록이 모두 사라지고 되돌릴 수 없습니다. 계속할까요?"
+    if ([System.Windows.Forms.MessageBox]::Show($body, '로그 파일 지우기', 'YesNo', 'Warning') -ne 'Yes') { return }
+    $removed = 0
+    foreach ($file in $files) {
+        try { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop; $removed++ } catch { }
+    }
+    if ($script:txtLog) { $script:txtLog.Clear() }
+    Write-RunLog "로그 파일 $($removed)개를 지웠습니다."
+    [System.Windows.Forms.MessageBox]::Show("로그 파일 $($removed)개를 지웠습니다.", '로그 지우기') | Out-Null
+})
 $script:btnDoUpdate.Add_Click({ Start-UpdateInstall $script:latestRelease })
 $script:pnlUpdate.Add_Click({
     Show-AppPage 'settings'
@@ -3778,7 +3897,8 @@ function Show-GuideTour([string]$CaptureDir = '') {
         $lblTitle.Text = [string]$step.Title
         $lblBody.Text = [string]$step.Body
         $btnPrev.Visible = ($script:tourIndex -gt 0)
-        $btnNext.Text = if ($script:tourIndex -eq ($total - 1)) { '시작하기' } else { '다음' }
+        $btnNext.Tag.Label = if ($script:tourIndex -eq ($total - 1)) { '시작하기' } else { '다음' }
+        $btnNext.Invalidate()
         $btnSkip.Visible = ($script:tourIndex -lt ($total - 1))
         $dots.Invalidate()
     }
@@ -3897,6 +4017,200 @@ $limitTimer.Interval = 60000
 $limitTimer.Add_Tick({ try { Update-LimitStateLabel } catch { } })
 $limitTimer.Start()
 
+# ---------------------------------------------------------------------------
+# 시작 화면 (순차 점검)
+# ---------------------------------------------------------------------------
+function Show-SplashScreen {
+    $splash = New-Object System.Windows.Forms.Form
+    $splash.FormBorderStyle = 'None'
+    $splash.StartPosition = 'CenterScreen'
+    $splash.Size = New-Object System.Drawing.Size(560, 420)
+    $splash.BackColor = $Theme.Card
+    $splash.Font = $FontBase
+    $splash.TopMost = $true
+    $splash.ShowInTaskbar = $false
+    $splash.Add_Paint({
+        param($sender, $e)
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $pen = New-Object System.Drawing.Pen ($Theme.Border)
+        $e.Graphics.DrawRectangle($pen, 0, 0, ($sender.Width - 1), ($sender.Height - 1))
+        $pen.Dispose()
+        $accent = New-Object System.Drawing.SolidBrush ($Theme.Accent)
+        $e.Graphics.FillRectangle($accent, 0, 0, $sender.Width, 6)
+        $accent.Dispose()
+        $mark = New-Object System.Drawing.Rectangle(40, 40, 52, 52)
+        $path = Get-RoundedPath $mark 15
+        $brush = New-Object System.Drawing.SolidBrush ($Theme.Accent)
+        $e.Graphics.FillPath($brush, $path)
+        $brush.Dispose(); $path.Dispose()
+        Write-Text $e.Graphics '톡' $FontTourTitle $Theme.AccentInk $mark $TextCenter
+        Write-Text $e.Graphics '카카오 발송기' $FontTourTitle $Theme.Ink (New-Object System.Drawing.Rectangle(108, 42, 300, 30)) $TextLeft
+        Write-Text $e.Graphics "버전 $($script:AppVersion)" $FontSmall $Theme.Muted (New-Object System.Drawing.Rectangle(110, 70, 300, 22)) $TextLeft
+    })
+
+    $steps = @(
+        @{ Key = 'os';       Label = '운영체제 확인' },
+        @{ Key = 'kakao';    Label = '카카오톡 실행 확인' },
+        @{ Key = 'instance'; Label = '카카오톡 창 선택' },
+        @{ Key = 'ocr';      Label = '한국어 문자 인식 확인' },
+        @{ Key = 'update';   Label = '최신 배포 확인' }
+    )
+    $script:splashState = @{}
+    foreach ($step in $steps) { $script:splashState[$step.Key] = @{ Status = '대기'; Detail = '' } }
+
+    $labels = @{}
+    $y = 120
+    foreach ($step in $steps) {
+        $row = New-Object System.Windows.Forms.Label
+        $row.Location = New-Object System.Drawing.Point(42, $y)
+        $row.Size = New-Object System.Drawing.Size(478, 44)
+        $row.Font = $FontBase
+        $row.ForeColor = $Theme.Muted
+        $row.BackColor = $Theme.Card
+        $row.Text = "· $($step.Label)"
+        $splash.Controls.Add($row)
+        $labels[$step.Key] = $row
+        $y += 46
+    }
+
+    $btnRetry = New-AppButton $splash '다시 확인' 42 356 130 40
+    $btnStart = New-AppButton $splash '시작하기' 306 356 96 40 'primary'
+    $btnQuit  = New-AppButton $splash '종료' 412 356 106 40
+    $btnRetry.Visible = $false
+    $btnStart.Visible = $false
+    $btnQuit.Visible = $false
+
+    $render = {
+        foreach ($step in $steps) {
+            $state = $script:splashState[$step.Key]
+            $mark = switch ($state.Status) {
+                '확인' { '[정상]' }
+                '실패' { '[확인 필요]' }
+                '진행' { '· 확인 중...' }
+                default { '·' }
+            }
+            $color = switch ($state.Status) {
+                '확인' { $Theme.Success }
+                '실패' { $Theme.Danger }
+                '진행' { $Theme.Info }
+                default { $Theme.Muted }
+            }
+            $text = "$mark $($step.Label)"
+            if ($state.Detail) { $text += "`r`n     $($state.Detail)" }
+            $labels[$step.Key].Text = $text
+            $labels[$step.Key].ForeColor = $color
+        }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+
+    $setStep = {
+        param($key, $status, $detail)
+        $script:splashState[$key].Status = $status
+        $script:splashState[$key].Detail = $detail
+        & $render
+    }
+
+    $splash.Show()
+    & $render
+    Start-Sleep -Milliseconds 200
+
+    # 1) 운영체제
+    & $setStep 'os' '진행' ''
+    Start-Sleep -Milliseconds 200
+    $osName = 'Windows'
+    try { $osName = (Get-CimInstance Win32_OperatingSystem).Caption } catch { }
+    $osOk = ([Environment]::OSVersion.Version.Major -ge 6)
+    & $setStep 'os' $(if ($osOk) { '확인' } else { '실패' }) "$osName / PowerShell $($PSVersionTable.PSVersion)"
+
+    # 2) 카카오톡 실행
+    & $setStep 'kakao' '진행' ''
+    Start-Sleep -Milliseconds 200
+    $instances = @(Get-KakaoMainWindows)
+    if ($instances.Count -eq 0) {
+        & $setStep 'kakao' '실패' 'PC 카카오톡을 실행해 주세요.'
+    } else {
+        & $setStep 'kakao' '확인' "카카오톡 $($instances.Count)개를 찾았습니다."
+    }
+
+    # 3) 창 선택 (여러 개면 사용자가 고릅니다)
+    & $setStep 'instance' '진행' ''
+    Start-Sleep -Milliseconds 150
+    if ($instances.Count -eq 0) {
+        & $setStep 'instance' '실패' '카카오톡을 먼저 실행해 주세요.'
+    } else {
+        if ($instances.Count -gt 1) {
+            $names = @($instances | ForEach-Object { Get-KakaoInstanceLabel $_ })
+            $pick = [Microsoft.VisualBasic.Interaction]::InputBox(
+                "카카오톡이 여러 개 실행 중입니다. 사용할 번호를 입력하세요.`r`n`r`n" +
+                (($names | ForEach-Object -Begin { $i = 0 } -Process { $i++; "$i. $_" }) -join "`r`n"),
+                '카카오톡 창 선택', '1')
+            $index = 0
+            if ([int]::TryParse(([string]$pick).Trim(), [ref]$index) -and $index -ge 1 -and $index -le $instances.Count) {
+                $script:selectedKakaoProcessId = $instances[$index - 1].ProcessId
+            } else {
+                $script:selectedKakaoProcessId = $instances[0].ProcessId
+            }
+        } else {
+            $script:selectedKakaoProcessId = $instances[0].ProcessId
+        }
+        $main = Get-MainKakaoWindow $true
+        if ($null -eq $main) {
+            & $setStep 'instance' '실패' '카카오톡 창을 찾지 못했습니다.'
+        } elseif (Test-WindowMinimized $main) {
+            & $setStep 'instance' '실패' '창이 닫혀 있습니다. 트레이의 카카오톡 아이콘을 눌러 창을 열어 주세요.'
+        } else {
+            $layout = Get-KakaoLayout $main
+            if ($null -eq $layout.List) {
+                & $setStep 'instance' '실패' '채팅 목록이 보이지 않습니다. 카카오톡에서 채팅 탭을 눌러 주세요.'
+            } else {
+                & $setStep 'instance' '확인' "카카오톡 #$($script:selectedKakaoProcessId) / 화면 $($layout.ViewName)"
+            }
+        }
+    }
+
+    # 4) 문자 인식
+    & $setStep 'ocr' '진행' ''
+    Start-Sleep -Milliseconds 150
+    if (Initialize-Ocr) { & $setStep 'ocr' '확인' '한국어 문자 인식 사용 가능' }
+    else { & $setStep 'ocr' '실패' $script:ocrError }
+
+    # 5) 최신 배포 확인
+    & $setStep 'update' '진행' '최신 배포를 확인합니다...'
+    $release = $null
+    if (-not $NoUpdateCheck) {
+        try { $release = Get-LatestRelease } catch { }
+    }
+    if ($null -eq $release) {
+        & $setStep 'update' '확인' '지금은 확인하지 않았습니다.'
+    } elseif (Test-UpdateAvailable $release) {
+        $script:latestRelease = $release
+        & $setStep 'update' '실패' "새 버전 $($release.Tag) 이(가) 있습니다. 업데이트해야 사용할 수 있습니다."
+    } else {
+        & $setStep 'update' '확인' "최신 버전입니다. ($($release.Tag))"
+    }
+
+    $allOk = $true
+    foreach ($step in $steps) { if ($script:splashState[$step.Key].Status -ne '확인') { $allOk = $false } }
+    $mustUpdate = ($null -ne $script:latestRelease)
+
+    $btnRetry.Visible = $true
+    $btnQuit.Visible = $true
+    $btnStart.Visible = ($allOk -and -not $mustUpdate)
+    if ($mustUpdate) {
+        $btnRetry.Tag.Label = '지금 업데이트'
+        $btnRetry.Invalidate()
+    }
+
+    $script:splashResult = ''
+    $btnStart.Add_Click({ $script:splashResult = 'start'; $splash.Close() })
+    $btnQuit.Add_Click({ $script:splashResult = 'quit'; $splash.Close() })
+    $btnRetry.Add_Click({ $script:splashResult = 'retry'; $splash.Close() })
+
+    while ($splash.Visible) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 40 }
+    $splash.Dispose()
+    return $script:splashResult
+}
+
 Show-AppPage 'compose'
 Write-RunLog "프로그램 시작 (v$($script:AppVersion)). 설정은 자동 저장됩니다."
 
@@ -3938,6 +4252,27 @@ if ($UiSmokeTest) {
 }
 
 $script:form.Add_Shown({
+    # 시작 화면에서 순서대로 점검합니다. 문제가 있으면 다음 화면으로 넘어가지 않습니다.
+    for ($attempt = 0; $attempt -lt 6; $attempt++) {
+        $result = Show-SplashScreen
+        if ($result -eq 'start') { break }
+        if ($result -eq 'quit') { $script:armed = $false; $script:form.Close(); return }
+        if ($result -eq 'retry' -and $null -ne $script:latestRelease) {
+            Start-UpdateInstall $script:latestRelease
+            if ($null -ne $script:latestRelease) {
+                # 업데이트를 하지 않으면 사용할 수 없습니다.
+                if ([System.Windows.Forms.MessageBox]::Show(
+                    "새 버전으로 업데이트해야 사용할 수 있습니다.`r`n`r`n다시 시도할까요? [아니오]를 누르면 종료합니다.",
+                    '업데이트 필요', 'YesNo', 'Warning') -ne 'Yes') {
+                    $script:armed = $false
+                    $script:form.Close()
+                    return
+                }
+            }
+        }
+    }
+    [void](Update-KakaoStateLabel)
+    Update-LimitStateLabel
     if (-not [bool]$script:config.TourDone) {
         Write-RunLog '처음 실행이라 사용 가이드를 표시합니다.'
         Show-GuideTour
