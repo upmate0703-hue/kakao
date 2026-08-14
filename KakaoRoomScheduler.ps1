@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.5.0'
+$script:AppVersion = '4.6.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -278,6 +278,80 @@ public static class NativeKakao {
 "@
 }
 
+# 화면 픽셀을 빠르게 훑습니다. GetPixel 은 한 점마다 오버헤드가 커서
+# 사양이 낮은 PC에서 눈에 띄게 느려집니다. LockBits 로 한 번에 읽습니다.
+if (-not ('FastImage' -as [type])) {
+Add-Type -ReferencedAssemblies 'System.Drawing' -TypeDefinition @"
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+
+public static class FastImage {
+    static int[] ReadRows(Bitmap bitmap, Rectangle rect, out int stridePixels) {
+        BitmapData data = bitmap.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try {
+            stridePixels = data.Stride / 4;
+            int[] buffer = new int[stridePixels * rect.Height];
+            Marshal.Copy(data.Scan0, buffer, 0, buffer.Length);
+            return buffer;
+        } finally { bitmap.UnlockBits(data); }
+    }
+
+    // 색이 3가지 이하면 아직 그려지지 않은 빈 화면으로 봅니다.
+    public static bool IsBlank(Bitmap bitmap) {
+        var rect = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+        int stride;
+        int[] pixels = ReadRows(bitmap, rect, out stride);
+        int seen = 0;
+        int[] colors = new int[4];
+        for (int y = 0; y < rect.Height; y += 13) {
+            int rowStart = y * stride;
+            for (int x = 0; x < rect.Width; x += 11) {
+                int color = pixels[rowStart + x];
+                bool found = false;
+                for (int i = 0; i < seen; i++) { if (colors[i] == color) { found = true; break; } }
+                if (!found) {
+                    if (seen >= 3) { return false; }
+                    colors[seen++] = color;
+                }
+            }
+        }
+        return true;
+    }
+
+    // 지정한 영역에서 어두운 픽셀 비율을 돌려줍니다. 탭 선택 여부 판별에 씁니다.
+    public static double DarkRatio(Bitmap bitmap, int left, int top, int right, int bottom, double threshold) {
+        if (left < 0) left = 0;
+        if (top < 0) top = 0;
+        if (right >= bitmap.Width) right = bitmap.Width - 1;
+        if (bottom >= bitmap.Height) bottom = bitmap.Height - 1;
+        if (right <= left || bottom <= top) { return 0.0; }
+        var rect = new Rectangle(left, top, right - left + 1, bottom - top + 1);
+        int stride;
+        int[] pixels = ReadRows(bitmap, rect, out stride);
+        long dark = 0, total = 0;
+        for (int y = 0; y < rect.Height; y++) {
+            int rowStart = y * stride;
+            for (int x = 0; x < rect.Width; x++) {
+                int color = pixels[rowStart + x];
+                int r = (color >> 16) & 0xFF;
+                int g = (color >> 8) & 0xFF;
+                int b = color & 0xFF;
+                int max = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                int min = r < g ? (r < b ? r : b) : (g < b ? g : b);
+                double brightness = (max + min) / 510.0;
+                total++;
+                if (brightness < threshold) { dark++; }
+            }
+        }
+        if (total == 0) { return 0.0; }
+        return (double)dark / (double)total;
+    }
+}
+"@
+}
+
 # ---------------------------------------------------------------------------
 # 경로 및 설정
 # ---------------------------------------------------------------------------
@@ -323,11 +397,14 @@ function New-DefaultConfig {
         ExtraHolidays = @()
         AutoDownloadUpdate = $true
         SkipSendConfirm = $false
+        RepeatEnabled = $false
+        RepeatMinutes = 30
+        RepeatCount = 0
         BatchSize = 0
         BatchRestMinutes = 30
         Message = ''
         Attachments = @()
-        ScheduledAt = (Get-Date).AddMinutes(10).ToString('yyyy-MM-dd HH:mm:ss')
+        ScheduledAt = (Get-Date).Date.AddDays(1).ToString('yyyy-MM-dd HH:mm:ss')
         IntervalSeconds = 8
         DryRun = $true
         ScanPages = 30
@@ -865,16 +942,19 @@ function Get-DarkPixelRatio([System.Drawing.Bitmap]$Bitmap, [object]$MainWindow,
     $top = [Math]::Max(0, $centerY - $HalfHeight)
     $bottom = [Math]::Min($Bitmap.Height - 1, $centerY + $HalfHeight)
     if ($right -le $left -or $bottom -le $top) { return 0.0 }
-    $dark = 0
-    $total = 0
-    for ($y = $top; $y -le $bottom; $y++) {
-        for ($x = $left; $x -le $right; $x++) {
-            $total++
-            if ($Bitmap.GetPixel($x, $y).GetBrightness() -lt 0.42) { $dark++ }
+    try { return [FastImage]::DarkRatio($Bitmap, $left, $top, $right, $bottom, 0.42) }
+    catch {
+        $dark = 0
+        $total = 0
+        for ($y = $top; $y -le $bottom; $y += 2) {
+            for ($x = $left; $x -le $right; $x += 2) {
+                $total++
+                if ($Bitmap.GetPixel($x, $y).GetBrightness() -lt 0.42) { $dark++ }
+            }
         }
+        if ($total -eq 0) { return 0.0 }
+        return ([double]$dark / [double]$total)
     }
-    if ($total -eq 0) { return 0.0 }
-    return ([double]$dark / [double]$total)
 }
 
 function Get-ActiveKakaoTab([object]$Layout) {
@@ -1334,14 +1414,17 @@ function Wait-WinRt($Operation, $ResultType) {
 }
 
 function Test-ImageBlank([System.Drawing.Bitmap]$Bitmap) {
-    $seen = @{}
-    for ($y = 0; $y -lt $Bitmap.Height; $y += 17) {
-        for ($x = 0; $x -lt $Bitmap.Width; $x += 13) {
-            $seen[$Bitmap.GetPixel($x, $y).ToArgb()] = $true
-            if ($seen.Keys.Count -gt 3) { return $false }
+    try { return [FastImage]::IsBlank($Bitmap) }
+    catch {
+        $seen = @{}
+        for ($y = 0; $y -lt $Bitmap.Height; $y += 17) {
+            for ($x = 0; $x -lt $Bitmap.Width; $x += 13) {
+                $seen[$Bitmap.GetPixel($x, $y).ToArgb()] = $true
+                if ($seen.Keys.Count -gt 3) { return $false }
+            }
         }
+        return $true
     }
-    return $true
 }
 
 # PrintWindow 는 창이 가려져 있거나 뒤에 있어도 내용을 그려 줍니다.
@@ -2234,7 +2317,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'AutoCheckUpdate', 'TourDone', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'AutoCheckUpdate', 'TourDone', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -3091,7 +3174,7 @@ $cardLimit.Controls.Add($script:numBatchRest)
 
 $script:lblLimitState = New-CardLabel $cardLimit '' 24 234 736 56 $FontSmall $Theme.Sub
 
-$cardSchedule = New-Card $pageRun 28 718 784 286 '지금 실행 및 예약'
+$cardSchedule = New-Card $pageRun 28 718 784 350 '지금 실행 및 예약'
 [void](New-CardLabel $cardSchedule '예약 시각' 24 56 100 22 $FontSmall $Theme.Muted)
 $script:dtSchedule = New-Object System.Windows.Forms.DateTimePicker
 $script:dtSchedule.Format = 'Custom'
@@ -3101,16 +3184,17 @@ $script:dtSchedule.Location = New-Object System.Drawing.Point(24, 80)
 $script:dtSchedule.Size = New-Object System.Drawing.Size(222, 32)
 $script:dtSchedule.Font = $FontBase
 try { $script:dtSchedule.Value = [datetime]::ParseExact([string]$script:config.ScheduledAt, 'yyyy-MM-dd HH:mm:ss', $null) }
-catch { $script:dtSchedule.Value = (Get-Date).AddMinutes(10) }
-if ($script:dtSchedule.Value -lt $script:dtSchedule.MinDate) { $script:dtSchedule.Value = (Get-Date).AddMinutes(10) }
+catch { $script:dtSchedule.Value = (Get-Date).Date.AddDays(1) }
+if ($script:dtSchedule.Value -lt $script:dtSchedule.MinDate -or $script:dtSchedule.Value -le (Get-Date)) { $script:dtSchedule.Value = (Get-Date).Date.AddDays(1) }
 $cardSchedule.Controls.Add($script:dtSchedule)
 
-[void](New-CardLabel $cardSchedule '방 사이 간격(초) — 0이면 쉬지 않음' 274 56 300 22 $FontSmall $Theme.Muted)
+$btnPickSchedule = New-AppButton $cardSchedule '달력에서 고르기' 254 78 148 32
+[void](New-CardLabel $cardSchedule '방 사이 간격(초) — 0이면 쉬지 않음' 424 56 300 22 $FontSmall $Theme.Muted)
 $script:numInterval = New-Object System.Windows.Forms.NumericUpDown
 $script:numInterval.Minimum = 0
 $script:numInterval.Maximum = 300
 $script:numInterval.Value = [Math]::Max(0, [Math]::Min(300, [int]$script:config.IntervalSeconds))
-$script:numInterval.Location = New-Object System.Drawing.Point(274, 80)
+$script:numInterval.Location = New-Object System.Drawing.Point(424, 80)
 $script:numInterval.Size = New-Object System.Drawing.Size(94, 30)
 $script:numInterval.Font = $FontBase
 $script:numInterval.BorderStyle = 'FixedSingle'
@@ -3122,8 +3206,41 @@ $btnCancelArm = New-AppButton $cardSchedule '예약 취소' 376 134 164 46
 $btnSave      = New-AppButton $cardSchedule '설정 저장' 552 134 164 46 'ghost'
 $btnCancelArm.Enabled = $false
 
-$script:lblCountdown = New-CardLabel $cardSchedule '예약이 설정되지 않았습니다.' 24 196 736 26 $FontStrong $Theme.Muted
-[void](New-CardLabel $cardSchedule '예약 시각까지 이 프로그램과 PC 카카오톡을 모두 켜 두어야 합니다. 화면 잠금·절전 상태에서는 동작하지 않으며, 실행 중에는 마우스와 키보드를 사용하지 마세요.' 24 226 736 44 $FontSmall $Theme.Muted)
+# ----- 반복 발송 -----
+$script:chkRepeat = New-Object System.Windows.Forms.CheckBox
+$script:chkRepeat.Text = '반복 발송 — 한 번 다 보낸 뒤 일정 시간마다 다시 보내기'
+$script:chkRepeat.Checked = [bool]$script:config.RepeatEnabled
+$script:chkRepeat.Location = New-Object System.Drawing.Point(24, 192)
+$script:chkRepeat.Size = New-Object System.Drawing.Size(430, 28)
+$script:chkRepeat.BackColor = $Theme.Card
+$script:chkRepeat.Font = $FontBase
+$cardSchedule.Controls.Add($script:chkRepeat)
+
+$script:numRepeatMinutes = New-Object System.Windows.Forms.NumericUpDown
+$script:numRepeatMinutes.Minimum = 1
+$script:numRepeatMinutes.Maximum = 1440
+$script:numRepeatMinutes.Value = [Math]::Max(1, [Math]::Min(1440, [int]$script:config.RepeatMinutes))
+$script:numRepeatMinutes.Location = New-Object System.Drawing.Point(462, 190)
+$script:numRepeatMinutes.Size = New-Object System.Drawing.Size(80, 30)
+$script:numRepeatMinutes.Font = $FontBase
+$script:numRepeatMinutes.BorderStyle = 'FixedSingle'
+$cardSchedule.Controls.Add($script:numRepeatMinutes)
+[void](New-CardLabel $cardSchedule '분마다 ·  최대' 548 194 92 24 $FontSmall $Theme.Muted)
+
+$script:numRepeatCount = New-Object System.Windows.Forms.NumericUpDown
+$script:numRepeatCount.Minimum = 0
+$script:numRepeatCount.Maximum = 999
+$script:numRepeatCount.Value = [Math]::Max(0, [Math]::Min(999, [int]$script:config.RepeatCount))
+$script:numRepeatCount.Location = New-Object System.Drawing.Point(642, 190)
+$script:numRepeatCount.Size = New-Object System.Drawing.Size(70, 30)
+$script:numRepeatCount.Font = $FontBase
+$script:numRepeatCount.BorderStyle = 'FixedSingle'
+$cardSchedule.Controls.Add($script:numRepeatCount)
+[void](New-CardLabel $cardSchedule '회' 718 194 30 24 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardSchedule '최대 횟수를 0으로 두면 [예약 취소]를 누를 때까지 계속 반복합니다.' 24 224 736 22 $FontSmall $Theme.Muted)
+
+$script:lblCountdown = New-CardLabel $cardSchedule '예약이 설정되지 않았습니다.' 24 250 736 26 $FontStrong $Theme.Muted
+[void](New-CardLabel $cardSchedule '예약 시각까지 이 프로그램과 PC 카카오톡을 모두 켜 두어야 합니다. 화면 잠금·절전 상태에서는 동작하지 않으며, 실행 중에는 마우스와 키보드를 사용하지 마세요.' 24 282 736 44 $FontSmall $Theme.Muted)
 
 # ===========================================================================
 # 페이지 4 — 설정
@@ -3405,6 +3522,9 @@ function Sync-ConfigFromForm {
     $script:config.HolidayIntervalMultiplier = [int]$script:numHolidayMultiplier.Value
     $script:config.BatchSize = [int]$script:numBatchSize.Value
     $script:config.BatchRestMinutes = [int]$script:numBatchRest.Value
+    $script:config.RepeatEnabled = [bool]$script:chkRepeat.Checked
+    $script:config.RepeatMinutes = [int]$script:numRepeatMinutes.Value
+    $script:config.RepeatCount = [int]$script:numRepeatCount.Value
     Update-LimitStateLabel
     Update-RoomCountLabel
     $script:lblMessageCount.Text = "$($script:txtMessage.Text.Length)자"
@@ -3449,6 +3569,13 @@ $script:cmbHoliday.Add_SelectedIndexChanged({ Request-AutoSave })
 $script:numHolidayMultiplier.Add_ValueChanged({ Request-AutoSave })
 $script:numBatchSize.Add_ValueChanged({ Request-AutoSave })
 $script:numBatchRest.Add_ValueChanged({ Request-AutoSave })
+$script:chkRepeat.Add_CheckedChanged({ Request-AutoSave })
+$script:numRepeatMinutes.Add_ValueChanged({ Request-AutoSave })
+$script:numRepeatCount.Add_ValueChanged({ Request-AutoSave })
+$btnPickSchedule.Add_Click({
+    $picked = Show-SchedulePicker $script:dtSchedule.Value
+    if ($null -ne $picked) { $script:dtSchedule.Value = $picked; Sync-ConfigFromForm }
+})
 
 $btnShowHolidays.Add_Click({
     $year = (Get-Date).Year
@@ -3744,6 +3871,99 @@ $btnVerifyRoom.Add_Click({
     }
 })
 
+# 달력에서 예약 시각을 고릅니다.
+function Show-SchedulePicker([datetime]$Current) {
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = '예약 시각 고르기'
+    $dialog.ClientSize = New-Object System.Drawing.Size(560, 470)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.BackColor = $Theme.Card
+    $dialog.Font = $FontBase
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = '언제 보낼까요?'
+    $title.Font = $FontTourTitle
+    $title.ForeColor = $Theme.Ink
+    $title.BackColor = $Theme.Card
+    $title.Location = New-Object System.Drawing.Point(26, 22)
+    $title.Size = New-Object System.Drawing.Size(508, 32)
+    $dialog.Controls.Add($title)
+
+    $calendar = New-Object System.Windows.Forms.MonthCalendar
+    $calendar.Location = New-Object System.Drawing.Point(26, 62)
+    $calendar.MaxSelectionCount = 1
+    $calendar.MinDate = (Get-Date).Date
+    $calendar.SetDate($Current.Date)
+    $dialog.Controls.Add($calendar)
+
+    [void](New-CardLabel $dialog '시' 300 80 24 26 $FontSmall $Theme.Muted)
+    $numHour = New-Object System.Windows.Forms.NumericUpDown
+    $numHour.Minimum = 0; $numHour.Maximum = 23; $numHour.Value = $Current.Hour
+    $numHour.Location = New-Object System.Drawing.Point(326, 76)
+    $numHour.Size = New-Object System.Drawing.Size(66, 30)
+    $numHour.Font = $FontBase; $numHour.BorderStyle = 'FixedSingle'
+    $dialog.Controls.Add($numHour)
+
+    [void](New-CardLabel $dialog '분' 400 80 24 26 $FontSmall $Theme.Muted)
+    $numMinute = New-Object System.Windows.Forms.NumericUpDown
+    $numMinute.Minimum = 0; $numMinute.Maximum = 59; $numMinute.Value = $Current.Minute
+    $numMinute.Location = New-Object System.Drawing.Point(426, 76)
+    $numMinute.Size = New-Object System.Drawing.Size(66, 30)
+    $numMinute.Font = $FontBase; $numMinute.BorderStyle = 'FixedSingle'
+    $dialog.Controls.Add($numMinute)
+
+    [void](New-CardLabel $dialog '자주 쓰는 시각' 300 124 200 24 $FontSmall $Theme.Muted)
+    $btnTonight  = New-AppButton $dialog '오늘 밤 9시' 300 150 196 36
+    $btnTomorrow = New-AppButton $dialog '내일 0시' 300 192 196 36
+    $btnMorning  = New-AppButton $dialog '내일 아침 9시' 300 234 196 36
+    $btnIn10     = New-AppButton $dialog '10분 뒤' 300 276 196 36
+
+    $lblPreview = New-CardLabel $dialog '' 26 320 508 30 $FontStrong $Theme.Info
+
+    $script:pickedSchedule = $Current
+    $refresh = {
+        $picked = $calendar.SelectionStart.Date.AddHours([int]$numHour.Value).AddMinutes([int]$numMinute.Value)
+        $script:pickedSchedule = $picked
+        $weekday = ('일','월','화','수','목','금','토')[[int]$picked.DayOfWeek]
+        $gap = $picked - (Get-Date)
+        $gapText = if ($gap.TotalSeconds -le 0) { '이미 지난 시각입니다' }
+                   elseif ($gap.TotalHours -ge 24) { "약 {0}일 {1}시간 뒤" -f [int]$gap.TotalDays, $gap.Hours }
+                   elseif ($gap.TotalMinutes -ge 60) { "약 {0}시간 {1}분 뒤" -f [int]$gap.TotalHours, $gap.Minutes }
+                   else { "약 {0}분 뒤" -f [int]$gap.TotalMinutes }
+        $lblPreview.Text = "$($picked.ToString('yyyy-MM-dd')) ($weekday) $($picked.ToString('HH:mm'))  ·  $gapText"
+        $lblPreview.ForeColor = if ($gap.TotalSeconds -le 0) { $Theme.Danger } else { $Theme.Info }
+    }
+    $setTo = {
+        param($target)
+        $calendar.SetDate($target.Date)
+        $numHour.Value = $target.Hour
+        $numMinute.Value = $target.Minute
+        & $refresh
+    }
+    $calendar.Add_DateChanged({ & $refresh })
+    $numHour.Add_ValueChanged({ & $refresh })
+    $numMinute.Add_ValueChanged({ & $refresh })
+    $btnTonight.Add_Click({ & $setTo ((Get-Date).Date.AddHours(21)) })
+    $btnTomorrow.Add_Click({ & $setTo ((Get-Date).Date.AddDays(1)) })
+    $btnMorning.Add_Click({ & $setTo ((Get-Date).Date.AddDays(1).AddHours(9)) })
+    $btnIn10.Add_Click({ & $setTo ((Get-Date).AddMinutes(10)) })
+    & $refresh
+
+    $script:scheduleConfirmed = $false
+    $btnOk = New-AppButton $dialog '이 시각으로 정하기' 322 402 152 42 'primary'
+    $btnCancelPick = New-AppButton $dialog '취소' 482 402 52 42
+    $btnOk.Add_Click({ $script:scheduleConfirmed = $true; $dialog.Close() })
+    $btnCancelPick.Add_Click({ $script:scheduleConfirmed = $false; $dialog.Close() })
+
+    [void]$dialog.ShowDialog($script:form)
+    $dialog.Dispose()
+    if ($script:scheduleConfirmed) { return $script:pickedSchedule }
+    return $null
+}
+
 # 보내기 전에 '누구에게 무엇을' 보내는지 한 화면에서 보여 줍니다.
 function Show-SendConfirm([string]$Action) {
     $rooms = @($script:roomEntries | Where-Object { $_.Checked })
@@ -3885,6 +4105,29 @@ function Confirm-LiveRun([string]$Action) {
     return $true
 }
 
+$script:repeatDone = 0
+
+# 반복 발송이 켜져 있으면 다음 차례를 예약합니다.
+function Start-RepeatIfNeeded {
+    if (-not [bool]$script:config.RepeatEnabled) { return }
+    $limit = [int]$script:config.RepeatCount
+    $script:repeatDone++
+    if ($limit -gt 0 -and $script:repeatDone -ge $limit) {
+        Write-RunLog "반복 발송을 $($script:repeatDone)회 마쳤습니다. (설정한 최대 횟수 도달)"
+        $script:repeatDone = 0
+        return
+    }
+    $minutes = [Math]::Max(1, [int]$script:config.RepeatMinutes)
+    $next = (Get-Date).AddMinutes($minutes)
+    $script:dtSchedule.Value = $next
+    $script:armed = $true
+    $btnArm.Enabled = $false
+    $btnCancelArm.Enabled = $true
+    $limitText = if ($limit -gt 0) { "$($script:repeatDone)/$limit 회" } else { "$($script:repeatDone)회째" }
+    Write-RunLog "반복 발송: $($minutes)분 뒤 다시 보냅니다. ($limitText) → $($next.ToString('yyyy-MM-dd HH:mm'))"
+    Set-StatusPill "반복 대기 — $($next.ToString('HH:mm')) 에 다시" 'wait'
+}
+
 function Start-BroadcastAsync {
     if ($script:running) { return }
     $script:running = $true
@@ -3896,6 +4139,7 @@ function Start-BroadcastAsync {
     try {
         $count = Invoke-Broadcast
         Set-StatusPill "작업 완료 · 성공 $($count)개" 'done'
+        Start-RepeatIfNeeded
     } catch {
         Write-RunLog "작업 중단: $($_.Exception.Message)"
         Set-StatusPill '오류로 중단' 'error'
@@ -3927,6 +4171,7 @@ $btnArm.Add_Click({
 })
 $btnCancelArm.Add_Click({
     $script:armed = $false
+    $script:repeatDone = 0
     $btnArm.Enabled = $true
     $btnCancelArm.Enabled = $false
     $script:lblCountdown.Text = '예약이 취소되었습니다.'
