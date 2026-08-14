@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.0.0'
+$script:AppVersion = '4.0.1'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -643,8 +643,10 @@ function Find-KakaoMainHandle {
     return $instances[0].Handle
 }
 
+# 최소화뿐 아니라 '트레이로 닫아 숨긴' 상태도 사용할 수 없는 상태로 봅니다.
 function Test-WindowMinimized([object]$Window) {
     if ($null -eq $Window) { return $false }
+    if (-not $Window.Visible) { return $true }
     if ([NativeKakao]::IsWindowMinimized($Window.Handle)) { return $true }
     return ($Window.Rect.Left -le -30000 -or $Window.Width -lt 200 -or $Window.Height -lt 200)
 }
@@ -654,10 +656,12 @@ function Get-MainKakaoWindow([bool]$Restore = $false) {
     if ($handle -eq [IntPtr]::Zero) { $script:activeKakaoWindow = $null; return $null }
     $window = [NativeKakao]::GetWindow($handle)
     if ($Restore -and (Test-WindowMinimized $window)) {
+        # 트레이로 닫아 숨긴 창은 SW_SHOW, 최소화된 창은 SW_RESTORE 로 되살립니다.
+        if (-not $window.Visible) { [void][NativeKakao]::ShowWindow($handle, 5); Start-Sleep -Milliseconds 400 }
         [void][NativeKakao]::ShowWindow($handle, 9)
-        Start-Sleep -Milliseconds 600
+        Start-Sleep -Milliseconds 700
         $window = [NativeKakao]::GetWindow($handle)
-        Write-RunLog '카카오톡 창이 최소화되어 있어 다시 열었습니다.'
+        Write-RunLog '카카오톡 창이 닫혀 있거나 최소화되어 있어 다시 열었습니다.'
     }
     $script:activeKakaoWindow = $window
     return $window
@@ -937,7 +941,12 @@ function Test-KakaoReady([bool]$Restore = $false, [bool]$NeedSearch = $false) {
         return [pscustomobject]@{ Ok = $false; Reason = 'PC 카카오톡이 실행되어 있지 않습니다. 카카오톡을 먼저 실행해 주세요.'; Layout = $null }
     }
     if (Test-WindowMinimized $main) {
-        return [pscustomobject]@{ Ok = $false; Reason = '카카오톡 창이 최소화되어 있습니다. 작업 표시줄에서 카카오톡 창을 열어 주세요.'; Layout = $null }
+        $reason = if (-not $main.Visible) {
+            '카카오톡 창이 닫혀 있습니다. 화면 오른쪽 아래 트레이(시계 옆)의 카카오톡 아이콘을 눌러 창을 열어 주세요.'
+        } else {
+            '카카오톡 창이 최소화되어 있습니다. 작업 표시줄에서 카카오톡 창을 열어 주세요.'
+        }
+        return [pscustomobject]@{ Ok = $false; Reason = $reason; Layout = $null }
     }
     $layout = Get-KakaoLayout $main
     if ($null -eq $layout.List) {
@@ -951,14 +960,16 @@ function Test-KakaoReady([bool]$Restore = $false, [bool]$NeedSearch = $false) {
 
 # 화면 좌표를 그 자리에 있는 컨트롤에 대한 메시지로 바꿔 보냅니다.
 # 마우스를 움직이지 않고, 카카오톡이 뒤에 있어도 동작합니다.
+# 주의: 이 함수는 값을 돌려주지 않습니다.
+# 예전에 $true 를 돌려주다가 그 값이 호출한 함수의 반환값에 섞여
+# 채팅창 대신 배열이 넘어가는 문제가 있었습니다.
 function Invoke-PointClick([int]$X, [int]$Y, [bool]$DoubleClick = $false) {
     $main = $script:activeKakaoWindow
     if ($null -eq $main) { $main = Get-MainKakaoWindow }
-    if ($null -eq $main) { return $false }
+    if ($null -eq $main) { return }
     $target = [NativeKakao]::ChildAtPoint($main.Handle, $X, $Y)
     if ($target -eq [IntPtr]::Zero) { $target = $main.Handle }
     [NativeKakao]::ClickControl($target, $X, $Y, $DoubleClick)
-    return $true
 }
 
 # 특정 컨트롤에 직접 누르기 (좌표를 아는 컨트롤이 있을 때)
@@ -976,7 +987,12 @@ function Invoke-RatioClick([object]$Window, [double]$XRatio, [double]$YRatio) {
 function Enter-KakaoTab([string]$Type) {
     $main = Get-MainKakaoWindow $true
     if ($null -eq $main) { throw 'PC 카카오톡이 실행되어 있지 않습니다. 카카오톡을 먼저 실행해 주세요.' }
-    if (Test-WindowMinimized $main) { throw '카카오톡 창이 최소화되어 있습니다. 카카오톡 창을 열어 주세요.' }
+    if (Test-WindowMinimized $main) {
+        if (-not $main.Visible) {
+            throw "카카오톡 창이 닫혀 있습니다.`r`n화면 오른쪽 아래 트레이(시계 옆)의 카카오톡 아이콘을 눌러 창을 열어 둔 뒤 다시 시도해 주세요."
+        }
+        throw "카카오톡 창이 최소화되어 있습니다.`r`n작업 표시줄에서 카카오톡 창을 열어 둔 뒤 다시 시도해 주세요."
+    }
     $layout = Get-KakaoLayout $main
     $wantOpen = ($Type -eq $script:RoomTypeOpen)
     if ($wantOpen -and $layout.IsOpenChatList) { return $layout }
@@ -1029,6 +1045,15 @@ function Find-ChatWindow([string]$Room, [IntPtr]$MainHandle) {
             if (-not $window.Visible -or $window.Handle -eq $MainHandle) { continue }
             if (Test-RoomTitle $window.Title $Room) { return $window }
         }
+    }
+    return $null
+}
+
+# 함수가 값을 여럿 돌려줘도 채팅창 하나만 골라냅니다.
+function Get-SingleChatWindow([object]$Value) {
+    foreach ($item in @($Value)) {
+        if ($null -eq $item) { continue }
+        if ($item -is [NativeKakao+WindowInfo]) { return $item }
     }
     return $null
 }
@@ -1481,9 +1506,9 @@ function Resolve-RoomName([string]$Query, [string]$RoomType) {
 }
 
 function Invoke-OneRoom([string]$Room, [string]$RoomType, [object]$Content) {
-    $chat = Open-RoomBySearch $Room $RoomType
+    $chat = Get-SingleChatWindow (Open-RoomBySearch $Room $RoomType)
     if ($null -eq $chat) {
-        Write-RunLog "건너뜀: '$Room' — 검색으로 채팅창을 열지 못했습니다."
+        Write-RunLog "건너뜀: '$Room' — 채팅창을 열지 못했습니다."
         return $false
     }
     if (-not (Test-RoomTitle $chat.Title $Room)) {
