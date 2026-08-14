@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.2.1'
+$script:AppVersion = '4.3.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -1600,23 +1600,9 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
 
     $message = [string]$Content.Message
     if (-not [string]::IsNullOrWhiteSpace($message)) {
-        if (-not (Set-ChatInputText $inputBox $message)) {
-            Write-RunLog "건너뜀: '$Room' — 글을 입력칸에 넣지 못했습니다. (전송하지 않음)"
-            Clear-ChatInput $inputBox
-            Close-ChatWindow $chat
-            return $false
-        }
-        $written = [NativeKakao]::GetControlText($inputBox.Handle)
-        # 넣은 글과 다르면 보내지 않습니다. 잘못된 내용이 나가는 것을 막습니다.
-        if (($written -replace '\s', '') -ne ($message -replace '\s', '')) {
-            Write-RunLog "건너뜀: '$Room' — 입력칸 내용이 문구와 다릅니다. (전송하지 않음)"
-            Clear-ChatInput $inputBox
-            Close-ChatWindow $chat
-            return $false
-        }
-        $how = Invoke-ChatSend $chat $inputBox
+        $how = Send-ChatText $chat $inputBox $message
         if (-not $how) {
-            Write-RunLog "실패: '$Room' — 입력은 됐지만 전송되지 않았습니다. 입력칸을 비우고 넘어갑니다."
+            Write-RunLog "실패: '$Room' — 전송되지 않았습니다. 입력칸을 비우고 넘어갑니다."
             Clear-ChatInput $inputBox
             Close-ChatWindow $chat
             return $false
@@ -1636,17 +1622,106 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
         }
         try { Set-ClipboardFileSafe $path }
         catch { Write-RunLog "첨부 건너뜀: 클립보드를 쓰지 못했습니다 — $path"; continue }
-        [NativeKakao]::ClickControl($inputBox.Handle, ($inputBox.Rect.Left + [int]($inputBox.Width / 2)), ($inputBox.Rect.Top + [int]($inputBox.Height / 2)), $false)
-        Start-Sleep -Milliseconds 150
-        [NativeKakao]::PasteInto($inputBox.Handle)
+        if (-not (Enter-ChatForeground $chat $inputBox)) {
+            Write-RunLog "첨부 건너뜀: 채팅창을 앞으로 가져오지 못했습니다 — $path"
+            continue
+        }
+        [System.Windows.Forms.SendKeys]::SendWait('^v')
         Start-Sleep -Milliseconds $waitMs
-        [void](Invoke-ChatSend $chat $inputBox)
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
         Start-Sleep -Milliseconds ($waitMs + 200)
     }
 
     Write-RunLog "발송 완료: '$Room'"
     Close-ChatWindow $chat
     return $true
+}
+
+# 채팅창을 앞으로 가져오고 입력칸에 포커스를 줍니다.
+# 카카오톡은 창 메시지로 넣은 글자를 '사용자 입력'으로 인정하지 않아
+# 전송 버튼이 회색으로 남습니다. 그래서 전송할 때만 실제 키보드 입력을 씁니다.
+function Enter-ChatForeground([object]$Chat, [object]$InputBox) {
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        [void][NativeKakao]::ForceForeground($Chat.Handle)
+        $deadline = (Get-Date).AddMilliseconds(900)
+        while ((Get-Date) -lt $deadline) {
+            if ([NativeKakao]::GetForegroundWindow() -eq $Chat.Handle) {
+                # 마우스를 움직이지 않고 입력칸에 포커스를 줍니다.
+                if (-not (Set-ChatInputFocus $Chat)) {
+                    [NativeKakao]::ClickControl($InputBox.Handle,
+                        ($InputBox.Rect.Left + [int]($InputBox.Width / 2)),
+                        ($InputBox.Rect.Top + [int]($InputBox.Height / 2)), $false)
+                }
+                Start-Sleep -Milliseconds 120
+                return $true
+            }
+            Start-Sleep -Milliseconds 60
+        }
+    }
+    return $false
+}
+
+# 실제 키보드 입력으로 붙여넣고 보냅니다. 성공은 입력칸이 비워졌는지로 판단합니다.
+function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message) {
+    if (-not (Enter-ChatForeground $Chat $InputBox)) {
+        Write-RunLog '경고: 채팅창을 앞으로 가져오지 못했습니다.'
+        return ''
+    }
+
+    # 이미 써 두던 글(임시 저장)이 있을 때만 지웁니다.
+    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) {
+        [System.Windows.Forms.SendKeys]::SendWait('^a')
+        [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
+        Start-Sleep -Milliseconds 120
+    }
+
+    $pasted = $false
+    try {
+        Set-ClipboardTextSafe $Message
+        [System.Windows.Forms.SendKeys]::SendWait('^v')
+        Start-Sleep -Milliseconds 320
+        $pasted = $true
+    } catch {
+        Write-RunLog '클립보드를 쓰지 못해 직접 입력으로 넘어갑니다.'
+    }
+
+    $written = [NativeKakao]::GetControlText($InputBox.Handle)
+    if (($written -replace '\s', '') -ne ($Message -replace '\s', '')) {
+        # 붙여넣기가 안 됐거나 내용이 다르면 실제 키 입력으로 다시 씁니다.
+        if (-not [string]::IsNullOrWhiteSpace($written)) {
+            [System.Windows.Forms.SendKeys]::SendWait('^a')
+            [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
+            Start-Sleep -Milliseconds 120
+        }
+        [System.Windows.Forms.SendKeys]::SendWait((ConvertTo-SendKeysText $Message))
+        Start-Sleep -Milliseconds 400
+        $written = [NativeKakao]::GetControlText($InputBox.Handle)
+    }
+
+    # 넣은 글과 다르면 보내지 않습니다. 잘못된 내용이 나가는 것을 막습니다.
+    if (($written -replace '\s', '') -ne ($Message -replace '\s', '')) {
+        Write-RunLog "건너뜀: 입력칸 내용이 문구와 다릅니다. (전송하지 않음)"
+        return ''
+    }
+
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    if (Wait-ChatInputCleared $InputBox 2000) {
+        return $(if ($pasted) { '붙여넣기 + Enter (실제 키 입력)' } else { '직접 입력 + Enter (실제 키 입력)' })
+    }
+
+    # 그래도 안 되면 창 메시지로 한 번 더 시도합니다.
+    $fallback = Invoke-ChatSend $Chat $InputBox
+    if ($fallback) { return $fallback }
+    return ''
+}
+
+# SendKeys 는 + ^ % ~ ( ) { } [ ] 를 특수 기호로 해석하므로 감싸 줍니다.
+# 줄바꿈은 반드시 Shift+Enter 로 보냅니다. 그냥 Enter 를 보내면
+# 줄마다 따로 전송되어 메시지가 여러 개로 쪼개집니다.
+function ConvertTo-SendKeysText([string]$Text) {
+    $escaped = [regex]::Replace($Text, '[+^%~(){}\[\]]', { param($m) '{' + $m.Value + '}' })
+    $escaped = $escaped -replace "`r`n", "`n"
+    return ($escaped -replace "`n", '+{ENTER}')
 }
 
 # ---------------------------------------------------------------------------
@@ -2218,6 +2293,16 @@ if ($SelfTest) {
     if ($null -eq $nextAllowed) { throw '다음 발송 가능 시각 계산 실패' }
     if ((Test-QuietHours $nextAllowed)) { throw '다음 발송 가능 시각이 여전히 방해금지 구간' }
     $script:config.QuietEnabled = $false
+
+    # 줄바꿈이 Enter 로 바뀌면 메시지가 줄마다 쪼개져 전송됩니다. 반드시 Shift+Enter 여야 합니다.
+    $multiline = ConvertTo-SendKeysText "첫째 줄`r`n둘째 줄"
+    if ($multiline -ne '첫째 줄+{ENTER}둘째 줄') { throw "줄바꿈 변환 실패: $multiline" }
+    if ($multiline -match '(?<!\+)\{ENTER\}') { throw '줄바꿈이 그냥 Enter 로 변환되었습니다' }
+    $special = ConvertTo-SendKeysText '가격(1+2) 100% ^표시 {중괄호} [대괄호] ~물결'
+    foreach ($token in @('{(}', '{)}', '{+}', '{%}', '{^}', '{{}', '{}}', '{[}', '{]}', '{~}')) {
+        if (-not $special.Contains($token)) { throw "특수 기호 변환 실패: $token 이 없습니다 — $special" }
+    }
+    if ((ConvertTo-SendKeysText '보통 문구') -ne '보통 문구') { throw '일반 문구가 잘못 변환되었습니다' }
 
     if ($script:TourSteps.Count -lt 3) { throw '가이드 투어 단계가 비어 있습니다' }
     foreach ($step in $script:TourSteps) {
