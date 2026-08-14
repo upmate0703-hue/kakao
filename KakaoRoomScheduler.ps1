@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.3.0'
+$script:AppVersion = '4.4.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -300,6 +300,7 @@ $script:statusKind = 'idle'
 $script:pillStatus = $null
 $script:hoverNav = ''
 $script:selectedKakaoProcessId = 0
+$script:lastTabRatios = ''
 $script:activeKakaoWindow = $null
 
 $script:RoomTypeNormal = '일반채팅'
@@ -623,7 +624,7 @@ function Get-NextAllowedTime([datetime]$From) {
 }
 
 function Get-EffectiveInterval([datetime]$When) {
-    $interval = [Math]::Max(5, [int]$script:config.IntervalSeconds)
+    $interval = [Math]::Max(0, [int]$script:config.IntervalSeconds)
     $holiday = Get-HolidayName $When
     if ($holiday -and ([string]$script:config.HolidayMode -eq '간격 늘리기')) {
         $multiplier = [Math]::Max(1, [int]$script:config.HolidayIntervalMultiplier)
@@ -851,6 +852,52 @@ function Find-TabPoint([object[]]$Words, [string]$Kind) {
     $matched = @($Words | Where-Object { Test-TabWord $_.Text $Kind } | Sort-Object Y, X)
     if ($matched.Count -eq 0) { return $null }
     return $matched[0]
+}
+
+# 지금 선택된 탭이 [채팅] 인지 [오픈채팅] 인지 글자 진하기로 판별합니다.
+# 카카오톡은 선택된 탭을 진한 검정으로, 선택되지 않은 탭을 회색으로 그립니다.
+function Get-DarkPixelRatio([System.Drawing.Bitmap]$Bitmap, [object]$MainWindow, [object]$Word, [int]$HalfWidth = 26, [int]$HalfHeight = 10) {
+    $centerX = $Word.X - $MainWindow.Rect.Left
+    $centerY = $Word.Y - $MainWindow.Rect.Top
+    $left = [Math]::Max(0, $centerX - $HalfWidth)
+    $right = [Math]::Min($Bitmap.Width - 1, $centerX + $HalfWidth)
+    $top = [Math]::Max(0, $centerY - $HalfHeight)
+    $bottom = [Math]::Min($Bitmap.Height - 1, $centerY + $HalfHeight)
+    if ($right -le $left -or $bottom -le $top) { return 0.0 }
+    $dark = 0
+    $total = 0
+    for ($y = $top; $y -le $bottom; $y++) {
+        for ($x = $left; $x -le $right; $x++) {
+            $total++
+            if ($Bitmap.GetPixel($x, $y).GetBrightness() -lt 0.42) { $dark++ }
+        }
+    }
+    if ($total -eq 0) { return 0.0 }
+    return ([double]$dark / [double]$total)
+}
+
+function Get-ActiveKakaoTab([object]$Layout) {
+    # 1순위: 카카오톡 내부 화면 이름
+    $byName = Get-RoomTypeFromViewName $Layout.ViewName
+    if ($byName -eq $script:RoomTypeOpen) { return $script:RoomTypeOpen }
+
+    # 2순위: 위쪽 탭 글자의 진하기 비교
+    try {
+        $words = @(Get-TopBandWords $Layout)
+        $chatWord = Find-TabPoint $words 'chat'
+        $openWord = Find-TabPoint $words 'open'
+        if ($null -eq $chatWord -and $null -eq $openWord) { return $byName }
+        $image = Get-WindowImage $Layout.Main
+        try {
+            $chatRatio = if ($null -ne $chatWord) { Get-DarkPixelRatio $image $Layout.Main $chatWord } else { 0.0 }
+            $openRatio = if ($null -ne $openWord) { Get-DarkPixelRatio $image $Layout.Main $openWord } else { 0.0 }
+            $script:lastTabRatios = "채팅 $([Math]::Round($chatRatio, 3)) / 오픈채팅 $([Math]::Round($openRatio, 3))"
+            # 차이가 뚜렷할 때만 판정합니다.
+            if ([Math]::Abs($chatRatio - $openRatio) -lt 0.04) { return $byName }
+            if ($openRatio -gt $chatRatio) { return $script:RoomTypeOpen }
+            return $script:RoomTypeNormal
+        } finally { $image.Dispose() }
+    } catch { return $byName }
 }
 
 # 돋보기 아이콘은 글자가 없어 위치를 확정할 수 없습니다.
@@ -1992,7 +2039,11 @@ function Invoke-Broadcast {
         if (@($pending).Count -eq 0) { break }
 
         if ($round -gt 1) {
-            $ask = "아직 못 찾은 방이 $(@($pending).Count)개 있습니다.`r`n`r`n카카오톡에서 다른 탭([채팅] 또는 [오픈채팅])으로 바꾸거나, 목록 위의 분류를 [전체]로 바꿔 주신 뒤 [확인]을 눌러 주세요.`r`n`r`n[취소]를 누르면 남은 방은 건너뜁니다."
+            $nowTab = ''
+            try { $nowTab = Get-ActiveKakaoTab (Test-KakaoReady $false $false).Layout } catch { }
+            $nowText = if (-not $nowTab -or $nowTab -eq $script:RoomTypeUnknown) { '알 수 없음' } else { "$nowTab 탭" }
+            $otherText = if ($nowTab -eq $script:RoomTypeOpen) { '[채팅]' } else { '[오픈채팅]' }
+            $ask = "아직 못 찾은 방이 $(@($pending).Count)개 있습니다.`r`n`r`n지금 카카오톡은 $nowText 을(를) 보고 있습니다.`r`n$otherText 탭으로 바꾸거나, 목록 위 분류를 [전체]로 바꿔 주신 뒤 [확인]을 눌러 주세요.`r`n`r`n[취소]를 누르면 남은 방은 건너뜁니다."
             if ([System.Windows.Forms.MessageBox]::Show($ask, '남은 방을 다른 목록에서 찾기', 'OKCancel', 'Information') -ne 'OK') {
                 Write-RunLog "남은 $(@($pending).Count)개는 사용자가 건너뛰었습니다."
                 break
@@ -2006,8 +2057,9 @@ function Invoke-Broadcast {
             if ($blocked) { Write-RunLog "발송 중단: $blocked"; break }
         }
 
-        $view = (Test-KakaoReady $false $false).Layout.ViewName
-        Write-RunLog "$($round)회차: 방 $(@($pending).Count)개 찾기 (현재 화면 $view)"
+        $layoutNow = (Test-KakaoReady $false $false).Layout
+        $tabNow = Get-ActiveKakaoTab $layoutNow
+        Write-RunLog "$($round)회차: 방 $(@($pending).Count)개 찾기 (현재 탭 $tabNow / 화면 $($layoutNow.ViewName))"
         $result = Invoke-SweepOverList @($pending) $content ([int]$script:config.ScanPages) $interval $batchSize $batchRest
         $totalSent += $result.Sent
         $totalFailed += $result.Failed
@@ -3037,11 +3089,11 @@ catch { $script:dtSchedule.Value = (Get-Date).AddMinutes(10) }
 if ($script:dtSchedule.Value -lt $script:dtSchedule.MinDate) { $script:dtSchedule.Value = (Get-Date).AddMinutes(10) }
 $cardSchedule.Controls.Add($script:dtSchedule)
 
-[void](New-CardLabel $cardSchedule '방 사이 간격(초)' 274 56 130 22 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardSchedule '방 사이 간격(초) — 0이면 쉬지 않음' 274 56 300 22 $FontSmall $Theme.Muted)
 $script:numInterval = New-Object System.Windows.Forms.NumericUpDown
-$script:numInterval.Minimum = 5
+$script:numInterval.Minimum = 0
 $script:numInterval.Maximum = 300
-$script:numInterval.Value = [Math]::Max(5, [Math]::Min(300, [int]$script:config.IntervalSeconds))
+$script:numInterval.Value = [Math]::Max(0, [Math]::Min(300, [int]$script:config.IntervalSeconds))
 $script:numInterval.Location = New-Object System.Drawing.Point(274, 80)
 $script:numInterval.Size = New-Object System.Drawing.Size(94, 30)
 $script:numInterval.Font = $FontBase
@@ -3274,6 +3326,29 @@ function Show-RoomPicker([string]$Title) {
     return $script:pickedRoom
 }
 
+# 방 하나를 처리하는 데 걸리는 시간(실측 기준: 열기·전송·닫기 약 1.6초)
+$script:SecondsPerRoom = 1.6
+
+function Get-EstimatedRunText {
+    $count = @($script:roomEntries | Where-Object { $_.Checked }).Count
+    if ($count -eq 0) { return '보낼 방을 체크하면 예상 소요 시간을 알려 드립니다.' }
+    $interval = Get-EffectiveInterval (Get-Date)
+    $seconds = $count * $script:SecondsPerRoom + [Math]::Max(0, $count - 1) * $interval
+    $batchSize = [int]$script:config.BatchSize
+    $batchRest = [int]$script:config.BatchRestMinutes
+    $restText = ''
+    if ($batchSize -gt 0 -and $batchRest -gt 0 -and $count -gt $batchSize) {
+        $rests = [Math]::Floor(($count - 1) / $batchSize)
+        $seconds += $rests * $batchRest * 60
+        $restText = " (쉬는 시간 $($rests)회 포함)"
+    }
+    $span = [TimeSpan]::FromSeconds([Math]::Round($seconds))
+    $text = if ($span.TotalHours -ge 1) { "{0}시간 {1}분" -f [int]$span.TotalHours, $span.Minutes }
+            elseif ($span.TotalMinutes -ge 1) { "{0}분 {1}초" -f [int]$span.TotalMinutes, $span.Seconds }
+            else { "{0}초" -f [int]$span.TotalSeconds }
+    return "체크한 $($count)개 · 간격 $($interval)초 → 예상 소요 약 $text$restText"
+}
+
 function Update-LimitStateLabel {
     $now = Get-Date
     $lines = New-Object System.Collections.Generic.List[string]
@@ -3286,10 +3361,10 @@ function Update-LimitStateLabel {
         if ($null -ne $next) { $lines.Add("다음 발송 가능 시각: $($next.ToString('yyyy-MM-dd HH:mm'))") }
         $script:lblLimitState.ForeColor = $Theme.Danger
     } else {
-        $interval = Get-EffectiveInterval $now
-        $lines.Add("지금은 보낼 수 있습니다. 적용될 방 간격: $($interval)초")
+        $lines.Add("지금은 보낼 수 있습니다.")
         $script:lblLimitState.ForeColor = $Theme.Success
     }
+    try { $lines.Add((Get-EstimatedRunText)) } catch { }
     $script:lblLimitState.Text = ($lines -join [Environment]::NewLine)
 }
 
@@ -3345,7 +3420,7 @@ $script:lblMessageCount.Text = "$($script:txtMessage.Text.Length)자"
 $script:txtMessage.Add_TextChanged({ $script:lblMessageCount.Text = "$($script:txtMessage.Text.Length)자"; Request-AutoSave })
 $script:txtTestRoom.Add_TextChanged({ Request-AutoSave })
 $script:dtSchedule.Add_ValueChanged({ Request-AutoSave })
-$script:numInterval.Add_ValueChanged({ Request-AutoSave })
+$script:numInterval.Add_ValueChanged({ $script:config.IntervalSeconds = [int]$script:numInterval.Value; try { Update-LimitStateLabel } catch { }; Request-AutoSave })
 $script:numScanPages.Add_ValueChanged({ Request-AutoSave })
 $script:rdoDry.Add_CheckedChanged({ Request-AutoSave })
 $script:chkAutoUpdate.Add_CheckedChanged({ Request-AutoSave })
@@ -3549,13 +3624,18 @@ $btnScanRooms.Add_Click({
             return
         }
 
-        # 어느 탭을 읽는지 먼저 확인받습니다. 자동 판별 결과를 기본값으로 보여 줍니다.
-        $detected = Get-RoomTypeFromViewName $ready.Layout.ViewName
-        $guess = if ($detected -eq $script:RoomTypeUnknown) { '판별하지 못했습니다' } else { $detected }
-        $ask = "지금 카카오톡에서 보고 있는 목록을 읽습니다.`r`n`r`n· 자동 판별: $guess`r`n· 카카오톡 화면 이름: $($ready.Layout.ViewName)`r`n`r`n이 목록은 어떤 채팅방인가요?`r`n`r`n[예] 오픈채팅방`r`n[아니오] 일반 채팅방`r`n[취소] 그만두기"
-        $answer = [System.Windows.Forms.MessageBox]::Show($ask, '어떤 목록을 읽을까요?', 'YesNoCancel', 'Question')
+        # 카카오톡 위쪽에서 지금 선택된 탭이 [채팅] 인지 [오픈채팅] 인지 직접 확인합니다.
+        Set-StatusPill '어떤 탭인지 확인 중' 'run'
+        $detected = Get-ActiveKakaoTab $ready.Layout
+        Set-StatusPill '준비됨' 'idle'
+        $guess = if ($detected -eq $script:RoomTypeUnknown) { '판별하지 못했습니다' } else { "$detected 탭" }
+        $ask = "지금 카카오톡에서 보고 있는 목록을 읽습니다.`r`n`r`n· 위쪽 탭 확인 결과: $guess`r`n· 카카오톡 화면 이름: $($ready.Layout.ViewName)`r`n`r`n맞으면 그대로 진행하시고, 다르면 아래에서 골라 주세요.`r`n`r`n[예] 오픈채팅으로 저장`r`n[아니오] 일반채팅으로 저장`r`n[취소] 그만두기"
+        $answer = [System.Windows.Forms.MessageBox]::Show($ask, "읽을 목록 확인 — $guess", 'YesNoCancel', 'Question')
         if ($answer -eq 'Cancel') { return }
         $type = if ($answer -eq 'Yes') { $script:RoomTypeOpen } else { $script:RoomTypeNormal }
+        if ($detected -ne $script:RoomTypeUnknown -and $detected -ne $type) {
+            Write-RunLog "주의: 화면은 $detected 로 보였는데 $type 으로 저장합니다."
+        }
 
         Set-StatusPill "$type 목록 읽는 중" 'run'
         $script:form.Enabled = $false
@@ -3762,8 +3842,10 @@ function Update-KakaoStateLabel {
     $lines = New-Object System.Collections.Generic.List[string]
     $ready = Test-KakaoReady
     if ($ready.Ok) {
-        $lines.Add("[정상] 카카오톡 연결됨 - 지금 보고 있는 화면: $($ready.Layout.ViewName)")
-        $lines.Add("[정상] 채팅방 목록을 찾았습니다.")
+        $tab = Get-ActiveKakaoTab $ready.Layout
+        $tabText = if ($tab -eq $script:RoomTypeUnknown) { '판별하지 못함' } else { "$tab 탭" }
+        $lines.Add("[정상] 카카오톡 연결됨 - 지금 선택된 탭: $tabText")
+        $lines.Add("[정상] 채팅방 목록을 찾았습니다. (화면 $($ready.Layout.ViewName))")
     } else {
         $lines.Add("[확인 필요] $($ready.Reason)")
     }
@@ -4257,7 +4339,10 @@ function Show-SplashScreen {
             if ($null -eq $layout.List) {
                 & $setStep 'instance' '실패' '채팅 목록이 보이지 않습니다. 카카오톡에서 채팅 탭을 눌러 주세요.'
             } else {
-                & $setStep 'instance' '확인' "카카오톡 #$($script:selectedKakaoProcessId) / 화면 $($layout.ViewName)"
+                $tab = ''
+                try { $tab = Get-ActiveKakaoTab $layout } catch { }
+                $tabText = if (-not $tab -or $tab -eq $script:RoomTypeUnknown) { '탭 판별 못함' } else { "$tab 탭" }
+                & $setStep 'instance' '확인' "카카오톡 #$($script:selectedKakaoProcessId) / 지금 $tabText"
             }
         }
     }
