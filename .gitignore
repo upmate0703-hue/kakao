@@ -1,0 +1,8 @@
+# 사용자 설정과 실행 기록은 저장소에 올리지 않습니다.
+config.json
+logs/
+backup/
+
+# 배포 산출물
+dist/
+*.zip

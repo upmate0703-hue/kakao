@@ -1,0 +1,5 @@
+# PowerShell 스크립트는 UTF-8 BOM 을 유지해야 합니다. git 이 내용을 바꾸지 않도록 둡니다.
+*.ps1  text eol=crlf
+*.cmd  text eol=crlf
+*.md   text eol=lf
+*.yml  text eol=lf
