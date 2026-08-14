@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.4.0'
+$script:AppVersion = '4.5.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -322,6 +322,7 @@ function New-DefaultConfig {
         SkipWeekend = $false
         ExtraHolidays = @()
         AutoDownloadUpdate = $true
+        SkipSendConfirm = $false
         BatchSize = 0
         BatchRestMinutes = 30
         Message = ''
@@ -2203,7 +2204,7 @@ $script:TourSteps = @(
     @{
         Page = 'compose'
         Title = '3단계 · 문구와 사진 준비'
-        Body  = "[발송 준비] 화면에 보낼 문구를 적고, 사진이나 파일을 추가합니다.`r`n`r`n문구가 먼저 한 개의 메시지로 전송되고, 그다음 첨부가 목록 순서대로 하나씩 전송됩니다. 순서는 [위로] [아래로] 버튼으로 바꿀 수 있습니다.`r`n`r`n입력한 내용은 자동으로 저장되니 따로 저장하지 않아도 됩니다."
+        Body  = "[1. 보낼 내용] 화면에 보낼 문구를 적고, 사진이나 파일을 추가합니다.`r`n`r`n문구가 먼저 한 개의 메시지로 전송되고, 그다음 첨부가 목록 순서대로 하나씩 전송됩니다. 순서는 [위로] [아래로] 버튼으로 바꿀 수 있습니다.`r`n`r`n입력한 내용은 자동으로 저장되니 따로 저장하지 않아도 됩니다."
     },
     @{
         Page = 'run'
@@ -2233,7 +2234,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'AutoCheckUpdate', 'TourDone', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'AutoCheckUpdate', 'TourDone', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -2726,16 +2727,19 @@ $logo.Add_Paint({
 })
 $sidebar.Controls.Add($logo)
 
+# 자주 쓰는 순서대로 위에 두고, 설정과 기록은 아래로 내립니다.
 $script:NavPages = @(
-    @{ Key = 'compose';  Text = '발송 준비';   Title = '발송 준비' },
-    @{ Key = 'rooms';    Text = '채팅방 선택'; Title = '채팅방 선택' },
-    @{ Key = 'run';      Text = '실행 · 예약'; Title = '실행 · 예약' },
-    @{ Key = 'settings'; Text = '설정';        Title = '설정' },
-    @{ Key = 'log';      Text = '실행 기록';   Title = '실행 기록' }
+    @{ Key = 'compose';  Text = '1. 보낼 내용';   Title = '보낼 내용';   Group = 'main' },
+    @{ Key = 'rooms';    Text = '2. 받을 채팅방'; Title = '받을 채팅방'; Group = 'main' },
+    @{ Key = 'run';      Text = '3. 보내기';      Title = '보내기';      Group = 'main' },
+    @{ Key = 'settings'; Text = '설정';           Title = '설정';        Group = 'bottom' },
+    @{ Key = 'log';      Text = '실행 기록';      Title = '실행 기록';   Group = 'bottom' }
 )
 
 $navY = 122
+$bottomY = 470
 foreach ($page in $script:NavPages) {
+    if ($page.Group -eq 'bottom' -and $navY -lt $bottomY) { $navY = $bottomY }
     $script:navText[$page.Key] = $page.Text
     $item = New-Object System.Windows.Forms.Panel
     $item.Location = New-Object System.Drawing.Point(0, $navY)
@@ -2770,6 +2774,13 @@ foreach ($page in $script:NavPages) {
     $script:navItems += $item
     $navY += 48
 }
+
+# 위쪽 작업 묶음과 아래쪽 보조 메뉴를 구분하는 선
+$navDivider = New-Object System.Windows.Forms.Panel
+$navDivider.Location = New-Object System.Drawing.Point(28, ($bottomY - 18))
+$navDivider.Size = New-Object System.Drawing.Size(164, 1)
+$navDivider.BackColor = (New-Rgb 58 60 70)
+$sidebar.Controls.Add($navDivider)
 
 $script:pnlUpdate = New-Object System.Windows.Forms.Panel
 $script:pnlUpdate.Location = New-Object System.Drawing.Point(18, 626)
@@ -2813,12 +2824,12 @@ $script:lblPageTitle.Font = $FontPage
 $script:lblPageTitle.ForeColor = $Theme.Ink
 $script:lblPageTitle.BackColor = $Theme.Bg
 $script:lblPageTitle.Location = New-Object System.Drawing.Point(28, 26)
-$script:lblPageTitle.Size = New-Object System.Drawing.Size(360, 36)
+$script:lblPageTitle.Size = New-Object System.Drawing.Size(230, 36)
 $header.Controls.Add($script:lblPageTitle)
 
 $script:pillStatus = New-Object System.Windows.Forms.Panel
-$script:pillStatus.Location = New-Object System.Drawing.Point(452, 26)
-$script:pillStatus.Size = New-Object System.Drawing.Size(300, 38)
+$script:pillStatus.Location = New-Object System.Drawing.Point(266, 26)
+$script:pillStatus.Size = New-Object System.Drawing.Size(250, 38)
 $script:pillStatus.BackColor = $Theme.Bg
 $script:pillStatus.Add_Paint({
     param($sender, $e)
@@ -2844,10 +2855,15 @@ $script:pillStatus.Add_Paint({
 })
 $header.Controls.Add($script:pillStatus)
 
-$btnHelp = New-AppButton $header '?' 768 26 44 38 'default'
+# 어느 화면에 있든 바로 누를 수 있게 위쪽에 둡니다.
+$btnHeaderEdit  = New-AppButton $header '내용 수정' 528 24 112 42
+$btnHeaderStart = New-AppButton $header '발송 시작' 648 24 124 42 'primary'
+$btnHelp = New-AppButton $header '?' 780 24 36 42 'default'
 $btnHelp.Font = $FontStrong
 $tipHelp = New-Object System.Windows.Forms.ToolTip
 $tipHelp.SetToolTip($btnHelp, '사용 가이드 다시 보기')
+$tipHelp.SetToolTip($btnHeaderStart, '지금 발송을 시작합니다')
+$tipHelp.SetToolTip($btnHeaderEdit, '보낼 문구와 첨부를 고칩니다')
 
 # ----- 페이지 컨테이너 -----
 $pageHost = New-Object System.Windows.Forms.Panel
@@ -2904,7 +2920,7 @@ $btnFileDown   = New-AppButton $cardFiles '아래로' 616 170 144 36
 $btnRemoveFile = New-AppButton $cardFiles '선택 제거' 616 218 144 36 'danger'
 [void](New-CardLabel $cardFiles '사진은 미리보기를 거쳐 전송됩니다.' 616 262 144 40 $FontSmall $Theme.Muted)
 
-$lblComposeHint = New-CardLabel $pageCompose '내용은 자동 저장됩니다. 실제 발송 전에 [실행 · 예약] 화면에서 테스트 발송으로 결과를 먼저 확인하세요.' 28 618 784 30 $FontSmall $Theme.Muted
+$lblComposeHint = New-CardLabel $pageCompose '내용은 자동 저장됩니다. 실제 발송 전에 [3. 보내기] 화면에서 테스트 발송으로 결과를 먼저 확인하세요.' 28 618 784 30 $FontSmall $Theme.Muted
 $lblComposeHint.BackColor = $Theme.Bg
 
 # ===========================================================================
@@ -3449,7 +3465,7 @@ $btnShowHolidays.Add_Click({
 $btnTestMyChat.Add_Click({ $script:txtTestRoom.Text = '나와의 채팅'; Sync-ConfigFromForm })
 $btnPickTestRoom.Add_Click({
     if ($script:roomEntries.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("아직 채팅방 목록이 비어 있습니다.`r`n[채팅방 선택] 화면에서 먼저 목록을 읽어 주세요.", '목록 없음') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("아직 채팅방 목록이 비어 있습니다.`r`n[2. 받을 채팅방] 화면에서 먼저 목록을 읽어 주세요.", '목록 없음') | Out-Null
         return
     }
     $picked = Show-RoomPicker '테스트로 보낼 채팅방 고르기'
@@ -3465,6 +3481,14 @@ $script:lstRooms.Add_ItemChecked({
 })
 
 $btnHelp.Add_Click({ Show-GuideTour })
+$btnHeaderEdit.Add_Click({ Show-AppPage 'compose' })
+$btnHeaderStart.Add_Click({
+    try {
+        Sync-ConfigFromForm
+        Show-AppPage 'run'
+        if (Confirm-LiveRun '지금 발송 시작') { Start-BroadcastAsync }
+    } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '실행 실패') | Out-Null }
+})
 
 $btnAddFile.Add_Click({
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -3720,7 +3744,126 @@ $btnVerifyRoom.Add_Click({
     }
 })
 
+# 보내기 전에 '누구에게 무엇을' 보내는지 한 화면에서 보여 줍니다.
+function Show-SendConfirm([string]$Action) {
+    $rooms = @($script:roomEntries | Where-Object { $_.Checked })
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = $Action
+    $dialog.ClientSize = New-Object System.Drawing.Size(600, 620)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.BackColor = $Theme.Card
+    $dialog.Font = $FontBase
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = $Action
+    $title.Font = $FontTourTitle
+    $title.ForeColor = $Theme.Ink
+    $title.BackColor = $Theme.Card
+    $title.Location = New-Object System.Drawing.Point(28, 24)
+    $title.Size = New-Object System.Drawing.Size(544, 34)
+    $dialog.Controls.Add($title)
+
+    $dryRun = [bool]$script:config.DryRun
+    $mode = if ($dryRun) { '확인 전용 — 방만 열어 보고 전송하지 않습니다.' } else { '실제로 메시지가 전송됩니다.' }
+    $summary = New-Object System.Windows.Forms.Label
+    $summary.Font = $FontBase
+    $summary.ForeColor = if ($dryRun) { $Theme.Sub } else { $Theme.Danger }
+    $summary.BackColor = $Theme.Card
+    $summary.Location = New-Object System.Drawing.Point(28, 62)
+    $summary.Size = New-Object System.Drawing.Size(544, 46)
+    $summary.Text = "$mode`r`n$(Get-EstimatedRunText)"
+    $dialog.Controls.Add($summary)
+
+    $lblTo = New-Object System.Windows.Forms.Label
+    $lblTo.Text = "받는 채팅방 $($rooms.Count)개"
+    $lblTo.Font = $FontStrong
+    $lblTo.ForeColor = $Theme.Ink
+    $lblTo.BackColor = $Theme.Card
+    $lblTo.Location = New-Object System.Drawing.Point(28, 116)
+    $lblTo.Size = New-Object System.Drawing.Size(544, 24)
+    $dialog.Controls.Add($lblTo)
+
+    $listFrame = New-FieldFrame $dialog 28 144 544 224
+    $list = New-Object System.Windows.Forms.ListView
+    $list.View = 'Details'
+    $list.FullRowSelect = $true
+    $list.BorderStyle = 'None'
+    $list.Font = $FontBase
+    $list.Location = New-Object System.Drawing.Point(12, 12)
+    $list.Size = New-Object System.Drawing.Size(520, 200)
+    [void]$list.Columns.Add('채팅방 이름', 380)
+    [void]$list.Columns.Add('종류', 120)
+    foreach ($entry in ($rooms | Sort-Object -Property Type, Name)) {
+        $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Name)
+        [void]$item.SubItems.Add([string]$entry.Type)
+        [void]$list.Items.Add($item)
+    }
+    $listFrame.Controls.Add($list)
+
+    $lblMsg = New-Object System.Windows.Forms.Label
+    $lblMsg.Text = '보낼 문구'
+    $lblMsg.Font = $FontStrong
+    $lblMsg.ForeColor = $Theme.Ink
+    $lblMsg.BackColor = $Theme.Card
+    $lblMsg.Location = New-Object System.Drawing.Point(28, 380)
+    $lblMsg.Size = New-Object System.Drawing.Size(544, 24)
+    $dialog.Controls.Add($lblMsg)
+
+    $msgFrame = New-FieldFrame $dialog 28 408 544 104
+    $preview = New-Object System.Windows.Forms.TextBox
+    $preview.Multiline = $true
+    $preview.ReadOnly = $true
+    $preview.ScrollBars = 'Vertical'
+    $preview.BorderStyle = 'None'
+    $preview.BackColor = [System.Drawing.Color]::White
+    $preview.Font = $FontBase
+    $preview.Location = New-Object System.Drawing.Point(12, 10)
+    $preview.Size = New-Object System.Drawing.Size(518, 82)
+    $preview.Text = if ([string]::IsNullOrWhiteSpace($script:config.Message)) { '(문구 없음)' } else { [string]$script:config.Message }
+    $msgFrame.Controls.Add($preview)
+
+    $lblFiles = New-Object System.Windows.Forms.Label
+    $lblFiles.Text = "첨부 $(@($script:config.Attachments).Count)개"
+    $lblFiles.Font = $FontSmall
+    $lblFiles.ForeColor = $Theme.Muted
+    $lblFiles.BackColor = $Theme.Card
+    $lblFiles.Location = New-Object System.Drawing.Point(28, 518)
+    $lblFiles.Size = New-Object System.Drawing.Size(300, 22)
+    $dialog.Controls.Add($lblFiles)
+
+    $chkSkip = New-Object System.Windows.Forms.CheckBox
+    $chkSkip.Text = '다음부터 이 확인 창 보지 않기'
+    $chkSkip.Font = $FontSmall
+    $chkSkip.BackColor = $Theme.Card
+    $chkSkip.Location = New-Object System.Drawing.Point(28, 548)
+    $chkSkip.Size = New-Object System.Drawing.Size(280, 26)
+    $dialog.Controls.Add($chkSkip)
+
+    $script:sendConfirmResult = $false
+    $btnGo = New-AppButton $dialog $(if ($dryRun) { '확인 시작' } else { '보내기' }) 372 542 118 42 'primary'
+    $btnNo = New-AppButton $dialog '취소' 498 542 74 42
+    $btnGo.Add_Click({
+        if ($chkSkip.Checked) { $script:config.SkipSendConfirm = $true; try { Save-Config $script:config } catch { } }
+        $script:sendConfirmResult = $true
+        $dialog.Close()
+    })
+    $btnNo.Add_Click({ $script:sendConfirmResult = $false; $dialog.Close() })
+
+    if ($rooms.Count -eq 0) { $btnGo.Enabled = $false; $lblTo.Text = '받는 채팅방이 없습니다. [2. 받을 채팅방]에서 체크해 주세요.' }
+
+    [void]$dialog.ShowDialog($script:form)
+    $dialog.Dispose()
+    return $script:sendConfirmResult
+}
+
 function Confirm-LiveRun([string]$Action) {
+    # 보낼 대상을 한 번 보여 줍니다. '다음부터 보지 않기'를 고르면 건너뜁니다.
+    if (-not [bool]$script:config.SkipSendConfirm) {
+        if (-not (Show-SendConfirm $Action)) { return $false }
+    }
     # 방해금지·주말·공휴일 설정을 먼저 확인합니다.
     if (-not [bool]$script:config.DryRun) {
         $blocked = Get-SendBlockReason (Get-Date)
@@ -3732,11 +3875,14 @@ function Confirm-LiveRun([string]$Action) {
         }
     }
     if ([bool]$script:config.DryRun) { return $true }
-    $roomCount = @($script:config.Rooms).Count
-    $fileCount = @($script:config.Attachments).Count
-    $interval = Get-EffectiveInterval (Get-Date)
-    $body = "$Action`r`n`r`n대상: $($roomCount)개 방`r`n첨부: $($fileCount)개`r`n방 간격: $($interval)초`r`n`r`n실제 메시지가 전송됩니다. 계속할까요?"
-    return ([System.Windows.Forms.MessageBox]::Show($body, '실제 발송 확인', 'YesNo', 'Warning') -eq 'Yes')
+    # 확인 창을 껐다면 여기서 마지막으로 한 번만 묻습니다.
+    if ([bool]$script:config.SkipSendConfirm) {
+        $roomCount = @($script:config.Rooms).Count
+        $interval = Get-EffectiveInterval (Get-Date)
+        $body = "$Action`r`n`r`n대상 $($roomCount)개 방 · 간격 $($interval)초`r`n`r`n실제 메시지가 전송됩니다. 계속할까요?"
+        return ([System.Windows.Forms.MessageBox]::Show($body, '실제 발송 확인', 'YesNo', 'Warning') -eq 'Yes')
+    }
+    return $true
 }
 
 function Start-BroadcastAsync {
