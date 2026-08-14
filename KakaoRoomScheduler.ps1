@@ -2,6 +2,8 @@
     [switch]$SelfTest,
     [switch]$UiSmokeTest,
     [switch]$NoUpdateCheck,
+    [switch]$ScanTest,
+    [switch]$MaskNames,
     [string]$ScreenshotDir = ''
 )
 
@@ -50,6 +52,9 @@ public static class NativeKakao {
     }
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc callback, IntPtr extraData);
+    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr extraData);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdc, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
@@ -97,6 +102,24 @@ public static class NativeKakao {
         uint pid;
         GetWindowThreadProcessId(hWnd, out pid);
         return Describe(hWnd, pid);
+    }
+
+    public static List<WindowInfo> GetChildWindows(IntPtr parent) {
+        var result = new List<WindowInfo>();
+        EnumChildWindows(parent, delegate(IntPtr hWnd, IntPtr ignored) {
+            uint pid;
+            GetWindowThreadProcessId(hWnd, out pid);
+            result.Add(Describe(hWnd, pid));
+            return true;
+        }, IntPtr.Zero);
+        return result;
+    }
+
+    // 실제 마우스를 움직이지 않고 목록 컨트롤에만 휠 신호를 보냅니다.
+    public static void ScrollControl(IntPtr hWnd, int delta, int screenX, int screenY) {
+        IntPtr wParam = (IntPtr)(delta << 16);
+        IntPtr lParam = (IntPtr)((screenY << 16) | (screenX & 0xFFFF));
+        SendMessage(hWnd, 0x020A, wParam, lParam);
     }
 
     public static int GetProcessId(IntPtr hWnd) {
@@ -366,15 +389,204 @@ function Set-ChatInputFocus([object]$Window) {
 $script:RoomNoiseLabels = @(
     '친구', '채팅', '오픈채팅', '더보기', '검색', '설정', '채팅방 검색', '새로운 채팅',
     '쇼핑', '보기', '전체', '즐겨찾기', '알림', '메뉴', '이름', '프로필', '읽지 않음',
-    '일반채팅', '광고', '카카오톡', '친구 검색', '채팅 검색', '멀티프로필'
+    '일반채팅', '광고', '카카오톡', '친구 검색', '채팅 검색', '멀티프로필',
+    '조용한 채팅방', '일반 채팅방', '숨김 채팅방', '숨긴 채팅방', '안 읽은 채팅방',
+    '채팅방 이름', '전체 채팅방', '광고 문의'
 )
+
+# 채팅 목록의 각 행 오른쪽에 나타나는 시각·날짜 표기입니다. 행의 기준선으로 사용합니다.
+function Test-RowAnchorText([string]$Text) {
+    $t = ([string]$Text).Trim()
+    if (-not $t) { return $false }
+    if ($t -match '^(오전|오후)\s*\d{1,2}\s*[:：]\s*\d{2}$') { return $true }
+    if ($t -match '^\d{1,2}\s*[:：]\s*\d{2}$') { return $true }
+    if ($t -match '^(어제|오늘|그저께)$') { return $true }
+    if ($t -match '^\d{4}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{1,2}\s*\.?$') { return $true }
+    if ($t -match '^\d{1,2}\s*[.\-/]\s*\d{1,2}\s*\.?$') { return $true }
+    return $false
+}
+
+# OCR 로 읽은 줄에서 방 이름만 골라냅니다. 순수 함수라 자체 점검으로 검증합니다.
+function Get-RoomNamesFromOcrLines([object[]]$Lines, [int]$Width) {
+    $all = @($Lines)
+    if ($all.Count -eq 0 -or $Width -le 0) { return @() }
+
+    $nameLines = @($all | Where-Object { $_.Left -ge ($Width * 0.13) -and $_.Left -le ($Width * 0.46) } | Sort-Object Top)
+    if ($nameLines.Count -eq 0) { return @() }
+
+    $anchors = @($all | Where-Object { $_.Left -ge ($Width * 0.60) -and (Test-RowAnchorText $_.Text) } | Sort-Object Top)
+
+    $picked = New-Object System.Collections.Generic.List[object]
+    foreach ($anchor in $anchors) {
+        $best = $null
+        $bestDelta = [int]::MaxValue
+        foreach ($line in $nameLines) {
+            $delta = [Math]::Abs($line.Top - $anchor.Top)
+            if ($delta -lt $bestDelta) { $bestDelta = $delta; $best = $line }
+        }
+        if ($null -ne $best -and $bestDelta -le 16 -and -not $picked.Contains($best)) { $picked.Add($best) }
+    }
+
+    # 시각 표기를 못 읽은 경우에만 세로 묶음의 첫 줄을 대신 사용합니다.
+    if ($picked.Count -lt 2) {
+        $picked.Clear()
+        $previousTop = [int]::MinValue
+        foreach ($line in $nameLines) {
+            if (($line.Top - $previousTop) -gt 34) { $picked.Add($line) }
+            $previousTop = $line.Top
+        }
+    }
+
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($picked | Sort-Object Top)) {
+        $candidate = ConvertTo-RoomCandidate $line.Text
+        if ($candidate -and -not $result.Contains($candidate)) { $result.Add($candidate) }
+    }
+    return @($result)
+}
+
+# ---------------------------------------------------------------------------
+# 화면 글자 읽기 (Windows 내장 OCR)
+# ---------------------------------------------------------------------------
+$script:ocrEngine = $null
+$script:ocrReady = $null
+$script:ocrError = ''
+$script:awaitAsTask = $null
+
+function Initialize-Ocr {
+    if ($null -ne $script:ocrReady) { return $script:ocrReady }
+    $script:ocrReady = $false
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime
+        $script:awaitAsTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+            $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+            $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+        if ($null -eq $script:awaitAsTask) { throw 'WinRT 비동기 도우미를 찾지 못했습니다.' }
+        [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+        [void][Windows.Media.Ocr.OcrEngine, Windows.Media, ContentType = WindowsRuntime]
+        [void][Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
+        $language = New-Object Windows.Globalization.Language 'ko'
+        $script:ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
+        if ($null -eq $script:ocrEngine) { $script:ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages() }
+        if ($null -eq $script:ocrEngine) { throw '한국어 OCR 언어 팩이 설치되어 있지 않습니다.' }
+        $script:ocrReady = $true
+    } catch {
+        $script:ocrError = $_.Exception.Message
+    }
+    return $script:ocrReady
+}
+
+function Wait-WinRt($Operation, $ResultType) {
+    $task = $script:awaitAsTask.MakeGenericMethod($ResultType).Invoke($null, @($Operation))
+    [void]$task.Wait(-1)
+    return $task.Result
+}
+
+# PrintWindow 는 창이 가려져 있거나 뒤에 있어도 내용을 그려 줍니다.
+# 다만 첫 호출은 아직 그려지지 않은 빈 화면을 돌려주는 경우가 있어 비면 다시 시도합니다.
+function Get-WindowImage([object]$Window) {
+    $bitmap = $null
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        if ($null -ne $bitmap) { $bitmap.Dispose() }
+        $bitmap = New-Object System.Drawing.Bitmap($Window.Width, $Window.Height)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $hdc = $graphics.GetHdc()
+            try { [void][NativeKakao]::PrintWindow($Window.Handle, $hdc, 2) }
+            finally { $graphics.ReleaseHdc($hdc) }
+        } finally { $graphics.Dispose() }
+        if (-not (Test-ImageBlank $bitmap)) { return $bitmap }
+        Start-Sleep -Milliseconds 220
+    }
+    return $bitmap
+}
+
+function Test-ImageBlank([System.Drawing.Bitmap]$Bitmap) {
+    $seen = @{}
+    for ($y = 0; $y -lt $Bitmap.Height; $y += 17) {
+        for ($x = 0; $x -lt $Bitmap.Width; $x += 13) {
+            $seen[$Bitmap.GetPixel($x, $y).ToArgb()] = $true
+            if ($seen.Keys.Count -gt 3) { return $false }
+        }
+    }
+    return $true
+}
+
+function Get-OcrLines([object]$Window, [int]$Scale = 2) {
+    if (-not (Initialize-Ocr)) { throw "OCR 을 사용할 수 없습니다. $($script:ocrError)" }
+    $source = Get-WindowImage $Window
+    try {
+        if (Test-ImageBlank $source) { return @() }
+        $scaled = New-Object System.Drawing.Bitmap(($source.Width * $Scale), ($source.Height * $Scale))
+        $stream = New-Object System.IO.MemoryStream
+        try {
+            $graphics = [System.Drawing.Graphics]::FromImage($scaled)
+            $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $graphics.DrawImage($source, 0, 0, $scaled.Width, $scaled.Height)
+            $graphics.Dispose()
+
+            $scaled.Save($stream, [System.Drawing.Imaging.ImageFormat]::Bmp)
+            [void]$stream.Seek(0, 'Begin')
+            $random = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($stream)
+            $decoder = Wait-WinRt ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($random)) ([Windows.Graphics.Imaging.BitmapDecoder])
+            $software = Wait-WinRt ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+            $recognized = Wait-WinRt ($script:ocrEngine.RecognizeAsync($software)) ([Windows.Media.Ocr.OcrResult])
+
+            $lines = @()
+            foreach ($line in $recognized.Lines) {
+                $words = @($line.Words)
+                if ($words.Count -eq 0) { continue }
+                $left = ($words | ForEach-Object { $_.BoundingRect.X } | Measure-Object -Minimum).Minimum
+                $top = ($words | ForEach-Object { $_.BoundingRect.Y } | Measure-Object -Minimum).Minimum
+                $lines += [pscustomobject]@{
+                    Text = [string]$line.Text
+                    Left = [int]($left / $Scale)
+                    Top = [int]($top / $Scale)
+                }
+            }
+            return $lines
+        } finally {
+            $scaled.Dispose()
+            $stream.Dispose()
+        }
+    } finally { $source.Dispose() }
+}
+
+# 채팅 목록을 그리는 자식 컨트롤을 찾습니다.
+function Get-ChatListControl([object]$MainWindow) {
+    $children = @([NativeKakao]::GetChildWindows($MainWindow.Handle))
+    $candidates = @($children | Where-Object {
+        $_.Visible -and $_.Width -ge 150 -and $_.Height -ge 200 -and
+        $_.ClassName -notlike '*ScrollCtrl*' -and $_.ClassName -ne 'Edit'
+    })
+    $listControls = @($candidates | Where-Object { $_.ClassName -like '*ListControl*' })
+    if ($listControls.Count -gt 0) {
+        return ($listControls | Sort-Object -Property @{ Expression = { $_.Width * $_.Height } } -Descending | Select-Object -First 1)
+    }
+    if ($candidates.Count -gt 0) {
+        return ($candidates | Sort-Object -Property @{ Expression = { $_.Width * $_.Height } } -Descending | Select-Object -First 1)
+    }
+    return $null
+}
+
+function Move-ChatListByMessage([object]$ListControl, [string]$Direction, [int]$Notches = 3) {
+    $x = $ListControl.Rect.Left + [int]($ListControl.Width / 2)
+    $y = $ListControl.Rect.Top + [int]($ListControl.Height / 2)
+    $delta = if ($Direction -eq 'down') { -120 } else { 120 }
+    for ($i = 0; $i -lt $Notches; $i++) {
+        [NativeKakao]::ScrollControl($ListControl.Handle, $delta, $x, $y)
+        Start-Sleep -Milliseconds 90
+    }
+}
 
 function ConvertTo-RoomCandidate([string]$RawName) {
     if ([string]::IsNullOrWhiteSpace($RawName)) { return $null }
     $parts = @($RawName -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if ($parts.Count -eq 0) { return $null }
     $name = $parts[0].Trim()
-    if ($name.Length -lt 1 -or $name.Length -gt 60) { return $null }
+    if ($name.Length -lt 2 -or $name.Length -gt 60) { return $null }
+    # 글자가 하나도 없는 조각은 화면을 잘못 읽은 결과입니다.
+    if ($name -notmatch '[0-9A-Za-z가-힣]') { return $null }
     if ($name -match '^\d{1,2}:\d{2}$') { return $null }
     if ($name -match '^\d+$') { return $null }
     if ($name -match '^(오전|오후)\s*\d') { return $null }
@@ -479,45 +691,112 @@ function Reset-ChatList([object]$Scroller, [object]$MainWindow, [int]$Pages) {
 function Get-KakaoRoomNames([object]$Config) {
     $main = Get-MainKakaoWindow $Config.Calibration
     if ($null -eq $main) { throw '카카오톡 메인 창을 찾지 못했습니다. PC 카카오톡을 실행하고 채팅 목록을 화면에 띄워 주세요.' }
-    [void](Enter-KakaoForeground $main)
 
     # 채팅 탭이 보정되어 있으면 채팅 목록으로 먼저 이동합니다.
     if ([double]$Config.Calibration.ChatTabX -ge 0 -and [double]$Config.Calibration.ChatTabY -ge 0) {
+        [void](Enter-KakaoForeground $main)
         Invoke-RelativeClick $main ([double]$Config.Calibration.ChatTabX) ([double]$Config.Calibration.ChatTabY)
         Start-Sleep -Milliseconds 600
+        $main = [NativeKakao]::GetWindow($main.Handle)
     }
 
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($main.Handle)
-    $scroller = if ($null -ne $root) { Get-ChatListScroller $root } else { $null }
-
-    $all = New-Object System.Collections.Generic.List[string]
-    $noChangeCount = 0
     $maxPages = [Math]::Max(1, [Math]::Min(50, [int]$Config.ScanPages))
-    for ($page = 0; $page -lt $maxPages; $page++) {
-        $before = $all.Count
-        foreach ($candidate in @(Get-VisibleRoomCandidates $main)) {
-            if (-not $all.Contains([string]$candidate)) { $all.Add([string]$candidate) }
+    $all = New-Object System.Collections.Generic.List[string]
+    $method = ''
+    $pagesRead = 0
+
+    # 1순위: 화면 글자 읽기(OCR). 카카오톡은 채팅 목록을 직접 그리기 때문에
+    # 접근성 정보로는 방 이름이 노출되지 않는 버전이 많습니다.
+    $listControl = Get-ChatListControl $main
+    if ($null -ne $listControl -and (Initialize-Ocr)) {
+        $method = 'OCR'
+        $scrollMode = 'message'
+        $noChangeCount = 0
+        for ($page = 0; $page -lt $maxPages; $page++) {
+            $before = $all.Count
+            try {
+                $lines = Get-OcrLines $listControl 2
+                foreach ($name in (Get-RoomNamesFromOcrLines $lines $listControl.Width)) {
+                    if (-not $all.Contains([string]$name)) { $all.Add([string]$name) }
+                }
+            } catch {
+                Write-RunLog "화면 읽기 오류: $($_.Exception.Message)"
+                break
+            }
+            $pagesRead++
+            if ($all.Count -eq $before) { $noChangeCount++ } else { $noChangeCount = 0 }
+            if ($noChangeCount -ge 2) { break }
+
+            # 첫 스크롤이 전혀 먹지 않으면 실제 마우스 휠로 전환합니다.
+            if ($scrollMode -eq 'message' -and $page -eq 0 -and $noChangeCount -eq 0) {
+                Move-ChatListByMessage $listControl 'down' 3
+            } elseif ($scrollMode -eq 'message' -and $noChangeCount -eq 1 -and $page -le 1) {
+                $scrollMode = 'mouse'
+                [void](Enter-KakaoForeground $main)
+                [void](Move-ChatList $null $main 'down')
+            } elseif ($scrollMode -eq 'message') {
+                Move-ChatListByMessage $listControl 'down' 3
+            } else {
+                [void](Enter-KakaoForeground $main)
+                [void](Move-ChatList $null $main 'down')
+            }
+            Start-Sleep -Milliseconds 600
         }
-        if ($all.Count -eq $before) { $noChangeCount++ } else { $noChangeCount = 0 }
-        if ($noChangeCount -ge 2) { break }
-        [void](Move-ChatList $scroller $main 'down')
-        Start-Sleep -Milliseconds 650
+        # 목록을 맨 위로 되돌립니다.
+        if ($scrollMode -eq 'message') { Move-ChatListByMessage $listControl 'up' ($pagesRead * 3 + 6) }
+        else { for ($i = 0; $i -lt ($pagesRead + 3); $i++) { [void](Move-ChatList $null $main 'up') } }
+        Start-Sleep -Milliseconds 300
     }
 
-    Reset-ChatList $scroller $main $maxPages
-    Start-Sleep -Milliseconds 300
-    return @($all | Sort-Object -Unique)
+    # 2순위: 접근성 정보(UI Automation). 일부 버전에서는 이쪽이 동작합니다.
+    if ($all.Count -eq 0) {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($main.Handle)
+        $scroller = if ($null -ne $root) { Get-ChatListScroller $root } else { $null }
+        [void](Enter-KakaoForeground $main)
+        $noChangeCount = 0
+        for ($page = 0; $page -lt $maxPages; $page++) {
+            $before = $all.Count
+            foreach ($candidate in @(Get-VisibleRoomCandidates $main)) {
+                if (-not $all.Contains([string]$candidate)) { $all.Add([string]$candidate) }
+            }
+            $pagesRead++
+            if ($all.Count -eq $before) { $noChangeCount++ } else { $noChangeCount = 0 }
+            if ($noChangeCount -ge 2) { break }
+            [void](Move-ChatList $scroller $main 'down')
+            Start-Sleep -Milliseconds 650
+        }
+        Reset-ChatList $scroller $main $maxPages
+        if ($all.Count -gt 0) { $method = '접근성 정보' }
+        Start-Sleep -Milliseconds 300
+    }
+
+    if (-not $method) {
+        $reason = if ($null -eq $listControl) { '채팅 목록 영역을 찾지 못했습니다.' }
+                  elseif (-not $script:ocrReady) { "화면 글자 읽기를 사용할 수 없습니다. $($script:ocrError)" }
+                  else { '채팅 목록에서 방 이름을 찾지 못했습니다.' }
+        throw "$reason`r`n카카오톡에서 채팅 목록(말풍선 탭)이 보이는 상태인지 확인한 뒤 다시 시도하거나, [직접 추가]로 방 이름을 입력하세요."
+    }
+
+    return [pscustomobject]@{
+        Names = @($all | Sort-Object -Unique)
+        Method = $method
+        Pages = $pagesRead
+    }
 }
 
-# ---------------------------------------------------------------------------
-# 발송
-# ---------------------------------------------------------------------------
-function Invoke-OneRoom([string]$Room, [object]$Config) {
+# 검색으로 방을 열고, 새로 열린 채팅창을 돌려줍니다.
+function Open-RoomBySearch([string]$Query, [object]$Config, [int]$TimeoutMs = 5000) {
     $main = Get-MainKakaoWindow $Config.Calibration
     if ($null -eq $main) { throw '카카오톡 메인 창을 찾지 못했습니다. 채팅 목록을 열어 주세요.' }
-
     if (-not (Enter-KakaoForeground $main)) {
-        Write-RunLog "경고: 카카오톡 창을 앞으로 가져오지 못했습니다. 계속 시도합니다."
+        Write-RunLog '경고: 카카오톡 창을 앞으로 가져오지 못했습니다. 계속 시도합니다.'
+    }
+
+    $existing = @{}
+    foreach ($process in (Get-KakaoProcesses)) {
+        foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
+            if ($window.Visible) { $existing[[string]$window.Handle] = $true }
+        }
     }
 
     Invoke-RelativeClick $main ([double]$Config.Calibration.ChatTabX) ([double]$Config.Calibration.ChatTabY)
@@ -525,14 +804,51 @@ function Invoke-OneRoom([string]$Room, [object]$Config) {
     Invoke-RelativeClick $main ([double]$Config.Calibration.SearchX) ([double]$Config.Calibration.SearchY)
     Start-Sleep -Milliseconds 250
     [System.Windows.Forms.SendKeys]::SendWait('^a')
-    Set-ClipboardTextSafe $Room
+    Set-ClipboardTextSafe $Query
     [System.Windows.Forms.SendKeys]::SendWait('^v')
     Start-Sleep -Milliseconds 1200
     Invoke-RelativeClick $main ([double]$Config.Calibration.ResultX) ([double]$Config.Calibration.ResultY) $true
 
-    $chat = Wait-ChatWindow $Room $main.Handle 5000
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        foreach ($process in (Get-KakaoProcesses)) {
+            foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
+                if (-not $window.Visible -or $window.Handle -eq $main.Handle) { continue }
+                if ($existing.ContainsKey([string]$window.Handle)) { continue }
+                if ([string]::IsNullOrWhiteSpace($window.Title)) { continue }
+                return $window
+            }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+
+    # 이미 열려 있던 창이면 제목으로 찾습니다.
+    return (Find-ChatWindow $Query $main.Handle)
+}
+
+# OCR 로 읽은 이름을 실제 채팅창 제목으로 교정합니다.
+function Resolve-RoomName([string]$Query, [object]$Config) {
+    $chat = Open-RoomBySearch $Query $Config
+    if ($null -eq $chat) { return $null }
+    $title = ([string]$chat.Title).Trim()
+    Close-ChatWindow $chat
+    if (-not $title) { return $null }
+    # 창 제목에 붙는 인원수 표기는 방 이름이 아니므로 떼어 냅니다.
+    return ($title -replace '\s*\(\d+\)$', '')
+}
+
+# ---------------------------------------------------------------------------
+# 발송
+# ---------------------------------------------------------------------------
+function Invoke-OneRoom([string]$Room, [object]$Config) {
+    $chat = Open-RoomBySearch $Room $Config
     if ($null -eq $chat) {
-        Write-RunLog "건너뜀: '$Room' — 열린 채팅창 제목이 정확히 일치하지 않습니다."
+        Write-RunLog "건너뜀: '$Room' — 검색으로 채팅창을 열지 못했습니다."
+        return $false
+    }
+    if (-not (Test-RoomTitle $chat.Title $Room)) {
+        Write-RunLog "건너뜀: '$Room' — 열린 채팅창 제목('$($chat.Title)')이 정확히 일치하지 않습니다."
+        Close-ChatWindow $chat
         return $false
     }
 
@@ -724,7 +1040,7 @@ $script:TourSteps = @(
     @{
         Page = 'rooms'
         Title = '2단계 · 보낼 채팅방 고르기'
-        Body  = "[채팅방 선택] 화면에서 [카카오톡에서 읽기]를 누르면 채팅 목록을 훑어 방 이름을 가져옵니다. 읽는 동안에는 마우스와 키보드를 사용하지 마세요.`r`n`r`n카카오톡 버전에 따라 최근 메시지 미리보기가 방 이름처럼 섞여 들어올 수 있습니다. 체크하기 전에 눈으로 확인하고, 틀린 이름은 [이름 수정]으로 고치거나 [직접 추가]로 정확히 입력하세요."
+        Body  = "[카카오톡에서 읽기]를 누르면 채팅 목록 화면의 글자를 읽어 방 이름 후보를 모아 옵니다.`r`n`r`n화면을 읽는 방식이라 이름이 조금 틀리게 들어올 수 있습니다. 그래서 두 단계로 씁니다.`r`n`r`n① 보낼 방만 체크한다.`r`n② [이름 확인·보정]을 누른다. 체크한 방을 하나씩 열어 실제 이름으로 자동 교정합니다.`r`n`r`n그래도 안 잡히는 방은 [직접 추가]로 정확히 입력하면 됩니다."
     },
     @{
         Page = 'compose'
@@ -769,6 +1085,32 @@ if ($SelfTest) {
     if (Test-RoomTitle '우리반 공지방 2기' '우리반 공지방') { throw '창 제목 비교가 너무 느슨합니다' }
     if ((ConvertTo-AppVersion 'v3.1.0') -le (ConvertTo-AppVersion '3.0.0')) { throw '버전 비교 자체 점검 실패' }
     if ($null -ne (ConvertTo-AppVersion 'nightly')) { throw '버전 파싱 자체 점검 실패' }
+    foreach ($anchor in @('오후 3:20', '오전 11:05', '12:30', '어제', '2026. 8. 13.', '8/12')) {
+        if (-not (Test-RowAnchorText $anchor)) { throw "행 기준선 인식 실패: $anchor" }
+    }
+    foreach ($notAnchor in @('안녕하세요', '우리반 공지방', '')) {
+        if (Test-RowAnchorText $notAnchor) { throw "행 기준선 오인식: $notAnchor" }
+    }
+    # 실제 카카오톡 화면에서 관찰한 배치(가로 325px, 행 간격 약 70px)를 그대로 재현합니다.
+    $sample = @(
+        [pscustomobject]@{ Text = '우리반 공지방'; Left = 80; Top = 92 },
+        [pscustomobject]@{ Text = '내일 준비물 알려드립니다'; Left = 80; Top = 110 },
+        [pscustomobject]@{ Text = '오후 3:20'; Left = 257; Top = 90 },
+        [pscustomobject]@{ Text = '동네 모임'; Left = 80; Top = 160 },
+        [pscustomobject]@{ Text = '또 봬요'; Left = 80; Top = 180 },
+        [pscustomobject]@{ Text = '오후 1:02'; Left = 257; Top = 160 },
+        [pscustomobject]@{ Text = '홍보방'; Left = 80; Top = 224 },
+        [pscustomobject]@{ Text = 'https://example.com'; Left = 80; Top = 242 },
+        [pscustomobject]@{ Text = '이어지는 미리보기 두 번째 줄'; Left = 80; Top = 258 },
+        [pscustomobject]@{ Text = '어제'; Left = 262; Top = 224 },
+        [pscustomobject]@{ Text = '3'; Left = 286; Top = 108 }
+    )
+    $parsed = @(Get-RoomNamesFromOcrLines $sample 325)
+    if ($parsed.Count -ne 3) { throw "화면 읽기 행 분리 실패: 방 $($parsed.Count)개 (기대 3개) — $($parsed -join ', ')" }
+    if ($parsed[0] -ne '우리반 공지방' -or $parsed[1] -ne '동네 모임' -or $parsed[2] -ne '홍보방') {
+        throw "화면 읽기 결과가 기대와 다릅니다: $($parsed -join ', ')"
+    }
+    if (@(Get-RoomNamesFromOcrLines @() 325).Count -ne 0) { throw '빈 입력 처리 실패' }
     if ($script:TourSteps.Count -lt 3) { throw '가이드 투어 단계가 비어 있습니다' }
     foreach ($step in $script:TourSteps) {
         foreach ($key in @('Page', 'Title', 'Body')) {
@@ -778,6 +1120,29 @@ if ($SelfTest) {
     }
     [void](Get-KakaoProcesses)
     Write-Output 'SELFTEST_OK'
+    exit 0
+}
+
+# 채팅방 목록 읽기만 실제로 실행해 보는 진단 모드입니다.
+if ($ScanTest) {
+    Write-Output ("OCR 사용 가능: {0}" -f (Initialize-Ocr))
+    if ($script:ocrError) { Write-Output ("OCR 메모: {0}" -f $script:ocrError) }
+    $mainWindow = Get-MainKakaoWindow $script:config.Calibration
+    if ($null -eq $mainWindow) { Write-Output '카카오톡 메인 창을 찾지 못했습니다.'; exit 1 }
+    Write-Output ("메인 창: '{0}' {1}x{2}" -f $mainWindow.Title, $mainWindow.Width, $mainWindow.Height)
+    $control = Get-ChatListControl $mainWindow
+    if ($null -eq $control) { Write-Output '채팅 목록 컨트롤을 찾지 못했습니다.' }
+    else { Write-Output ("채팅 목록 컨트롤: {0} {1}x{2}" -f $control.ClassName, $control.Width, $control.Height) }
+    $scan = Get-KakaoRoomNames $script:config
+    Write-Output ("읽기 방식: {0} / 훑은 화면 수: {1} / 후보 {2}개" -f $scan.Method, $scan.Pages, @($scan.Names).Count)
+    foreach ($name in $scan.Names) {
+        if ($MaskNames -and $name.Length -gt 2) {
+            Write-Output ("  - {0}{1} [{2}자]" -f $name.Substring(0, 2), ('*' * [Math]::Min(10, $name.Length - 2)), $name.Length)
+        } else {
+            Write-Output "  - $name"
+        }
+    }
+    Write-Output 'SCANTEST_OK'
     exit 0
 }
 
@@ -1208,11 +1573,12 @@ $lblComposeHint.BackColor = $Theme.Bg
 $pageRooms = New-Page 'rooms'
 $cardRooms = New-Card $pageRooms 24 8 742 600 '발송 대상 채팅방' '카카오톡 채팅 목록을 읽어옵니다. 읽는 동안 마우스와 키보드를 사용하지 마세요.'
 
-$script:txtRoomFilter = New-AppTextBox $cardRooms 20 74 240 38
-$btnScanRooms  = New-AppButton $cardRooms '카카오톡에서 읽기' 272 74 158 38 'primary'
-$btnAddRoom    = New-AppButton $cardRooms '직접 추가' 438 74 90 38
-$btnEditRoom   = New-AppButton $cardRooms '이름 수정' 536 74 90 38
-$btnDeleteRoom = New-AppButton $cardRooms '삭제' 634 74 88 38 'danger'
+$script:txtRoomFilter = New-AppTextBox $cardRooms 20 74 200 38
+$btnScanRooms  = New-AppButton $cardRooms '카카오톡에서 읽기' 232 74 150 38 'primary'
+$btnVerifyRoom = New-AppButton $cardRooms '이름 확인·보정' 390 74 128 38
+$btnAddRoom    = New-AppButton $cardRooms '직접 추가' 526 74 88 38
+$btnEditRoom   = New-AppButton $cardRooms '이름 수정' 622 74 88 38
+$btnDeleteRoom = New-AppButton $cardRooms '삭제' 20 508 68 34 'danger'
 
 $frameRooms = New-FieldFrame $cardRooms 20 124 702 372
 $script:lstRooms = New-Object System.Windows.Forms.CheckedListBox
@@ -1223,9 +1589,9 @@ $script:lstRooms.Location = New-Object System.Drawing.Point(10, 10)
 $script:lstRooms.Size = New-Object System.Drawing.Size(682, 352)
 $frameRooms.Controls.Add($script:lstRooms)
 
-$btnCheckAll  = New-AppButton $cardRooms '전체 선택' 20 508 96 34
-$btnCheckNone = New-AppButton $cardRooms '전체 해제' 124 508 96 34
-$script:lblRoomCount = New-CardLabel $cardRooms '선택 0개 / 전체 0개' 232 512 200 26 $FontStrong $Theme.Ink
+$btnCheckAll  = New-AppButton $cardRooms '전체 선택' 96 508 88 34
+$btnCheckNone = New-AppButton $cardRooms '전체 해제' 192 508 88 34
+$script:lblRoomCount = New-CardLabel $cardRooms '선택 0개 / 전체 0개' 292 512 180 26 $FontStrong $Theme.Ink
 [void](New-CardLabel $cardRooms '최대 탐색 페이지' 470 512 110 26 $FontSmall $Theme.Muted)
 $script:numScanPages = New-Object System.Windows.Forms.NumericUpDown
 $script:numScanPages.Minimum = 1
@@ -1237,7 +1603,7 @@ $script:numScanPages.Font = $FontBase
 $script:numScanPages.BorderStyle = 'FixedSingle'
 $cardRooms.Controls.Add($script:numScanPages)
 
-[void](New-CardLabel $cardRooms '자동 인식 결과에는 최근 메시지 미리보기가 섞일 수 있습니다. 체크하기 전에 방 이름이 맞는지 확인하고, 틀리면 [이름 수정]으로 고치세요. 동명 채팅방은 구분되지 않으니 카카오톡에서 이름을 다르게 바꿔 주세요.' 20 548 702 40 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardRooms '화면의 글자를 읽어오는 방식이라 일부 이름이 정확하지 않을 수 있습니다. 체크한 뒤 [이름 확인·보정]을 누르면 각 방을 열어 실제 이름으로 자동 교정합니다. 동명 채팅방은 구분되지 않으니 카카오톡에서 이름을 다르게 바꿔 주세요.' 20 548 702 40 $FontSmall $Theme.Muted)
 
 # ===========================================================================
 # 페이지 3 — 실행 · 예약
@@ -1503,7 +1869,8 @@ $btnScanRooms.Add_Click({
         Set-StatusPill '채팅방 목록 읽는 중' 'run'
         $script:form.Enabled = $false
         Write-RunLog '카카오톡 채팅방 목록을 읽는 중입니다.'
-        $rooms = @(Get-KakaoRoomNames $script:config)
+        $scan = Get-KakaoRoomNames $script:config
+        $rooms = @($scan.Names)
         $added = 0
         foreach ($room in $rooms) {
             if (-not $script:lstRooms.Items.Contains($room)) { [void]$script:lstRooms.Items.Add($room); $added++ }
@@ -1512,14 +1879,64 @@ $btnScanRooms.Add_Click({
         $script:form.Activate()
         Sync-ConfigFromForm
         Set-StatusPill '대기 중' 'idle'
-        Write-RunLog "목록 읽기 완료: 후보 $($rooms.Count)개 중 새 항목 $($added)개 추가"
-        [System.Windows.Forms.MessageBox]::Show("후보 $($rooms.Count)개를 읽었습니다. (새로 추가 $($added)개)`r`n`r`n방 이름이 아닌 미리보기 문구가 섞였는지 확인한 뒤 발송할 방만 체크하세요.", '목록 읽기 완료') | Out-Null
+        Write-RunLog "목록 읽기 완료($($scan.Method), $($scan.Pages)면): 후보 $($rooms.Count)개 중 새 항목 $($added)개 추가"
+        [System.Windows.Forms.MessageBox]::Show("후보 $($rooms.Count)개를 읽었습니다. (새로 추가 $($added)개)`r`n읽기 방식: $($scan.Method)`r`n`r`n방 이름이 아닌 문구가 섞였는지 확인하고 발송할 방만 체크하세요.`r`n체크한 뒤 [이름 확인·보정]을 누르면 실제 채팅방 이름으로 자동 교정됩니다.", '목록 읽기 완료') | Out-Null
     } catch {
         $script:form.Enabled = $true
         $script:form.Activate()
         Set-StatusPill '읽기 실패' 'error'
         Write-RunLog "목록 읽기 실패: $($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '목록 읽기 실패') | Out-Null
+    }
+})
+$btnVerifyRoom.Add_Click({
+    try {
+        Sync-ConfigFromForm
+        if (-not (Test-Calibration $script:config)) { throw '설정 화면에서 세 위치를 먼저 보정해 주세요.' }
+        $targets = @()
+        for ($i = 0; $i -lt $script:lstRooms.Items.Count; $i++) {
+            if ($script:lstRooms.GetItemChecked($i)) { $targets += $i }
+        }
+        if ($targets.Count -eq 0) { throw '확인할 채팅방을 먼저 체크해 주세요.' }
+        if ($targets.Count -gt 50) { throw '한 번에 최대 50개까지만 확인합니다.' }
+        $body = "체크한 $($targets.Count)개 방을 하나씩 열어 실제 이름으로 교정합니다.`r`n`r`n메시지는 전송하지 않지만 채팅방이 열리므로 읽음 표시가 될 수 있습니다.`r`n진행하는 동안 마우스와 키보드를 사용하지 마세요. 계속할까요?"
+        if ([System.Windows.Forms.MessageBox]::Show($body, '이름 확인·보정', 'YesNo', 'Question') -ne 'Yes') { return }
+
+        $script:form.Enabled = $false
+        Set-StatusPill '이름 확인 중' 'run'
+        $fixed = 0
+        $failed = 0
+        foreach ($index in $targets) {
+            $current = [string]$script:lstRooms.Items[$index]
+            try {
+                $actual = Resolve-RoomName $current $script:config
+                if (-not $actual) { $failed++; Write-RunLog "이름 확인 실패: '$current' — 채팅창을 열지 못했습니다."; continue }
+                if ($actual -ne $current) {
+                    if ($script:lstRooms.Items.Contains($actual)) {
+                        Write-RunLog "이름 교정 생략: '$current' → '$actual' (이미 목록에 있음)"
+                    } else {
+                        $script:lstRooms.Items[$index] = $actual
+                        $script:lstRooms.SetItemChecked($index, $true)
+                        $fixed++
+                        Write-RunLog "이름 교정: '$current' → '$actual'"
+                    }
+                }
+            } catch {
+                $failed++
+                Write-RunLog "이름 확인 오류: '$current' — $($_.Exception.Message)"
+            }
+            Start-Sleep -Milliseconds 700
+        }
+        $script:form.Enabled = $true
+        $script:form.Activate()
+        Sync-ConfigFromForm
+        Set-StatusPill '이름 확인 완료' 'done'
+        [System.Windows.Forms.MessageBox]::Show("확인 $($targets.Count)개 · 교정 $($fixed)개 · 실패 $($failed)개`r`n`r`n실패한 방은 카카오톡에 표시되는 이름을 [이름 수정]으로 직접 맞춰 주세요.", '이름 확인·보정 완료') | Out-Null
+    } catch {
+        $script:form.Enabled = $true
+        $script:form.Activate()
+        Set-StatusPill '이름 확인 실패' 'error'
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '이름 확인·보정 실패') | Out-Null
     }
 })
 
