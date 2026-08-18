@@ -3274,19 +3274,24 @@ $lblComposeHint.BackColor = $Theme.Bg
 $pageRooms = New-Page 'rooms'
 $cardRooms = New-Card $pageRooms 28 12 784 700 '발송 대상 채팅방' '[오픈채팅] 탭을 먼저 읽고 그다음 [채팅] 탭을 읽으면 종류가 정확히 나뉩니다.'
 
-$script:txtRoomFilter = New-AppTextBox $cardRooms 24 80 216 38
-$btnScanRooms  = New-AppButton $cardRooms '카카오톡에서 읽기' 252 80 170 38 'primary'
-$btnVerifyRoom = New-AppButton $cardRooms '이름 확인·보정' 430 80 140 38
-$btnAddRoom    = New-AppButton $cardRooms '직접 추가' 578 80 90 38
-$btnEditRoom   = New-AppButton $cardRooms '이름 수정' 676 80 84 38
+$btnScanRooms  = New-AppButton $cardRooms '카카오톡에서 읽기' 24 80 170 38 'primary'
+$btnVerifyRoom = New-AppButton $cardRooms '이름 확인·보정' 202 80 140 38
+$btnAddRoom    = New-AppButton $cardRooms '직접 추가' 350 80 90 38
+$btnEditRoom   = New-AppButton $cardRooms '이름 수정' 448 80 84 38
 
-[void](New-CardLabel $cardRooms '보기' 24 134 34 26 $FontSmall $Theme.Muted)
-$btnFilterAll  = New-AppButton $cardRooms '전체' 62 130 74 32
-$btnFilterChat = New-AppButton $cardRooms '일반채팅' 142 130 88 32
-$btnFilterOpen = New-AppButton $cardRooms '오픈채팅' 236 130 88 32
-$script:lblRoomCount = New-CardLabel $cardRooms '선택 0 / 전체 0' 340 134 420 26 $FontStrong $Theme.Ink
+# 방이 많을 때를 위한 검색칸
+[void](New-CardLabel $cardRooms '검색' 24 134 38 26 $FontSmall $Theme.Muted)
+$script:txtRoomSearch = New-AppTextBox $cardRooms 62 128 236 36
+$btnSearchClear = New-AppButton $cardRooms '지우기' 306 128 74 36 'ghost'
 
-$frameRooms = New-FieldFrame $cardRooms 24 174 736 372
+[void](New-CardLabel $cardRooms '보기' 396 134 34 26 $FontSmall $Theme.Muted)
+$btnFilterAll  = New-AppButton $cardRooms '전체' 434 128 66 36
+$btnFilterChat = New-AppButton $cardRooms '일반채팅' 506 128 84 36
+$btnFilterOpen = New-AppButton $cardRooms '오픈채팅' 596 128 84 36
+$script:lblRoomCount = New-CardLabel $cardRooms '선택 0 / 전체 0' 24 172 480 24 $FontStrong $Theme.Ink
+$script:lblSearchState = New-CardLabel $cardRooms '' 24 196 736 22 $FontSmall $Theme.Info
+
+$frameRooms = New-FieldFrame $cardRooms 24 222 736 324
 $script:lstRooms = New-Object System.Windows.Forms.ListView
 $script:lstRooms.View = 'Details'
 $script:lstRooms.CheckBoxes = $true
@@ -3295,7 +3300,7 @@ $script:lstRooms.HideSelection = $false
 $script:lstRooms.BorderStyle = 'None'
 $script:lstRooms.Font = $FontBase
 $script:lstRooms.Location = New-Object System.Drawing.Point(12, 12)
-$script:lstRooms.Size = New-Object System.Drawing.Size(712, 348)
+$script:lstRooms.Size = New-Object System.Drawing.Size(712, 300)
 [void]$script:lstRooms.Columns.Add('채팅방 이름', 560)
 [void]$script:lstRooms.Columns.Add('종류', 130)
 $frameRooms.Controls.Add($script:lstRooms)
@@ -3596,9 +3601,16 @@ function Add-RoomEntry([string]$Name, [string]$Type, [bool]$Checked) {
 function Update-RoomCountLabel {
     $checked = @($script:roomEntries | Where-Object { $_.Checked }).Count
     $total = $script:roomEntries.Count
-    $normal = @($script:roomEntries | Where-Object { $_.Type -eq $script:RoomTypeNormal }).Count
-    $open = @($script:roomEntries | Where-Object { $_.Type -eq $script:RoomTypeOpen }).Count
-    $script:lblRoomCount.Text = "선택 $($checked) / 전체 $($total)   ·   일반 $($normal)  오픈 $($open)"
+    $shown = $script:lstRooms.Items.Count
+    $text = "선택 $($checked) / 전체 $($total)"
+    if ($shown -ne $total) { $text += "   ·   보이는 것 $($shown)" }
+    $script:lblRoomCount.Text = $text
+}
+
+# 검색어를 견주기 좋게 다듬습니다. 띄어쓰기와 기호는 무시합니다.
+function Test-RoomMatchesSearch([string]$Name, [string]$Key) {
+    if (-not $Key) { return $true }
+    return ((ConvertTo-CompareKey $Name).Contains($Key))
 }
 
 function Update-FilterButtons {
@@ -3617,21 +3629,36 @@ function Update-FilterButtons {
 }
 
 function Update-RoomListView {
+    $query = ''
+    if ($null -ne $script:txtRoomSearch) { $query = $script:txtRoomSearch.Text.Trim() }
+    $key = ConvertTo-CompareKey $query
+
     $script:suppressRoomEvents = $true
     $script:lstRooms.BeginUpdate()
     $script:lstRooms.Items.Clear()
+    $items = New-Object System.Collections.Generic.List[object]
     foreach ($entry in ($script:roomEntries | Sort-Object -Property Type, Name)) {
         if ($script:roomFilter -ne '전체' -and $entry.Type -ne $script:roomFilter) { continue }
+        if (-not (Test-RoomMatchesSearch $entry.Name $key)) { continue }
         $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Name)
         [void]$item.SubItems.Add([string]$entry.Type)
         $item.Checked = [bool]$entry.Checked
         if ($entry.Type -eq $script:RoomTypeUnknown) { $item.ForeColor = $Theme.Muted }
-        [void]$script:lstRooms.Items.Add($item)
+        $items.Add($item)
     }
+    if ($items.Count -gt 0) { $script:lstRooms.Items.AddRange($items.ToArray()) }
     $script:lstRooms.EndUpdate()
     $script:suppressRoomEvents = $false
     Update-FilterButtons
     Update-RoomCountLabel
+    if ($null -ne $script:lblSearchState) {
+        if ($key) {
+            $script:lblSearchState.Text = "'$query' 검색 결과 $($items.Count)개 — [보이는 항목 모두 체크]로 한 번에 고를 수 있습니다"
+            $script:lblSearchState.ForeColor = if ($items.Count -gt 0) { $Theme.Info } else { $Theme.Danger }
+        } else {
+            $script:lblSearchState.Text = ''
+        }
+    }
 }
 
 function Get-RoomEntry([string]$Name) {
@@ -3977,17 +4004,22 @@ $btnFileDown.Add_Click({
     }
 })
 
-$script:txtRoomFilter.Add_TextChanged({
-    $query = $script:txtRoomFilter.Text.Trim()
-    if (-not $query) { return }
-    foreach ($item in $script:lstRooms.Items) {
-        if (([string]$item.Text).IndexOf($query, [System.StringComparison]::CurrentCultureIgnoreCase) -ge 0) {
-            $item.Selected = $true
-            $item.EnsureVisible()
-            break
-        }
+# 글자를 칠 때마다 목록을 다시 그리면 방이 많을 때 느려집니다.
+# 잠깐 멈춘 뒤 한 번만 그리도록 합니다.
+$script:searchTimer = New-Object System.Windows.Forms.Timer
+$script:searchTimer.Interval = 220
+$script:searchTimer.Add_Tick({
+    $script:searchTimer.Stop()
+    try { Update-RoomListView } catch { }
+})
+$script:txtRoomSearch.Add_TextChanged({ $script:searchTimer.Stop(); $script:searchTimer.Start() })
+$script:txtRoomSearch.Add_KeyDown({
+    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) {
+        $script:txtRoomSearch.Clear()
+        $_.SuppressKeyPress = $true
     }
 })
+$btnSearchClear.Add_Click({ $script:txtRoomSearch.Clear(); $script:txtRoomSearch.Focus() })
 $btnGroupNew.Add_Click({
     $name = ([string][Microsoft.VisualBasic.Interaction]::InputBox('새 그룹 이름을 입력하세요. (예: 학부모, 홍보방)', '새 그룹 만들기', '')).Trim()
     if (-not $name) { return }
