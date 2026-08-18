@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '4.9.1'
+$script:AppVersion = '5.0.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -152,6 +152,31 @@ public static class NativeKakao {
             mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);
             mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
         }
+    }
+
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extraInfo);
+
+    // SendKeys 의 ^v 는 Ctrl 키 상태를 제대로 알리지 못해 카카오톡이 붙여넣기를 무시합니다.
+    // 실제 키 눌림 신호를 보내 진짜로 누른 것과 같게 만듭니다.
+    public static void PressCtrlKey(byte key) {
+        const byte VK_CONTROL = 0x11;
+        const uint KEYUP = 0x0002;
+        keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(40);
+        keybd_event(key, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(40);
+        keybd_event(key, 0, KEYUP, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(20);
+        keybd_event(VK_CONTROL, 0, KEYUP, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(40);
+    }
+
+    public static void PressPlainKey(byte key) {
+        const uint KEYUP = 0x0002;
+        keybd_event(key, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(30);
+        keybd_event(key, 0, KEYUP, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(30);
     }
 
     public static void Scroll(int x, int y, int delta) {
@@ -1788,16 +1813,12 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
             Write-RunLog "첨부 건너뜀: 파일 없음 — $path"
             continue
         }
-        try { Set-ClipboardFileSafe $path }
-        catch { Write-RunLog "첨부 건너뜀: 클립보드를 쓰지 못했습니다 — $path"; continue }
-        if (-not (Enter-ChatForeground $chat $inputBox)) {
-            Write-RunLog "첨부 건너뜀: 채팅창을 앞으로 가져오지 못했습니다 — $path"
-            continue
+        $name = [System.IO.Path]::GetFileName($path)
+        if (Send-ChatAttachment $chat $inputBox $path $waitMs) {
+            Write-RunLog "첨부 보냄: $name (카카오톡에서 실제로 갔는지 확인해 주세요)"
+        } else {
+            Write-RunLog "첨부 실패: '$name' 을(를) 붙여넣지 못했습니다. (전송하지 않음)"
         }
-        [System.Windows.Forms.SendKeys]::SendWait('^v')
-        Start-Sleep -Milliseconds $waitMs
-        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-        Start-Sleep -Milliseconds ($waitMs + 200)
     }
 
     Write-RunLog "발송 완료: '$Room'"
@@ -1837,33 +1858,33 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message) {
     }
 
     # 이미 써 두던 글(임시 저장)이 있을 때만 지웁니다.
-    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) {
-        [System.Windows.Forms.SendKeys]::SendWait('^a')
-        [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
+    if (-not [string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) {
+        [NativeKakao]::PressCtrlKey(0x41)
+        [NativeKakao]::PressPlainKey(0x2E)
         Start-Sleep -Milliseconds 120
     }
 
     $pasted = $false
     try {
         Set-ClipboardTextSafe $Message
-        [System.Windows.Forms.SendKeys]::SendWait('^v')
+        [NativeKakao]::PressCtrlKey(0x56)
         Start-Sleep -Milliseconds 320
         $pasted = $true
     } catch {
         Write-RunLog '클립보드를 쓰지 못해 직접 입력으로 넘어갑니다.'
     }
 
-    $written = [NativeKakao]::GetControlText($InputBox.Handle)
+    $written = (Get-ChatInputText $InputBox)
     if (($written -replace '\s', '') -ne ($Message -replace '\s', '')) {
         # 붙여넣기가 안 됐거나 내용이 다르면 실제 키 입력으로 다시 씁니다.
         if (-not [string]::IsNullOrWhiteSpace($written)) {
-            [System.Windows.Forms.SendKeys]::SendWait('^a')
-            [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
+            [NativeKakao]::PressCtrlKey(0x41)
+            [NativeKakao]::PressPlainKey(0x2E)
             Start-Sleep -Milliseconds 120
         }
         [System.Windows.Forms.SendKeys]::SendWait((ConvertTo-SendKeysText $Message))
         Start-Sleep -Milliseconds 400
-        $written = [NativeKakao]::GetControlText($InputBox.Handle)
+        $written = (Get-ChatInputText $InputBox)
     }
 
     # 넣은 글과 다르면 보내지 않습니다. 잘못된 내용이 나가는 것을 막습니다.
@@ -1881,6 +1902,108 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message) {
     $fallback = Invoke-ChatSend $Chat $InputBox
     if ($fallback) { return $fallback }
     return ''
+}
+
+# 사진은 '파일 목록'이 아니라 '그림 자체'를 클립보드에 넣어야 붙습니다.
+# 파일 목록만 넣으면 카카오톡이 받아들이지 않아 전송 버튼이 회색으로 남습니다.
+function Test-IsImageFile([string]$Path) {
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    return ($ext -in @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'))
+}
+
+function Set-ClipboardImageSafe([string]$Path) {
+    $source = [System.Drawing.Image]::FromFile($Path)
+    $copy = $null
+    try {
+        $copy = New-Object System.Drawing.Bitmap($source)
+    } finally { $source.Dispose() }
+    if ($null -eq $copy) { return $false }
+    try {
+        for ($attempt = 0; $attempt -lt 6; $attempt++) {
+            try {
+                # copy=$true 로 클립보드에 실제로 복사해 둡니다.
+                # 그냥 SetImage 를 쓰면 우리가 그림 객체를 버리는 순간 클립보드 내용도 사라집니다.
+                [System.Windows.Forms.Clipboard]::SetDataObject($copy, $true, 5, 150)
+                Start-Sleep -Milliseconds 120
+                return $true
+            } catch { Start-Sleep -Milliseconds 200 }
+        }
+    } finally {
+        # 클립보드로 복사가 끝난 뒤에 정리합니다.
+        Start-Sleep -Milliseconds 80
+        try { $copy.Dispose() } catch { }
+    }
+    return $false
+}
+
+# 채팅창 아래쪽(입력 영역)의 모습을 숫자로 요약합니다.
+# 붙여넣기 전후를 견주어 첨부가 실제로 붙었는지 확인합니다.
+function Get-InputAreaSignature([object]$Chat, [object]$InputBox) {
+    try {
+        $window = [NativeKakao]::GetWindow($Chat.Handle)
+        if ($null -eq $window -or $window.Width -le 0 -or $window.Height -le 0) { return '' }
+        $image = Get-WindowImage $window
+        try {
+            # 입력칸과 그 바로 위(첨부 미리보기가 나타나는 자리)만 봅니다.
+            # 대화 내용까지 넣으면 새 메시지가 와도 바뀐 것으로 오해합니다.
+            $top = [int]($image.Height * 0.80)
+            if ($null -ne $InputBox) {
+                $relative = $InputBox.Rect.Top - $window.Rect.Top - 100
+                if ($relative -gt 0 -and $relative -lt ($image.Height - 20)) { $top = $relative }
+            }
+            $ratio = [FastImage]::DarkRatio($image, 0, $top, ($image.Width - 1), ($image.Height - 1), 0.5)
+            return ('{0}x{1}:{2}' -f $image.Width, $image.Height, [Math]::Round($ratio, 4))
+        } finally { $image.Dispose() }
+    } catch { return '' }
+}
+
+# 실제 키 신호는 '지금 앞에 있는 창'으로 갑니다.
+# 카카오톡 채팅창이 앞에 있는지 확인하지 않고 보내면 엉뚱한 프로그램에
+# Ctrl+A 나 Delete 가 들어갈 수 있어 위험합니다. 반드시 확인하고 보냅니다.
+function Test-ChatIsForeground([object]$Chat) {
+    $window = [NativeKakao]::GetWindow($Chat.Handle)
+    if ($null -eq $window -or $window.Width -le 0) { return $false }
+    return ([NativeKakao]::GetForegroundWindow() -eq $Chat.Handle)
+}
+
+function Send-KeyToChat([object]$Chat, [scriptblock]$Action) {
+    if (-not (Test-ChatIsForeground $Chat)) { return $false }
+    & $Action
+    return $true
+}
+
+# 첨부 하나를 붙여넣고 보냅니다. 붙지 않으면 보내지 않고 $false 를 돌려줍니다.
+function Send-ChatAttachment([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs) {
+    # 사진이면 그림으로 먼저, 그 밖의 파일은 파일 목록으로 먼저 시도합니다.
+    $methods = if (Test-IsImageFile $Path) { @('image', 'file') } else { @('file', 'image') }
+    $before = Get-InputAreaSignature $Chat $InputBox
+
+    foreach ($method in $methods) {
+        $ready = $false
+        try {
+            if ($method -eq 'image') { $ready = Set-ClipboardImageSafe $Path }
+            else { Set-ClipboardFileSafe $Path; $ready = $true }
+        } catch { $ready = $false }
+        if (-not $ready) { continue }
+
+        if (-not (Enter-ChatForeground $Chat $InputBox)) { return $false }
+        [NativeKakao]::PressCtrlKey(0x56)
+        Start-Sleep -Milliseconds $WaitMs
+
+        # 입력 영역 모습이 바뀌었으면 붙은 것입니다.
+        $after = Get-InputAreaSignature $Chat $InputBox
+        if ($after -and $before -and $after -ne $before) {
+            [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+            Start-Sleep -Milliseconds ($WaitMs + 300)
+            return $true
+        }
+
+        # 안 붙었으면 다음 방법으로 넘어가기 전에 입력칸을 정리합니다.
+        [NativeKakao]::PressCtrlKey(0x41)
+        [NativeKakao]::PressPlainKey(0x2E)
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
 }
 
 # SendKeys 는 + ^ % ~ ( ) { } [ ] 를 특수 기호로 해석하므로 감싸 줍니다.
@@ -1901,7 +2024,7 @@ function Clear-ChatInput([object]$InputBox) {
     [NativeKakao]::SelectAllIn($InputBox.Handle)
     [NativeKakao]::ClearSelection($InputBox.Handle)
     Start-Sleep -Milliseconds 80
-    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) {
+    if (-not [string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) {
         [NativeKakao]::SetControlText($InputBox.Handle, '')
     }
 }
@@ -1920,7 +2043,7 @@ function Set-ChatInputText([object]$InputBox, [string]$Text) {
         [NativeKakao]::SelectAllIn($InputBox.Handle)
         [NativeKakao]::PasteInto($InputBox.Handle)
         Start-Sleep -Milliseconds 220
-        if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) { return $true }
+        if (-not [string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) { return $true }
     }
 
     # 2순위: 글자를 하나씩 보냅니다. 붙여넣기와 마찬가지로 변경 알림이 발생합니다.
@@ -1928,18 +2051,29 @@ function Set-ChatInputText([object]$InputBox, [string]$Text) {
     [NativeKakao]::ClearSelection($InputBox.Handle)
     [NativeKakao]::TypeText($InputBox.Handle, $Text)
     Start-Sleep -Milliseconds 250
-    if (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) { return $true }
+    if (-not [string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) { return $true }
 
     # 3순위: 마지막 수단
     [NativeKakao]::SetControlText($InputBox.Handle, $Text)
     Start-Sleep -Milliseconds 150
-    return (-not [string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle)))
+    return (-not [string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox)))
+}
+
+# 입력칸이 비면 카카오톡이 '메시지 입력' 같은 안내글을 대신 보여 줍니다.
+# 이걸 내용으로 오해하면 전송 성공을 영영 확인하지 못합니다.
+$script:InputPlaceholders = @('메시지 입력', '메시지를 입력하세요', 'Enter message', '메세지 입력')
+
+function Get-ChatInputText([object]$InputBox) {
+    $text = [string][NativeKakao]::GetControlText($InputBox.Handle)
+    $trimmed = $text.Trim()
+    if ($trimmed -in $script:InputPlaceholders) { return '' }
+    return $text
 }
 
 function Wait-ChatInputCleared([object]$InputBox, [int]$TimeoutMs) {
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
-        if ([string]::IsNullOrWhiteSpace([NativeKakao]::GetControlText($InputBox.Handle))) { return $true }
+        if ([string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) { return $true }
         Start-Sleep -Milliseconds 70
     }
     return $false
@@ -2500,6 +2634,15 @@ if ($SelfTest) {
     if ($null -eq (Find-SearchResultLine $ampSample '마케팅 초이스&핫소스' 325)) { throw '앰퍼샌드 이름 매칭 실패' }
     $wrongSample = @([pscustomobject]@{ Text = '전혀 다른 방'; Left = 80; Top = 20 })
     if ($null -ne (Find-SearchResultLine $wrongSample '☆자유로운 홍보방☆' 325)) { throw '다른 방을 잘못 매칭' }
+
+    # 입력칸이 비면 카카오톡이 안내글을 보여 줍니다. 이걸 내용으로 오해하면 안 됩니다.
+    if ($script:InputPlaceholders -notcontains '메시지 입력') { throw '입력칸 안내글 목록 누락' }
+    foreach ($ext in @('.png', '.JPG', '.jpeg', '.gif', '.bmp')) {
+        if (-not (Test-IsImageFile "사진$ext")) { throw "사진 확장자 인식 실패: $ext" }
+    }
+    foreach ($ext in @('.pdf', '.zip', '.hwp', '.txt')) {
+        if (Test-IsImageFile "문서$ext") { throw "사진이 아닌 파일을 사진으로 봤습니다: $ext" }
+    }
 
     if ($script:TourSteps.Count -lt 3) { throw '가이드 투어 단계가 비어 있습니다' }
     foreach ($step in $script:TourSteps) {
