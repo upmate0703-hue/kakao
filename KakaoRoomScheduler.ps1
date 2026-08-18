@@ -423,6 +423,8 @@ $script:activeKakaoWindow = $null
 
 $script:RoomTypeNormal = '일반채팅'
 $script:RoomTypeOpen = '오픈채팅'
+$script:RoomTypePersonal = '개인채팅'
+$script:RoomTypeGroup = '그룹채팅'
 $script:RoomTypeUnknown = '미분류'
 
 function New-DefaultConfig {
@@ -1369,11 +1371,22 @@ $script:RoomNoiseLabels = @(
     '채팅방 이름', '전체 채팅방', '광고 문의', '오픈채팅 검색', '새 채팅'
 )
 
+# 채팅 목록의 아이콘·표시가 글자로 잘못 읽혀 이름 앞에 '0 ' 같은 잡티가 붙습니다.
+# 실제 이름이 숫자로 시작하는 경우(05K-니자인 등)는 건드리지 않습니다.
+function Remove-RoomNameNoise([string]$RawName) {
+    $name = ([string]$RawName).Trim()
+    if (-not $name) { return '' }
+    # '0 홍보방' → '홍보방'   /  '0홍보방' → '홍보방'
+    $name = $name -replace '^0\s+', ''
+    $name = $name -replace '^0(?=[가-힣A-Za-z])', ''
+    return $name.Trim()
+}
+
 function ConvertTo-RoomCandidate([string]$RawName) {
     if ([string]::IsNullOrWhiteSpace($RawName)) { return $null }
     $parts = @($RawName -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if ($parts.Count -eq 0) { return $null }
-    $name = $parts[0].Trim()
+    $name = Remove-RoomNameNoise $parts[0]
     if ($name.Length -lt 2 -or $name.Length -gt 60) { return $null }
     if ($name -notmatch '[0-9A-Za-z가-힣]') { return $null }
     if ($name -match '^\d{1,2}:\d{2}$') { return $null }
@@ -2644,6 +2657,13 @@ if ($SelfTest) {
         if (Test-IsImageFile "문서$ext") { throw "사진이 아닌 파일을 사진으로 봤습니다: $ext" }
     }
 
+    # 목록에서 읽을 때 이름 앞에 붙는 '0 ' 잡티를 떼어냅니다.
+    if ((Remove-RoomNameNoise '0 우리반 공지방') -ne '우리반 공지방') { throw '이름 앞 잡티 제거 실패' }
+    if ((Remove-RoomNameNoise '0홍보방') -ne '홍보방') { throw '붙어 있는 잡티 제거 실패' }
+    if ((Remove-RoomNameNoise '05K-니자인') -ne '05K-니자인') { throw '진짜 숫자 이름을 잘못 건드렸습니다' }
+    if ((Remove-RoomNameNoise '95 비와이') -ne '95 비와이') { throw '숫자로 시작하는 이름을 잘못 건드렸습니다' }
+    if ((ConvertTo-RoomCandidate '0 동네 모임') -ne '동네 모임') { throw '후보 추출에서 잡티가 남았습니다' }
+
     if ($script:TourSteps.Count -lt 3) { throw '가이드 투어 단계가 비어 있습니다' }
     foreach ($step in $script:TourSteps) {
         foreach ($key in @('Page', 'Title', 'Body')) {
@@ -3285,9 +3305,10 @@ $script:txtRoomSearch = New-AppTextBox $cardRooms 62 128 236 36
 $btnSearchClear = New-AppButton $cardRooms '지우기' 306 128 74 36 'ghost'
 
 [void](New-CardLabel $cardRooms '보기' 396 134 34 26 $FontSmall $Theme.Muted)
-$btnFilterAll  = New-AppButton $cardRooms '전체' 434 128 66 36
-$btnFilterChat = New-AppButton $cardRooms '일반채팅' 506 128 84 36
-$btnFilterOpen = New-AppButton $cardRooms '오픈채팅' 596 128 84 36
+$btnFilterAll    = New-AppButton $cardRooms '전체' 428 128 58 36
+$btnFilterPerson = New-AppButton $cardRooms '개인' 492 128 58 36
+$btnFilterChat   = New-AppButton $cardRooms '그룹' 556 128 58 36
+$btnFilterOpen   = New-AppButton $cardRooms '오픈채팅' 620 128 84 36
 $script:lblRoomCount = New-CardLabel $cardRooms '선택 0 / 전체 0' 24 172 480 24 $FontStrong $Theme.Ink
 $script:lblSearchState = New-CardLabel $cardRooms '' 24 196 736 22 $FontSmall $Theme.Info
 
@@ -3614,7 +3635,7 @@ function Test-RoomMatchesSearch([string]$Name, [string]$Key) {
 }
 
 function Update-FilterButtons {
-    foreach ($pair in @(@($btnFilterAll, '전체'), @($btnFilterChat, $script:RoomTypeNormal), @($btnFilterOpen, $script:RoomTypeOpen))) {
+    foreach ($pair in @(@($btnFilterAll, '전체'), @($btnFilterPerson, $script:RoomTypePersonal), @($btnFilterChat, $script:RoomTypeGroup), @($btnFilterOpen, $script:RoomTypeOpen))) {
         $button = $pair[0]
         if ($script:roomFilter -eq $pair[1]) {
             $button.BackColor = $Theme.Ink
@@ -4066,7 +4087,8 @@ $btnGroupDelete.Add_Click({
 })
 
 $btnFilterAll.Add_Click({ $script:roomFilter = '전체'; Update-RoomListView })
-$btnFilterChat.Add_Click({ $script:roomFilter = $script:RoomTypeNormal; Update-RoomListView })
+$btnFilterPerson.Add_Click({ $script:roomFilter = $script:RoomTypePersonal; Update-RoomListView })
+$btnFilterChat.Add_Click({ $script:roomFilter = $script:RoomTypeGroup; Update-RoomListView })
 $btnFilterOpen.Add_Click({ $script:roomFilter = $script:RoomTypeOpen; Update-RoomListView })
 
 $btnCheckAll.Add_Click({
@@ -4207,9 +4229,16 @@ $btnVerifyRoom.Add_Click({
             $current = [string]$entry.Name
             $type = if ($entry.Type -eq $script:RoomTypeUnknown) { $script:RoomTypeNormal } else { $entry.Type }
             try {
-                $actual = Resolve-RoomName $current $type
-                if (-not $actual) { $failed++; Write-RunLog "이름 확인 실패: '$current' — 채팅창을 열지 못했습니다."; continue }
-                if ($actual -ne $current) {
+                $result = Resolve-RoomName $current $type
+                if ($null -eq $result) { $failed++; Write-RunLog "이름 확인 실패: '$current' — 채팅창을 열지 못했습니다."; continue }
+                $actual = [string]$result.Name
+                # 개인/그룹 구분을 함께 기록합니다.
+                if ($entry.Type -ne $result.Type) {
+                    $entry.Type = $result.Type
+                    $detail = if ($result.Members -gt 0) { " (인원 $($result.Members)명)" } else { '' }
+                    Write-RunLog "종류 확인: '$actual' → $($result.Type)$detail"
+                }
+                if ($actual -and $actual -ne $current) {
                     if ($null -ne (Get-RoomEntry $actual)) {
                         Write-RunLog "이름 교정 생략: '$current' → '$actual' (이미 목록에 있음)"
                     } else {
