@@ -4696,6 +4696,8 @@ $cardStatus = New-Card $pageSettings 28 12 784 240 '카카오톡 연결 상태' 
 $script:lblKakaoState = New-CardLabel $cardStatus '확인 중입니다...' 24 78 736 104 $FontBase $Theme.Sub
 $btnCheckKakao = New-AppButton $cardStatus '지금 확인' 24 190 150 40 'strong'
 $btnOpenKakao = New-AppButton $cardStatus '카카오톡 창 앞으로 가져오기' 184 190 220 40
+# 프로그램이 돌아가는 데 필요한 것들을 확인하고, 없으면 설치까지 해 줍니다.
+$btnPrereq = New-AppButton $cardStatus '필수 요소 확인' 414 190 150 40
 
 $cardUpdate = New-Card $pageSettings 28 264 784 236 '업데이트' '최신 배포를 확인합니다.'
 $script:lblUpdateState = New-CardLabel $cardUpdate "현재 버전 v$($script:AppVersion)" 24 76 736 46 $FontBase $Theme.Ink
@@ -6255,6 +6257,21 @@ $script:pnlUpdate.Add_Click({
 # ----- 폴더 및 초기화 -----
 $btnGuide.Add_Click({ Show-GuideTour })
 $btnOpenApp.Add_Click({ Start-Process 'explorer.exe' $AppDir })
+$btnPrereq.Add_Click({
+    # 필수 요소 확인은 따로 떨어진 스크립트로 돌립니다.
+    # 한국어 문자 인식을 설치하려면 관리자 권한이 필요한데,
+    # 이 프로그램 전체를 관리자로 띄울 이유는 없기 때문입니다.
+    try {
+        $script = Join-Path $AppDir '필수요소.ps1'
+        if (-not (Test-Path -LiteralPath $script)) {
+            [System.Windows.Forms.MessageBox]::Show('필수요소.ps1 을 찾지 못했습니다. 프로그램을 다시 받아 주세요.', '필수 요소 확인') | Out-Null
+            return
+        }
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script) -WorkingDirectory $AppDir
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '필수 요소 확인') | Out-Null
+    }
+})
 $btnOpenLogs.Add_Click({ Start-Process 'explorer.exe' $LogDir })
 $btnOpenLogDir.Add_Click({ Start-Process 'explorer.exe' $LogDir })
 $btnClearLog.Add_Click({ $script:txtLog.Clear() })
