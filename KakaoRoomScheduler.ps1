@@ -76,6 +76,14 @@ public static class NativeKakao {
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int virtualKey);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
 
+    [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr dialog, int itemId);
+
+    // 파일 선택창은 윈도우가 만드는 기본 창이라 창 메시지가 그대로 통합니다.
+    // 카카오톡이 직접 그린 아이콘과 달라서 여기서는 확실하게 동작합니다.
+    public static void ClickButton(IntPtr hWnd) {
+        PostMessageW(hWnd, 0x00F5, IntPtr.Zero, IntPtr.Zero);
+    }
+
     static WindowInfo Describe(IntPtr hWnd, uint pid) {
         var title = new StringBuilder(512);
         var cls = new StringBuilder(256);
@@ -362,6 +370,64 @@ public static class FastImage {
             }
         }
         return true;
+    }
+
+    // 세로줄마다 색이 있는 픽셀 수를 셉니다.
+    // 채팅창 아래 아이콘 줄에서 아이콘이 어디 있는지 찾는 데 씁니다.
+    // 자리를 미리 정해 두면 카카오톡 판이나 해상도가 바뀔 때 틀리므로 화면을 보고 찾습니다.
+    public static int[] ColumnInk(Bitmap bitmap, int left, int top, int right, int bottom, double threshold) {
+        if (left < 0) left = 0;
+        if (top < 0) top = 0;
+        if (right >= bitmap.Width) right = bitmap.Width - 1;
+        if (bottom >= bitmap.Height) bottom = bitmap.Height - 1;
+        if (right <= left || bottom <= top) { return new int[0]; }
+        var rect = new Rectangle(left, top, right - left + 1, bottom - top + 1);
+        int stride;
+        int[] pixels = ReadRows(bitmap, rect, out stride);
+        int[] counts = new int[rect.Width];
+        for (int y = 0; y < rect.Height; y++) {
+            int rowStart = y * stride;
+            for (int x = 0; x < rect.Width; x++) {
+                int color = pixels[rowStart + x];
+                int r = (color >> 16) & 0xFF;
+                int g = (color >> 8) & 0xFF;
+                int b = color & 0xFF;
+                int max = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                int min = r < g ? (r < b ? r : b) : (g < b ? g : b);
+                double brightness = (max + min) / 510.0;
+                if (brightness < threshold) { counts[x]++; }
+            }
+        }
+        return counts;
+    }
+
+    // 카카오톡 노란색 비율입니다.
+    // 전송 버튼은 보낼 것이 있을 때만 노랗게 켜집니다.
+    // 첨부가 실제로 붙었는지 알아내는 가장 확실한 신호라서 이 색을 봅니다.
+    // 밝은 화면이든 어두운 화면이든 이 노란색은 그대로입니다.
+    public static double YellowRatio(Bitmap bitmap, int left, int top, int right, int bottom) {
+        if (left < 0) left = 0;
+        if (top < 0) top = 0;
+        if (right >= bitmap.Width) right = bitmap.Width - 1;
+        if (bottom >= bitmap.Height) bottom = bitmap.Height - 1;
+        if (right <= left || bottom <= top) { return 0.0; }
+        var rect = new Rectangle(left, top, right - left + 1, bottom - top + 1);
+        int stride;
+        int[] pixels = ReadRows(bitmap, rect, out stride);
+        long yellow = 0, total = 0;
+        for (int y = 0; y < rect.Height; y++) {
+            int rowStart = y * stride;
+            for (int x = 0; x < rect.Width; x++) {
+                int color = pixels[rowStart + x];
+                int r = (color >> 16) & 0xFF;
+                int g = (color >> 8) & 0xFF;
+                int b = color & 0xFF;
+                total++;
+                if (r > 200 && g > 170 && b < 140 && (r - b) > 80 && (g - b) > 60) { yellow++; }
+            }
+        }
+        if (total == 0) { return 0.0; }
+        return (double)yellow / (double)total;
     }
 
     // 지정한 영역에서 어두운 픽셀 비율을 돌려줍니다. 탭 선택 여부 판별에 씁니다.
@@ -1818,6 +1884,42 @@ function Resolve-RoomName([string]$Query, [string]$RoomType) {
     return ($title -replace '\s*\(\d+\)$', '')
 }
 
+# 첨부가 실제로 붙는지만 확인합니다.
+# 붙여 본 뒤 바로 치우고 보내지 않습니다.
+# 카카오톡 판이나 화면 배율이 사람마다 달라서, 실제로 보내기 전에
+# 이 확인을 한 번 해 보면 첨부가 될 환경인지 미리 알 수 있습니다.
+function Invoke-AttachmentCheck([string]$Room, [string]$Path) {
+    $report = @()
+    $ready = Test-KakaoReady $true $false
+    if (-not $ready.Ok) { return [pscustomobject]@{ Ok = $false; Text = [string]$ready.Reason } }
+    $chat = Get-SingleChatWindow (Open-RoomBySearch $Room (Get-RoomType $Room))
+    if ($null -eq $chat) {
+        return [pscustomobject]@{ Ok = $false; Text = "'$Room' 채팅창을 열지 못했습니다." }
+    }
+    try {
+        $state = Wait-ChatWindowReady $chat $Room ([Math]::Max(3000, [int]$script:config.OpenTimeoutMs))
+        if ($null -eq $state) {
+            return [pscustomobject]@{ Ok = $false; Text = "'$Room' 방이 다 열리지 않았습니다. 설정에서 [방 열림 대기]를 늘려 보세요." }
+        }
+        $icons = @(Find-ChatToolbarIcons $state.Window $state.InputBox)
+        $report += "채팅창 아래 아이콘 $($icons.Count)개를 찾았습니다."
+        if ($icons.Count -lt 3) {
+            $report += '아이콘을 3개 찾지 못했습니다. 채팅창을 조금 크게 키우면 나아집니다.'
+        }
+        $waitMs = [Math]::Max(500, [int]$script:config.AttachmentWaitMs)
+        $outcome = Send-ChatAttachment $state.Window $state.InputBox $Path $waitMs $false
+        if ($outcome.Ok) {
+            $report += "붙이기 성공 — $($outcome.Method)"
+            $report += '붙였던 첨부는 다시 치웠습니다. 보내지 않았습니다.'
+        } else {
+            $report += "붙이기 실패 — $($outcome.Reason)"
+        }
+        return [pscustomobject]@{ Ok = [bool]$outcome.Ok; Text = ($report -join "`r`n") }
+    } finally {
+        Close-ChatWindow $chat
+    }
+}
+
 function Invoke-OneRoom([string]$Room, [string]$RoomType, [object]$Content) {
     $chat = Get-SingleChatWindow (Open-RoomBySearch $Room $RoomType)
     if ($null -eq $chat) {
@@ -1872,10 +1974,14 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
             continue
         }
         $name = [System.IO.Path]::GetFileName($path)
-        if (Send-ChatAttachment $chat $inputBox $path $waitMs) {
-            Write-RunLog "첨부 보냄: $name (카카오톡에서 실제로 갔는지 확인해 주세요)"
+        $outcome = $null
+        try { $outcome = Send-ChatAttachment $chat $inputBox $path $waitMs $true } catch { $outcome = $null }
+        if ($null -eq $outcome) {
+            Write-RunLog "첨부 실패: '$name' — 알 수 없는 문제가 생겨 보내지 않았습니다."
+        } elseif ($outcome.Sent) {
+            Write-RunLog "첨부 보냄: $name  [$($outcome.Method) / $($outcome.SendWay)]"
         } else {
-            Write-RunLog "첨부 실패: '$name' 을(를) 붙여넣지 못했습니다. (전송하지 않음)"
+            Write-RunLog "첨부 실패: '$name' — $($outcome.Reason) (보내지 않았습니다)"
         }
     }
 
@@ -2030,38 +2136,379 @@ function Send-KeyToChat([object]$Chat, [scriptblock]$Action) {
     return $true
 }
 
-# 첨부 하나를 붙여넣고 보냅니다. 붙지 않으면 보내지 않고 $false 를 돌려줍니다.
-function Send-ChatAttachment([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs) {
-    # 사진이면 그림으로 먼저, 그 밖의 파일은 파일 목록으로 먼저 시도합니다.
-    $methods = if (Test-IsImageFile $Path) { @('image', 'file') } else { @('file', 'image') }
-    $before = Get-InputAreaSignature $Chat $InputBox
+# 첨부가 오래 안 되던 진짜 이유를 찾았습니다.
+# 카카오톡은 사진을 붙여넣으면 채팅창에 바로 붙이지 않고
+# [클립보드 이미지 전송] 이라는 미리보기 창을 따로 띄웁니다.
+# 그 창에서 [전송] 을 눌러야 실제로 갑니다.
+# 예전 코드는 이 창을 몰랐습니다. 채팅창만 보고 "안 붙었다" 고 판단해
+# 전송을 누르지 않았고, 그래서 사진이 한 장도 가지 않았습니다.
 
+# 미리보기 창은 제목이 없는 별도 창입니다.
+# 누르기 전에 있던 창은 빼고 세어서, 원래 열려 있던 창을 잘못 잡지 않습니다.
+function Wait-KakaoPreviewWindow([hashtable]$Before, [int]$TimeoutMs) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        foreach ($process in (Get-KakaoProcesses)) {
+            foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
+                if (-not $window.Visible) { continue }
+                if ($Before.ContainsKey([string]$window.Handle)) { continue }
+                if (-not [string]::IsNullOrWhiteSpace($window.Title)) { continue }
+                if ($window.Width -lt 220 -or $window.Height -lt 220) { continue }
+                if ($window.Width -gt 1200 -or $window.Height -gt 1200) { continue }
+                return $window
+            }
+        }
+        Start-Sleep -Milliseconds 120
+    }
+    return $null
+}
+
+# 미리보기 창을 보내지 않고 닫습니다. 확인만 할 때와 실패했을 때 씁니다.
+# 열린 채로 두면 다음 방에서 엉뚱하게 딸려 갈 수 있어 반드시 닫습니다.
+function Close-KakaoPreview([object]$Preview) {
+    if ($null -eq $Preview) { return $true }
+    for ($i = 0; $i -lt 3; $i++) {
+        [NativeKakao]::CloseWindow($Preview.Handle)
+        Start-Sleep -Milliseconds 400
+        $still = [NativeKakao]::GetWindow($Preview.Handle)
+        if ($null -eq $still -or -not $still.Visible) { return $true }
+    }
+    return $false
+}
+
+# 미리보기 창의 [전송] 을 누릅니다. 창 아래 가운데에 넓게 있는 단추입니다.
+# 이 창도 카카오톡이 직접 그려서 창 메시지를 받지 않으므로 실제 마우스로 누릅니다.
+function Submit-KakaoPreview([object]$Preview, [int]$TimeoutMs) {
+    $window = [NativeKakao]::GetWindow($Preview.Handle)
+    if ($null -eq $window -or $window.Width -le 0) { return '미리보기 창이 사라짐' }
+    if (-not [NativeKakao]::ForceForeground($window.Handle)) { return '미리보기 창을 앞으로 가져오지 못함' }
+    Start-Sleep -Milliseconds 250
+    if ([NativeKakao]::GetForegroundWindow() -ne $window.Handle) { return '미리보기 창이 앞에 오지 않음' }
+    $x = $window.Rect.Left + [int]($window.Width / 2)
+    $y = $window.Rect.Bottom - 24
+    Invoke-PointClick $x $y $false
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $still = [NativeKakao]::GetWindow($Preview.Handle)
+        if ($null -eq $still -or -not $still.Visible) { return '' }
+        Start-Sleep -Milliseconds 120
+    }
+    return '전송을 눌렀지만 미리보기 창이 닫히지 않음'
+}
+
+# 입력칸 아래 아이콘 줄의 위치입니다. (창 안에서의 좌표)
+function Get-ChatToolbarBand([object]$Chat, [object]$InputBox) {
+    if ($null -eq $Chat -or $null -eq $InputBox) { return $null }
+    $top = $InputBox.Rect.Bottom - $Chat.Rect.Top
+    $bottom = $Chat.Height - 1
+    if (($bottom - $top) -lt 16) { return $null }
+    return [pscustomobject]@{ Top = ($top + 3); Bottom = ($bottom - 5) }
+}
+
+# 아이콘 줄에서 아이콘들의 가로 위치를 찾습니다.
+# 좌표를 코드에 박아 두면 카카오톡 판이나 화면 배율이 바뀔 때 엉뚱한 곳을 누르므로
+# 그때그때 화면을 보고 찾습니다.
+function Find-ChatToolbarIcons([object]$Chat, [object]$InputBox) {
+    $band = Get-ChatToolbarBand $Chat $InputBox
+    if ($null -eq $band) { return @() }
+    $window = [NativeKakao]::GetWindow($Chat.Handle)
+    if ($null -eq $window -or $window.Width -le 0 -or $window.Height -le 0) { return @() }
+    $image = $null
+    try { $image = Get-WindowImage $window } catch { return @() }
+    try {
+        $rightEdge = [int]($window.Width * 0.5)
+        $counts = [FastImage]::ColumnInk($image, 6, $band.Top, $rightEdge, $band.Bottom, 0.86)
+        if ($null -eq $counts -or $counts.Count -eq 0) { return @() }
+        $groups = @()
+        $start = -1
+        $gap = 0
+        for ($x = 0; $x -lt $counts.Count; $x++) {
+            if ($counts[$x] -ge 2) {
+                if ($start -lt 0) { $start = $x }
+                $gap = 0
+            } elseif ($start -ge 0) {
+                $gap++
+                if ($gap -ge 5) {
+                    $groups += ,@($start, ($x - $gap))
+                    $start = -1
+                    $gap = 0
+                }
+            }
+        }
+        if ($start -ge 0) { $groups += ,@($start, ($counts.Count - 1)) }
+        $centerY = $window.Rect.Top + [int](($band.Top + $band.Bottom) / 2)
+        $icons = @()
+        foreach ($group in $groups) {
+            $width = $group[1] - $group[0] + 1
+            if ($width -lt 7 -or $width -gt 44) { continue }
+            $icons += [pscustomobject]@{
+                X = ($window.Rect.Left + 6 + [int](($group[0] + $group[1]) / 2))
+                Y = $centerY
+                Width = $width
+            }
+        }
+        return @($icons)
+    } catch { return @() }
+    finally { if ($null -ne $image) { try { $image.Dispose() } catch { } } }
+}
+
+# 전송 버튼이 켜졌는지 봅니다. 보낼 것이 있으면 노랗게 켜집니다.
+# 파일이 채팅창에 바로 붙는 경우에 이걸로 확인합니다.
+# 'yes' 켜짐, 'no' 꺼짐, 'unknown' 판단 못 함
+function Test-ChatSendReady([object]$Chat, [object]$InputBox) {
+    $band = Get-ChatToolbarBand $Chat $InputBox
+    if ($null -eq $band) { return 'unknown' }
+    $window = [NativeKakao]::GetWindow($Chat.Handle)
+    if ($null -eq $window -or $window.Width -le 0 -or $window.Height -le 0) { return 'unknown' }
+    $image = $null
+    try { $image = Get-WindowImage $window } catch { return 'unknown' }
+    try {
+        $left = $window.Width - 100
+        $right = $window.Width - 12
+        if ($left -lt 0 -or $right -le $left) { return 'unknown' }
+        $ratio = [FastImage]::YellowRatio($image, $left, $band.Top, $right, $band.Bottom)
+        if ($ratio -ge 0.15) { return 'yes' }
+        return 'no'
+    } catch { return 'unknown' }
+    finally { if ($null -ne $image) { try { $image.Dispose() } catch { } } }
+}
+
+# 채팅창에 바로 붙은 첨부를 취소합니다.
+# 카카오톡은 Escape 로 채팅창 자체가 닫히므로, 붙은 것이 있을 때만 누릅니다.
+function Clear-ChatAttachmentDraft([object]$Chat, [object]$InputBox) {
+    for ($i = 0; $i -lt 3; $i++) {
+        if ((Test-ChatSendReady $Chat $InputBox) -ne 'yes') { return $true }
+        if (Enter-ChatForeground $Chat $InputBox) {
+            [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+        } else {
+            [NativeKakao]::PressKey($InputBox.Handle, 0x1B)
+        }
+        Start-Sleep -Milliseconds 350
+    }
+    return ((Test-ChatSendReady $Chat $InputBox) -ne 'yes')
+}
+
+# 아이콘을 눌렀는데 아무 창도 안 뜨면 메뉴가 열렸을 수 있습니다.
+# 이때 Escape 를 쓰면 안 됩니다. 카카오톡은 Escape 로 채팅창이 닫힙니다.
+# 입력칸을 눌러 메뉴만 닫습니다.
+function Hide-ChatPopup([object]$Chat, [object]$InputBox) {
+    try {
+        [NativeKakao]::ClickControl($InputBox.Handle,
+            ($InputBox.Rect.Left + [int]($InputBox.Width / 2)),
+            ($InputBox.Rect.Top + [int]($InputBox.Height / 2)), $false)
+    } catch { }
+    Start-Sleep -Milliseconds 200
+}
+
+# 새로 뜬 파일 선택창을 기다립니다.
+function Wait-FileDialog([hashtable]$Before, [int]$TimeoutMs) {
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        foreach ($process in (Get-KakaoProcesses)) {
+            foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
+                if (-not $window.Visible) { continue }
+                if ($window.ClassName -ne '#32770') { continue }
+                if ($Before.ContainsKey([string]$window.Handle)) { continue }
+                if ($window.Width -lt 200 -or $window.Height -lt 150) { continue }
+                return $window
+            }
+        }
+        Start-Sleep -Milliseconds 120
+    }
+    return $null
+}
+
+# 파일 선택창에 경로를 적어 넣고 [열기] 를 누릅니다.
+# 이 창은 윈도우 기본 창이라 창 메시지가 그대로 통합니다.
+function Submit-FileDialog([object]$Dialog, [string]$Path, [int]$TimeoutMs) {
+    $edit = $null
+    foreach ($child in [NativeKakao]::GetChildWindows($Dialog.Handle)) {
+        if ($child.ClassName -eq 'Edit' -and $child.Visible -and $child.Width -gt 40) { $edit = $child; break }
+    }
+    if ($null -eq $edit) { return '파일 이름 칸을 찾지 못함' }
+    [NativeKakao]::SetControlText($edit.Handle, $Path)
+    Start-Sleep -Milliseconds 150
+    if ([NativeKakao]::GetControlText($edit.Handle) -ne $Path) { return '파일 이름 칸에 경로가 들어가지 않음' }
+    $okButton = [NativeKakao]::GetDlgItem($Dialog.Handle, 1)
+    if ($okButton -ne [IntPtr]::Zero) { [NativeKakao]::ClickButton($okButton) }
+    else { [NativeKakao]::PressKey($edit.Handle, 0x0D) }
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $still = [NativeKakao]::GetWindow($Dialog.Handle)
+        if ($null -eq $still -or -not $still.Visible) { return '' }
+        Start-Sleep -Milliseconds 100
+    }
+    return '파일 선택창이 닫히지 않음'
+}
+
+# 열어 둔 파일 선택창을 반드시 닫습니다. 열린 채로 두면 다음 방부터 전부 막힙니다.
+function Close-FileDialog([object]$Dialog) {
+    if ($null -eq $Dialog) { return }
+    try {
+        $cancel = [NativeKakao]::GetDlgItem($Dialog.Handle, 2)
+        if ($cancel -ne [IntPtr]::Zero) { [NativeKakao]::ClickButton($cancel) }
+        else { [NativeKakao]::CloseWindow($Dialog.Handle) }
+    } catch { }
+    Start-Sleep -Milliseconds 300
+    try {
+        $still = [NativeKakao]::GetWindow($Dialog.Handle)
+        if ($null -ne $still -and $still.Visible) { [NativeKakao]::CloseWindow($Dialog.Handle) }
+    } catch { }
+}
+
+# 붙이기 결과입니다.
+#   Problem : 비어 있으면 붙이기 단계까지는 성공
+#   Preview : 미리보기 창이 떴으면 그 창. 여기서 [전송] 을 눌러야 갑니다.
+function New-AttachStage([string]$Problem, [object]$Preview) {
+    return [pscustomobject]@{ Problem = $Problem; Preview = $Preview }
+}
+
+# 1순위: 클립보드로 붙여넣습니다. 사진은 이 길이 가장 확실합니다.
+function Add-AttachmentByClipboard([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs) {
+    $methods = if (Test-IsImageFile $Path) { @('image', 'file') } else { @('file', 'image') }
+    $lastReason = '클립보드로 붙지 않음'
     foreach ($method in $methods) {
         $ready = $false
         try {
             if ($method -eq 'image') { $ready = Set-ClipboardImageSafe $Path }
             else { Set-ClipboardFileSafe $Path; $ready = $true }
         } catch { $ready = $false }
-        if (-not $ready) { continue }
-
-        if (-not (Enter-ChatForeground $Chat $InputBox)) { return $false }
+        if (-not $ready) { $lastReason = '클립보드에 넣지 못함'; continue }
+        $before = Get-VisibleWindowHandles
+        if (-not (Enter-ChatForeground $Chat $InputBox)) { return (New-AttachStage '채팅창을 앞으로 가져오지 못함' $null) }
         [NativeKakao]::PressCtrlKey(0x56)
-        Start-Sleep -Milliseconds $WaitMs
-
-        # 입력 영역 모습이 바뀌었으면 붙은 것입니다.
-        $after = Get-InputAreaSignature $Chat $InputBox
-        if ($after -and $before -and $after -ne $before) {
-            [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-            Start-Sleep -Milliseconds ($WaitMs + 300)
-            return $true
-        }
-
-        # 안 붙었으면 다음 방법으로 넘어가기 전에 입력칸을 정리합니다.
-        [NativeKakao]::PressCtrlKey(0x41)
-        [NativeKakao]::PressPlainKey(0x2E)
-        Start-Sleep -Milliseconds 250
+        # 사진은 미리보기 창이 뜹니다. 파일은 채팅창에 바로 붙기도 합니다.
+        $preview = Wait-KakaoPreviewWindow $before ([Math]::Max(2500, $WaitMs + 1200))
+        if ($null -ne $preview) { return (New-AttachStage '' $preview) }
+        if ((Test-ChatSendReady $Chat $InputBox) -eq 'yes') { return (New-AttachStage '' $null) }
     }
-    return $false
+    return (New-AttachStage $lastReason $null)
+}
+
+# 2순위: 채팅창 아래 [파일] 아이콘으로 파일 선택창을 띄워 넣습니다.
+# 클립보드를 다른 프로그램이 쓰고 있을 때도 이 길은 막히지 않습니다.
+function Add-AttachmentByDialog([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs) {
+    $icons = @(Find-ChatToolbarIcons $Chat $InputBox)
+    if ($icons.Count -eq 0) { return (New-AttachStage '채팅창 아래 아이콘 줄을 찾지 못함' $null) }
+    # 왼쪽부터 [+] [이모티콘] [파일] 순서입니다.
+    $targets = @()
+    if ($icons.Count -ge 3) { $targets += $icons[2] }
+    $targets += $icons[0]
+    $lastReason = '파일 선택창이 뜨지 않음'
+    foreach ($icon in $targets) {
+        $modes = if ($script:toolbarClickNeedsMouse) { @($true) } else { @($false, $true) }
+        foreach ($useMouse in $modes) {
+            $before = Get-VisibleWindowHandles
+            if ($useMouse) {
+                # 실제 마우스는 지금 앞에 있는 창으로 갑니다.
+                # 엉뚱한 프로그램을 누르지 않도록 채팅창이 앞인지 반드시 확인합니다.
+                if (-not (Enter-ChatForeground $Chat $InputBox)) { return (New-AttachStage '채팅창을 앞으로 가져오지 못함' $null) }
+                Invoke-PointClick $icon.X $icon.Y $false
+            } else {
+                [NativeKakao]::ClickControl($Chat.Handle, $icon.X, $icon.Y, $false)
+            }
+            $waitFor = 3000
+            if (-not $useMouse) { $waitFor = 1200 }
+            $dialog = Wait-FileDialog $before $waitFor
+            if ($null -eq $dialog) {
+                if (-not $useMouse) { $script:toolbarClickNeedsMouse = $true }
+                Hide-ChatPopup $Chat $InputBox
+                continue
+            }
+            $seen = Get-VisibleWindowHandles
+            $problem = Submit-FileDialog $dialog $Path 8000
+            if ($problem) {
+                $lastReason = $problem
+                Close-FileDialog $dialog
+                continue
+            }
+            $preview = Wait-KakaoPreviewWindow $seen ([Math]::Max(2500, $WaitMs + 1200))
+            return (New-AttachStage '' $preview)
+        }
+    }
+    return (New-AttachStage $lastReason $null)
+}
+
+# 채팅창에 바로 붙은 첨부를 보냅니다.
+# 첨부는 입력칸이 처음부터 비어 있어서, 입력칸으로는 성공을 알 수 없습니다.
+# 전송 버튼이 다시 꺼지는 것으로 확인합니다.
+function Invoke-ChatSendAttachment([object]$Chat, [object]$InputBox, [int]$WaitMs) {
+    $ways = @(
+        [pscustomobject]@{ Name = '입력칸에 Enter 키'; Act = { [NativeKakao]::PressKey($InputBox.Handle, 0x0D) } },
+        [pscustomobject]@{ Name = '채팅창에 Enter 키'; Act = { [NativeKakao]::PressKey($Chat.Handle, 0x0D) } },
+        [pscustomobject]@{ Name = '창을 앞으로 가져와 Enter'; Act = {
+            if (Enter-ChatForeground $Chat $InputBox) { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') } } }
+    )
+    foreach ($way in $ways) {
+        try { & $way.Act } catch { continue }
+        $deadline = (Get-Date).AddMilliseconds([Math]::Max(2000, $WaitMs + 1200))
+        while ((Get-Date) -lt $deadline) {
+            if (-not (Test-ControlAlive $InputBox)) { break }
+            if ((Test-ChatSendReady $Chat $InputBox) -eq 'no') { return [string]$way.Name }
+            Start-Sleep -Milliseconds 180
+        }
+    }
+    return ''
+}
+
+# 첨부 하나를 붙이고 보냅니다.
+# 붙은 것이 확인되지 않으면 보내지 않습니다. 잘못 보내는 것보다 안 보내는 것이 낫습니다.
+# SendIt 을 $false 로 주면 붙이기만 해 보고 치웁니다. (첨부 시험)
+function Send-ChatAttachment([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs, [bool]$SendIt = $true) {
+    $result = [pscustomobject]@{ Ok = $false; Sent = $false; Method = ''; SendWay = ''; Reason = '' }
+    $reasons = @()
+    # 사진은 클립보드가 확실하고, 문서는 파일 선택창이 확실합니다.
+    $ways = @()
+    if (Test-IsImageFile $Path) {
+        $ways += [pscustomobject]@{ Name = '붙여넣기'; Act = { Add-AttachmentByClipboard $Chat $InputBox $Path $WaitMs } }
+        $ways += [pscustomobject]@{ Name = '파일 선택창'; Act = { Add-AttachmentByDialog $Chat $InputBox $Path $WaitMs } }
+    } else {
+        $ways += [pscustomobject]@{ Name = '파일 선택창'; Act = { Add-AttachmentByDialog $Chat $InputBox $Path $WaitMs } }
+        $ways += [pscustomobject]@{ Name = '붙여넣기'; Act = { Add-AttachmentByClipboard $Chat $InputBox $Path $WaitMs } }
+    }
+    $preview = $null
+    foreach ($way in $ways) {
+        $stage = $null
+        try { $stage = & $way.Act } catch { $stage = New-AttachStage $_.Exception.Message $null }
+        if ($null -eq $stage) { $reasons += ($way.Name + ': 알 수 없는 문제'); continue }
+        if ($stage.Problem) { $reasons += ($way.Name + ': ' + $stage.Problem); continue }
+        $preview = $stage.Preview
+        $result.Ok = $true
+        if ($null -ne $preview) { $result.Method = $way.Name + ' (미리보기 창 확인)' }
+        else { $result.Method = $way.Name + ' (전송 버튼 켜짐 확인)' }
+        break
+    }
+    $result.Reason = ($reasons -join ' / ')
+    if (-not $result.Ok) { return $result }
+
+    if (-not $SendIt) {
+        # 시험일 때는 붙인 것을 그대로 치웁니다. 보내지 않습니다.
+        if ($null -ne $preview) { [void](Close-KakaoPreview $preview) }
+        else { [void](Clear-ChatAttachmentDraft $Chat $InputBox) }
+        return $result
+    }
+
+    if ($null -ne $preview) {
+        $problem = Submit-KakaoPreview $preview ([Math]::Max(4000, $WaitMs + 2500))
+        if ($problem) {
+            $result.Reason = $problem
+            [void](Close-KakaoPreview $preview)
+        } else {
+            $result.Sent = $true
+            $result.SendWay = '미리보기 창의 전송 누름'
+        }
+        return $result
+    }
+
+    $how = Invoke-ChatSendAttachment $Chat $InputBox $WaitMs
+    if ($how) {
+        $result.Sent = $true
+        $result.SendWay = $how
+    } else {
+        $result.Reason = '붙이기는 됐지만 전송이 확인되지 않아 치웠습니다'
+        [void](Clear-ChatAttachmentDraft $Chat $InputBox)
+    }
+    return $result
 }
 
 # SendKeys 는 + ^ % ~ ( ) { } [ ] 를 특수 기호로 해석하므로 감싸 줍니다.
@@ -2076,6 +2523,9 @@ function ConvertTo-SendKeysText([string]$Text) {
 # ---------------------------------------------------------------------------
 # 입력과 전송
 # ---------------------------------------------------------------------------
+# 채팅창 아래 아이콘이 창 메시지를 받아 주는지 한 번만 확인하고 기억합니다.
+# 안 받아 주는데 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
+$script:toolbarClickNeedsMouse = $false
 $script:sendMethodLogged = ''
 
 function Clear-ChatInput([object]$InputBox) {
@@ -3320,7 +3770,7 @@ $script:txtMessage = New-AppTextBox $cardMessage 24 78 736 158 $true
 $script:txtMessage.Text = [string]$script:config.Message
 $script:lblMessageCount = New-CardLabel $cardMessage '' 24 240 736 20 $FontSmall $Theme.Muted
 
-$cardFiles = New-Card $pageCompose 28 292 784 312 '첨부 사진 · 파일' '문구를 보낸 뒤 아래 순서대로 하나씩 전송합니다.'
+$cardFiles = New-Card $pageCompose 28 292 784 312 '첨부 사진 · 파일' '문구를 보낸 뒤 아래 순서대로 하나씩 전송합니다. [첨부 시험]은 붙는지만 확인하고 보내지 않습니다.'
 $frameFiles = New-FieldFrame $cardFiles 24 78 576 212
 $script:lstFiles = New-Object System.Windows.Forms.ListBox
 $script:lstFiles.BorderStyle = 'None'
@@ -3334,7 +3784,7 @@ $btnAddFile    = New-AppButton $cardFiles '파일 추가' 616 78 144 40 'primary
 $btnFileUp     = New-AppButton $cardFiles '위로' 616 128 144 36
 $btnFileDown   = New-AppButton $cardFiles '아래로' 616 170 144 36
 $btnRemoveFile = New-AppButton $cardFiles '선택 제거' 616 218 144 36 'danger'
-[void](New-CardLabel $cardFiles '사진은 미리보기를 거쳐 전송됩니다.' 616 262 144 40 $FontSmall $Theme.Muted)
+$btnCheckAttach = New-AppButton $cardFiles '첨부 시험' 616 262 144 36
 
 $lblComposeHint = New-CardLabel $pageCompose '내용은 자동 저장됩니다. 실제 발송 전에 [3. 보내기] 화면에서 테스트 발송으로 결과를 먼저 확인하세요.' 28 618 784 30 $FontSmall $Theme.Muted
 $lblComposeHint.BackColor = $Theme.Bg
@@ -4054,6 +4504,48 @@ $btnHeaderStart.Add_Click({
         Show-AppPage 'run'
         if (Confirm-LiveRun '지금 발송 시작') { Start-BroadcastAsync }
     } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '실행 실패') | Out-Null }
+})
+
+$btnCheckAttach.Add_Click({
+    try {
+        Sync-ConfigFromForm
+        $files = @($script:lstFiles.Items | ForEach-Object { [string]$_ })
+        if ($files.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('먼저 [파일 추가]로 첨부할 파일을 넣어 주세요.', '첨부 시험') | Out-Null
+            return
+        }
+        $path = $files[0]
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            [System.Windows.Forms.MessageBox]::Show("파일을 찾을 수 없습니다." + "`r`n" + $path, '첨부 시험') | Out-Null
+            return
+        }
+        $room = [string]$script:config.TestRoom
+        if ([string]::IsNullOrWhiteSpace($room)) { $room = '나와의 채팅' }
+        $ask = "'$room' 방을 열어 첨부가 붙는지만 확인합니다." + "`r`n`r`n" +
+               '붙여 본 뒤 바로 치웁니다. 메시지는 보내지 않습니다.' + "`r`n`r`n" +
+               "파일: $([System.IO.Path]::GetFileName($path))" + "`r`n`r`n" + '진행할까요?'
+        if ([System.Windows.Forms.MessageBox]::Show($ask, '첨부 시험 (보내지 않음)', 'YesNo', 'Question') -ne 'Yes') { return }
+        $script:form.Enabled = $false
+        Set-StatusPill '첨부 시험 중' 'run'
+        $outcome = $null
+        try { $outcome = Invoke-AttachmentCheck $room $path } catch { $outcome = [pscustomobject]@{ Ok = $false; Text = $_.Exception.Message } }
+        $script:form.Enabled = $true
+        $script:form.Activate()
+        Write-RunLog "첨부 시험 ($room): $($outcome.Text)"
+        if ($outcome.Ok) {
+            Set-StatusPill '첨부 시험 성공' 'done'
+            [System.Windows.Forms.MessageBox]::Show($outcome.Text + "`r`n`r`n" + '이 환경에서는 첨부가 됩니다.', '첨부 시험 성공') | Out-Null
+        } else {
+            Set-StatusPill '첨부 시험 실패' 'error'
+            [System.Windows.Forms.MessageBox]::Show($outcome.Text + "`r`n`r`n" + '실행 기록에 그대로 남겨 두었습니다.', '첨부 시험 실패') | Out-Null
+        }
+    } catch {
+        $script:form.Enabled = $true
+        $script:form.Activate()
+        Set-StatusPill '첨부 시험 실패' 'error'
+        Write-RunLog "첨부 시험 실패: $($_.Exception.Message)"
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '첨부 시험 실패') | Out-Null
+    }
 })
 
 $btnAddFile.Add_Click({
