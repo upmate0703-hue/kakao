@@ -523,6 +523,7 @@ function New-DefaultConfig {
         TestRoom = '나와의 채팅'
         AttachmentWaitMs = 1500
         OpenTimeoutMs = 8000
+        SettleMs = 4000
         AutoCheckUpdate = $true
         TourDone = $false
         Calibration = [pscustomobject]@{
@@ -1351,13 +1352,41 @@ function Set-ClipboardFileSafe([string]$Path) {
     throw '클립보드에 첨부 파일을 넣지 못했습니다.'
 }
 
+# 창 제목이 목표 방과 같은지 봅니다.
+# 목록에 보이는 이름은 길면 뒤가 잘립니다. 그래서 저장된 이름이 창 제목보다 짧을 수 있습니다.
+# 앞부분만 같으면 맞다고 볼 수도 있지만, 그러면 이름이 비슷한 다른 방에 보낼 위험이 있습니다.
+# 그래서 앞부분이 같은 방이 딱 하나일 때만 맞다고 봅니다. 둘 이상이면 보내지 않습니다.
 function Test-RoomTitle([string]$Actual, [string]$Expected) {
     $a = ([string]$Actual).Trim()
     $e = ([string]$Expected).Trim()
     if (-not $a -or -not $e) { return $false }
     if ($a -eq $e) { return $true }
     # 카카오톡은 인원수를 붙여 "방이름 (12)" 형태로 창 제목을 표시하기도 합니다.
-    return $a -match ('^' + [regex]::Escape($e) + '\s*\(\d+\)$')
+    if ($a -match ('^' + [regex]::Escape($e) + '\s*\(\d+\)$')) { return $true }
+
+    $keyActual = ConvertTo-CompareKey $a
+    $keyExpected = ConvertTo-CompareKey $e
+    if (-not $keyActual -or -not $keyExpected) { return $false }
+    if ($keyActual -eq $keyExpected) { return $true }
+    # 인원수가 붙은 경우를 한 번 더 봅니다.
+    if ($keyActual -match ('^' + [regex]::Escape($keyExpected) + '\d{1,4}$')) { return $true }
+
+    # 여기부터는 잘린 이름 처리입니다.
+    if ($keyExpected.Length -lt 6) { return $false }
+    if (-not $keyActual.StartsWith($keyExpected)) { return $false }
+    # 저장된 방 중에 같은 앞부분을 가진 방이 딱 하나일 때만 인정합니다.
+    # 하나도 없으면 우리가 모르는 방이고, 둘 이상이면 어느 방인지 알 수 없습니다.
+    # 둘 다 보내면 안 되는 상황입니다.
+    $sameStart = 0
+    try {
+        foreach ($known in @($script:config.KnownRooms)) {
+            $keyKnown = ConvertTo-CompareKey ([string]$known)
+            if (-not $keyKnown) { continue }
+            if ($keyKnown.StartsWith($keyExpected) -or $keyExpected.StartsWith($keyKnown)) { $sameStart++ }
+        }
+    } catch { return $false }
+    if ($sameStart -ne 1) { return $false }
+    return $true
 }
 
 function Find-ChatWindow([string]$Room, [IntPtr]$MainHandle) {
@@ -1406,7 +1435,8 @@ function Test-ControlAlive([object]$Control) {
 # 제목이 목표 방과 일치하고, 그 제목이 흔들리지 않고, 입력칸까지 준비돼야 통과입니다.
 function Wait-ChatWindowReady([object]$Chat, [string]$Room, [int]$TimeoutMs = 8000) {
     if ($TimeoutMs -le 0) { $TimeoutMs = 8000 }
-    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $started = Get-Date
+    $deadline = $started.AddMilliseconds($TimeoutMs)
     $lastTitle = ''
     $stable = 0
     $sawTitle = ''
@@ -1424,7 +1454,13 @@ function Wait-ChatWindowReady([object]$Chat, [string]$Room, [int]$TimeoutMs = 80
         if ($stable -ge 2 -and (Test-RoomTitle $title $Room)) {
             $box = Get-ChatInputControl $fresh
             if ($null -ne $box -and (Test-ControlAlive $box)) {
-                return [pscustomobject]@{ Window = $fresh; InputBox = $box }
+                # 여기까지는 창이 준비된 것이고, 대화 내용은 아직 불러오는 중일 수 있습니다.
+                # 남은 시간만큼 화면이 멈추기를 기다립니다. 못 기다려도 실패로 보지 않고
+                # 전송할 때 다시 확인하고 필요하면 다시 보냅니다.
+                $left = [int]($deadline - (Get-Date)).TotalMilliseconds
+                $settled = $true
+                if ($left -gt 400) { $settled = Wait-ChatContentSettled $fresh $left }
+                return [pscustomobject]@{ Window = $fresh; InputBox = $box; Settled = $settled }
             }
         }
         Start-Sleep -Milliseconds 200
@@ -1433,6 +1469,57 @@ function Wait-ChatWindowReady([object]$Chat, [string]$Room, [int]$TimeoutMs = 80
         Write-RunLog "  (열린 창 제목은 '$sawTitle' 이었습니다)"
     }
     return $null
+}
+
+# 대화 목록(말풍선이 보이는 곳) 컨트롤을 찾습니다.
+function Get-ChatListControl([object]$Chat) {
+    if ($null -eq $Chat) { return $null }
+    try {
+        foreach ($child in [NativeKakao]::GetChildWindows($Chat.Handle)) {
+            if ($child.ClassName -eq 'EVA_VH_ListControl_Dblclk' -and $child.Visible -and $child.Height -gt 100) { return $child }
+        }
+    } catch { }
+    return $null
+}
+
+# 대화 영역의 모습을 숫자로 요약합니다. 네 칸으로 나눠 봐서 조금만 바뀌어도 알아챕니다.
+function Get-ChatListSignature([object]$List) {
+    $window = [NativeKakao]::GetWindow($List.Handle)
+    if ($null -eq $window -or $window.Width -le 0 -or $window.Height -le 0) { return '' }
+    $image = $null
+    try { $image = Get-WindowImage $window } catch { return '' }
+    try {
+        $parts = @()
+        for ($i = 0; $i -lt 4; $i++) {
+            $top = [int]($image.Height * $i / 4)
+            $bottom = [int]($image.Height * ($i + 1) / 4) - 1
+            $parts += [Math]::Round([FastImage]::DarkRatio($image, 0, $top, ($image.Width - 1), $bottom, 0.72), 5)
+        }
+        return ($parts -join '|')
+    } catch { return '' }
+    finally { if ($null -ne $image) { try { $image.Dispose() } catch { } } }
+}
+
+# 대화 내용을 아직 불러오는 중이면 Enter 를 눌러도 전송되지 않습니다.
+# 실제로 재 보니 제목과 입력칸은 0.4초면 준비되는데,
+# 대화 내용은 방에 따라 12초까지 계속 그려지고 있었습니다.
+# 그 사이에 보내면 아무 일도 일어나지 않습니다. 그래서 화면이 멈출 때까지 기다립니다.
+# 대화가 계속 올라오는 방은 영영 안 멈추므로, 정해진 시간까지만 기다리고 넘어갑니다.
+function Wait-ChatContentSettled([object]$Chat, [int]$TimeoutMs) {
+    if ($TimeoutMs -le 0) { return $true }
+    $list = Get-ChatListControl $Chat
+    if ($null -eq $list) { return $true }
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $last = ''
+    $same = 0
+    while ((Get-Date) -lt $deadline) {
+        $signature = Get-ChatListSignature $list
+        if ($signature -and $signature -eq $last) { $same++ } else { $same = 0 }
+        $last = $signature
+        if ($same -ge 2) { return $true }
+        Start-Sleep -Milliseconds 220
+    }
+    return $false
 }
 
 function Get-ChatInputControl([object]$ChatWindow) {
@@ -1487,9 +1574,27 @@ $script:RoomNoiseLabels = @(
 function Remove-RoomNameNoise([string]$RawName) {
     $name = ([string]$RawName).Trim()
     if (-not $name) { return '' }
-    # '0 홍보방' → '홍보방'   /  '0홍보방' → '홍보방'
-    $name = $name -replace '^0\s+', ''
+    # 안 읽은 개수 뱃지가 이름 앞에 붙어 읽힙니다. '0 홍보방' → '홍보방'
+    # 진짜 이름이 숫자로 시작하는 방도 있어서, 뱃지로 확실한 0 과 O 만 뗍니다.
+    $name = $name -replace '^[0OoＯ]\s+', ''
     $name = $name -replace '^0(?=[가-힣A-Za-z])', ''
+    # 이름이 길면 카카오톡이 뒤를 … 로 줄여 보여 줍니다. 그 표시를 뗍니다.
+    $name = $name -replace '[…⋯]+\s*$', ''
+    # 화면 글자 인식이 줄 끝에 남기는 찌꺼기입니다.
+    $name = $name -replace '[′`´ˊˋ˙·,]+$', ''
+    # 이모티콘이나 그림 문자는 이름에서 뺍니다. 목록이 읽기 어려워집니다.
+    # 뺀 뒤에도 방을 찾는 데는 문제가 없습니다. 방 찾기는 한글·영문·숫자만 견줍니다.
+    $kept = New-Object System.Text.StringBuilder
+    foreach ($ch in $name.ToCharArray()) {
+        $code = [int][char]$ch
+        $isEmoji = ($code -ge 0x1F000 -and $code -le 0x1FAFF) -or ($code -ge 0x2600 -and $code -le 0x27BF)
+        $isSurrogate = ($code -ge 0xD800 -and $code -le 0xDFFF)
+        $isMark = ($code -ge 0xFE00 -and $code -le 0xFE0F) -or $code -eq 0x20E3
+        if ($isEmoji -or $isSurrogate -or $isMark) { continue }
+        [void]$kept.Append($ch)
+    }
+    $name = $kept.ToString()
+    $name = $name -replace '\s{2,}', ' '
     return $name.Trim()
 }
 
@@ -1953,7 +2058,7 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
 
     $message = [string]$Content.Message
     if (-not [string]::IsNullOrWhiteSpace($message)) {
-        $how = Send-ChatText $chat $inputBox $message
+        $how = Send-ChatText $chat $inputBox $message ([int]$Content.SettleMs)
         if (-not $how) {
             Write-RunLog "실패: '$Room' — 전송되지 않았습니다. 입력칸을 비우고 넘어갑니다."
             Clear-ChatInput $inputBox
@@ -2015,19 +2120,23 @@ function Enter-ChatForeground([object]$Chat, [object]$InputBox) {
 }
 
 # 실제 키보드 입력으로 붙여넣고 보냅니다. 성공은 입력칸이 비워졌는지로 판단합니다.
-function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message) {
-    if (-not (Enter-ChatForeground $Chat $InputBox)) {
-        Write-RunLog '경고: 채팅창을 앞으로 가져오지 못했습니다.'
-        return ''
-    }
+# 입력칸에 우리가 넣은 글이 그대로 남아 있는지 봅니다.
+# 비어 있으면 이미 전송된 것이므로 다시 보내면 안 됩니다. 두 번 가 버립니다.
+function Get-ChatInputState([object]$InputBox, [string]$Message) {
+    if (-not (Test-ControlAlive $InputBox)) { return '사라짐' }
+    $written = [string](Get-ChatInputText $InputBox)
+    if ([string]::IsNullOrWhiteSpace($written)) { return '비어있음' }
+    if (($written -replace '\s', '') -eq ($Message -replace '\s', '')) { return '그대로' }
+    return '다름'
+}
 
-    # 이미 써 두던 글(임시 저장)이 있을 때만 지웁니다.
+# 글을 넣습니다. 붙여넣기가 먼저, 안 되면 실제 키 입력입니다.
+function Set-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message) {
     if (-not [string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) {
         [NativeKakao]::PressCtrlKey(0x41)
         [NativeKakao]::PressPlainKey(0x2E)
         Start-Sleep -Milliseconds 120
     }
-
     $pasted = $false
     try {
         Set-ClipboardTextSafe $Message
@@ -2037,34 +2146,64 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message) {
     } catch {
         Write-RunLog '클립보드를 쓰지 못해 직접 입력으로 넘어갑니다.'
     }
-
-    $written = (Get-ChatInputText $InputBox)
-    if (($written -replace '\s', '') -ne ($Message -replace '\s', '')) {
-        # 붙여넣기가 안 됐거나 내용이 다르면 실제 키 입력으로 다시 씁니다.
-        if (-not [string]::IsNullOrWhiteSpace($written)) {
+    if ((Get-ChatInputState $InputBox $Message) -ne '그대로') {
+        if (-not [string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) {
             [NativeKakao]::PressCtrlKey(0x41)
             [NativeKakao]::PressPlainKey(0x2E)
             Start-Sleep -Milliseconds 120
         }
         [System.Windows.Forms.SendKeys]::SendWait((ConvertTo-SendKeysText $Message))
         Start-Sleep -Milliseconds 400
-        $written = (Get-ChatInputText $InputBox)
+        $pasted = $false
     }
+    return $pasted
+}
 
-    # 넣은 글과 다르면 보내지 않습니다. 잘못된 내용이 나가는 것을 막습니다.
-    if (($written -replace '\s', '') -ne ($Message -replace '\s', '')) {
+# 글을 보냅니다.
+# 오픈채팅처럼 대화가 아직 불러와지는 중이면 Enter 가 먹지 않습니다.
+# 그래서 한 번 보내고 끝내지 않고, 확인해서 안 갔으면 기다렸다 다시 보냅니다.
+# 다시 보내기 전에 입력칸을 꼭 확인합니다. 비어 있으면 이미 간 것이라 다시 보내면
+# 같은 글이 두 번 갑니다.
+function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]$SettleMs = 4000) {
+    if (-not (Enter-ChatForeground $Chat $InputBox)) {
+        Write-RunLog '경고: 채팅창을 앞으로 가져오지 못했습니다.'
+        return ''
+    }
+    # 아직 불러오는 중이면 여기서 기다립니다.
+    [void](Wait-ChatContentSettled $Chat $SettleMs)
+
+    $pasted = Set-ChatMessageText $Chat $InputBox $Message
+    $state = Get-ChatInputState $InputBox $Message
+    if ($state -ne '그대로') {
         Write-RunLog "건너뜀: 입력칸 내용이 문구와 다릅니다. (전송하지 않음)"
         return ''
     }
 
-    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-    if (Wait-ChatInputCleared $InputBox 2000) {
-        return $(if ($pasted) { '붙여넣기 + Enter (실제 키 입력)' } else { '직접 입력 + Enter (실제 키 입력)' })
+    $base = '직접 입력'
+    if ($pasted) { $base = '붙여넣기' }
+    $tries = @(
+        [pscustomobject]@{ Name = 'Enter (실제 키 입력)'; Act = {
+            if (Enter-ChatForeground $Chat $InputBox) { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') } } },
+        [pscustomobject]@{ Name = '입력칸에 Enter 키'; Act = { [NativeKakao]::PressKey($InputBox.Handle, 0x0D) } },
+        [pscustomobject]@{ Name = 'Enter (실제 키 입력, 재시도)'; Act = {
+            if (Enter-ChatForeground $Chat $InputBox) { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') } } },
+        [pscustomobject]@{ Name = '채팅창에 Enter 키'; Act = { [NativeKakao]::PressKey($Chat.Handle, 0x0D) } }
+    )
+    $attempt = 0
+    foreach ($try in $tries) {
+        $attempt++
+        $state = Get-ChatInputState $InputBox $Message
+        if ($state -eq '비어있음') { return ($base + ' + ' + $try.Name) }
+        if ($state -eq '사라짐') { return '' }
+        if ($state -eq '다름') {
+            Write-RunLog '건너뜀: 보내는 도중 입력칸 내용이 바뀌었습니다. (전송하지 않음)'
+            return ''
+        }
+        try { & $try.Act } catch { continue }
+        if (Wait-ChatInputCleared $InputBox 2200) { return ($base + ' + ' + $try.Name) }
+        # 아직 불러오는 중이라 안 먹었을 수 있습니다. 잠깐 기다렸다 다시 해 봅니다.
+        if ($attempt -lt $tries.Count) { [void](Wait-ChatContentSettled $Chat 2500) }
     }
-
-    # 그래도 안 되면 창 메시지로 한 번 더 시도합니다.
-    $fallback = Invoke-ChatSend $Chat $InputBox
-    if ($fallback) { return $fallback }
     return ''
 }
 
@@ -2762,6 +2901,7 @@ function New-SendContent([bool]$DryRun) {
         Attachments = @($script:config.Attachments)
         AttachmentWaitMs = [int]$script:config.AttachmentWaitMs
         OpenTimeoutMs = [Math]::Max(3000, [int]$script:config.OpenTimeoutMs)
+        SettleMs = [Math]::Max(0, [Math]::Min(30000, [int]$script:config.SettleMs))
         DryRun = $DryRun
     }
 }
@@ -3015,7 +3155,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'AutoCheckUpdate', 'TourDone', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'AutoCheckUpdate', 'TourDone', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -3029,6 +3169,14 @@ if ($SelfTest) {
     if ((ConvertTo-RoomCandidate "테스트 채팅방`r`n안녕하세요") -ne '테스트 채팅방') { throw '후보 추출 자체 점검 실패' }
     if (-not (Test-RoomTitle '우리반 공지방 (24)' '우리반 공지방')) { throw '창 제목 비교 자체 점검 실패' }
     if (Test-RoomTitle '우리반 공지방 2기' '우리반 공지방') { throw '창 제목 비교가 너무 느슨합니다' }
+    if ((Remove-RoomNameNoise '0 홍보방') -ne '홍보방') { throw '이름 다듬기 자체 점검 실패 (안읽음 뱃지)' }
+    if ((Remove-RoomNameNoise '긴 방이름입니다…') -ne '긴 방이름입니다') { throw '이름 다듬기 자체 점검 실패 (잘림 표시)' }
+    # 진짜 이름이 숫자로 시작하는 방을 잘못 깎으면 안 됩니다.
+    if ((Remove-RoomNameNoise '5K 디자인') -ne '5K 디자인') { throw '이름 다듬기가 진짜 이름을 깎았습니다' }
+    if ((Remove-RoomNameNoise '95 비와이') -ne '95 비와이') { throw '이름 다듬기가 진짜 이름을 깎았습니다 (숫자)' }
+    foreach ($fn in @('Wait-ChatContentSettled', 'Get-ChatListControl', 'Get-ChatInputState')) {
+        if (-not (Get-Command $fn -ErrorAction SilentlyContinue)) { throw "필수 기능 누락: $fn" }
+    }
     if ((ConvertTo-AppVersion 'v3.1.0') -le (ConvertTo-AppVersion '3.0.0')) { throw '버전 비교 자체 점검 실패' }
     if ($null -ne (ConvertTo-AppVersion 'nightly')) { throw '버전 파싱 자체 점검 실패' }
 
@@ -4086,6 +4234,19 @@ $script:numOpenTimeout.BorderStyle = 'FixedSingle'
 $cardLimit.Controls.Add($script:numOpenTimeout)
 [void](New-CardLabel $cardLimit '초까지 기다림 (대화 많은 방은 늘리세요)' 600 200 200 24 $FontSmall $Theme.Muted)
 
+# 오픈채팅처럼 대화가 많이 쌓인 방은 창이 뜬 뒤에도 한참 더 불러옵니다.
+# 다 불러오기 전에 Enter 를 누르면 아무 일도 일어나지 않습니다.
+[void](New-CardLabel $cardLimit '대화 로딩 대기' 24 240 100 24 $FontSmall $Theme.Muted)
+$script:numSettle = New-Object System.Windows.Forms.NumericUpDown
+$script:numSettle.Minimum = 0
+$script:numSettle.Maximum = 30
+$script:numSettle.Value = [Math]::Max(0, [Math]::Min(30, [int]([Math]::Round([int]$script:config.SettleMs / 1000))))
+$script:numSettle.Location = New-Object System.Drawing.Point(130, 236)
+$script:numSettle.Size = New-Object System.Drawing.Size(64, 28)
+$script:numSettle.Font = $FontBase
+$cardLimit.Controls.Add($script:numSettle)
+[void](New-CardLabel $cardLimit '초 동안 화면이 멈추기를 기다린 뒤 보냅니다 (오픈채팅은 늘리세요)' 200 240 380 24 $FontSmall $Theme.Muted)
+
 $script:lblLimitState = New-CardLabel $cardLimit '' 24 234 736 56 $FontSmall $Theme.Sub
 
 # 페이지 5 — 실행 기록
@@ -4171,7 +4332,7 @@ function Update-RoomListView {
     $script:lstRooms.BeginUpdate()
     $script:lstRooms.Items.Clear()
     $items = New-Object System.Collections.Generic.List[object]
-    foreach ($entry in ($script:roomEntries | Sort-Object -Property Type, Name)) {
+    foreach ($entry in ($script:roomEntries | Sort-Object -Property Name)) {
         if ($script:roomFilter -ne '전체' -and $entry.Type -ne $script:roomFilter) { continue }
         if (-not (Test-RoomMatchesSearch $entry.Name $key)) { continue }
         $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Name)
@@ -4253,7 +4414,7 @@ function Show-RoomPicker([string]$Title) {
         param($query)
         $list.BeginUpdate()
         $list.Items.Clear()
-        foreach ($entry in ($script:roomEntries | Sort-Object -Property Type, Name)) {
+        foreach ($entry in ($script:roomEntries | Sort-Object -Property Name)) {
             if ($query -and ([string]$entry.Name).IndexOf($query, [System.StringComparison]::CurrentCultureIgnoreCase) -lt 0) { continue }
             $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Name)
             [void]$item.SubItems.Add([string]$entry.Type)
@@ -4373,6 +4534,7 @@ function Sync-ConfigFromForm {
     $script:config.BatchSize = [int]$script:numBatchSize.Value
     $script:config.BatchRestMinutes = [int]$script:numBatchRest.Value
     $script:config.OpenTimeoutMs = [int]$script:numOpenTimeout.Value * 1000
+    $script:config.SettleMs = [int]$script:numSettle.Value * 1000
     $script:config.RepeatEnabled = [bool]$script:chkRepeat.Checked
     $script:config.RepeatMinutes = [int]$script:numRepeatMinutes.Value
     $script:config.RepeatCount = [int]$script:numRepeatCount.Value
@@ -4422,6 +4584,7 @@ $script:numHolidayMultiplier.Add_ValueChanged({ Request-AutoSave })
 $script:numBatchSize.Add_ValueChanged({ Request-AutoSave })
 $script:numBatchRest.Add_ValueChanged({ Request-AutoSave })
 $script:numOpenTimeout.Add_ValueChanged({ Request-AutoSave })
+$script:numSettle.Add_ValueChanged({ Request-AutoSave })
 $script:chkRepeat.Add_CheckedChanged({ Request-AutoSave })
 $script:numRepeatMinutes.Add_ValueChanged({ Request-AutoSave })
 $script:numRepeatCount.Add_ValueChanged({ Request-AutoSave })
