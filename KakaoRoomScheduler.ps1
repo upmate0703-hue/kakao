@@ -585,6 +585,94 @@ function Add-ConfigPropertyIfMissing([object]$Object, [string]$Name, [object]$Va
     }
 }
 
+# 예전에 저장된 이름에는 안 읽은 개수 뱃지(0)나 잘림 표시(…)가 그대로 남아 있습니다.
+# 그래서 목록에 같은 방이 두 번 보이거나 이름이 이상하게 나옵니다.
+#   *자유로운 홍보방*
+#   0 *자유로운 홍보방*   <- 같은 방인데 뱃지가 붙어 따로 저장됨
+# 프로그램을 켤 때 한 번 정리하고 같은 방은 합칩니다.
+# 첨부 목록에는 파일 이름만 보여 주고 전체 경로는 안에 담아 둡니다.
+# 긴 경로가 그대로 보이면 목록이 지저분해서 무엇이 들었는지 알아보기 어렵습니다.
+function New-AttachmentItem([string]$Path) {
+    $name = $Path
+    try { $name = [System.IO.Path]::GetFileName($Path) } catch { }
+    if (-not $name) { $name = $Path }
+    return [pscustomobject]@{ Name = $name; Path = [string]$Path }
+}
+
+function Get-AttachmentPaths {
+    return @($script:lstFiles.Items | ForEach-Object { [string]$_.Path })
+}
+
+function Repair-RoomNames([object]$Config) {
+    $order = New-Object System.Collections.Generic.List[string]
+    $byKey = @{}
+    $cleaned = 0
+    $merged = 0
+
+    # 고른 방을 먼저 기억해 둡니다. 합치는 과정에서 잃어버리면 안 됩니다.
+    $picked = @{}
+    foreach ($raw in @($Config.Rooms)) {
+        $name = Remove-RoomNameNoise ([string]$raw)
+        if (-not $name) { continue }
+        $key = ConvertTo-CompareKey $name
+        if ($key) { $picked[$key] = $true }
+    }
+
+    foreach ($raw in (@($Config.Rooms) + @($Config.KnownRooms))) {
+        $before = [string]$raw
+        if ([string]::IsNullOrWhiteSpace($before)) { continue }
+        $name = Remove-RoomNameNoise $before
+        if (-not $name) { continue }
+        if ($name -ne $before) { $cleaned++ }
+        $key = ConvertTo-CompareKey $name
+        if (-not $key) { continue }
+        if ($byKey.ContainsKey($key)) { $merged++; continue }
+        $byKey[$key] = $name
+        [void]$order.Add($key)
+    }
+
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($key in $order) { [void]$names.Add($byKey[$key]) }
+
+    # 종류 정보를 새 이름으로 옮깁니다.
+    $newTypes = [pscustomobject]@{}
+    foreach ($prop in @($Config.RoomTypes.PSObject.Properties)) {
+        $name = Remove-RoomNameNoise ([string]$prop.Name)
+        if (-not $name) { continue }
+        $key = ConvertTo-CompareKey $name
+        if (-not $key -or -not $byKey.ContainsKey($key)) { continue }
+        $target = $byKey[$key]
+        if ($null -ne $newTypes.PSObject.Properties[$target]) { continue }
+        Add-Member -InputObject $newTypes -NotePropertyName $target -NotePropertyValue ([string]$prop.Value)
+    }
+    $Config.RoomTypes = $newTypes
+
+    # 그룹에 들어 있는 이름도 옮깁니다.
+    $newGroups = [pscustomobject]@{}
+    foreach ($prop in @($Config.Groups.PSObject.Properties)) {
+        $members = New-Object System.Collections.Generic.List[string]
+        foreach ($member in @($prop.Value)) {
+            $name = Remove-RoomNameNoise ([string]$member)
+            if (-not $name) { continue }
+            $key = ConvertTo-CompareKey $name
+            if (-not $key -or -not $byKey.ContainsKey($key)) { continue }
+            $target = $byKey[$key]
+            if (-not $members.Contains($target)) { [void]$members.Add($target) }
+        }
+        Add-Member -InputObject $newGroups -NotePropertyName ([string]$prop.Name) -NotePropertyValue @($members)
+    }
+    $Config.Groups = $newGroups
+
+    $Config.KnownRooms = @($names)
+    $Config.Rooms = @($names | Where-Object { $picked[(ConvertTo-CompareKey $_)] })
+    $script:lastSendProblem = ''
+$script:roomRepairNote = ''
+    if ($cleaned -gt 0 -or $merged -gt 0) {
+        $script:roomRepairNote = "채팅방 목록을 정리했습니다: 이름 다듬음 $($cleaned)개 · 같은 방 합침 $($merged)개"
+    }
+    return $Config
+}
+
 function Repair-Config([object]$Config) {
     $defaults = New-DefaultConfig
     foreach ($property in $defaults.PSObject.Properties) {
@@ -601,6 +689,7 @@ function Repair-Config([object]$Config) {
     foreach ($property in @($Config.RoomTypes.PSObject.Properties)) {
         if ([string]$property.Value -eq '확인 필요') { $Config.RoomTypes.($property.Name) = $script:RoomTypeUnknown }
     }
+    $Config = Repair-RoomNames $Config
     return $Config
 }
 
@@ -2115,7 +2204,9 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
     if (-not [string]::IsNullOrWhiteSpace($message)) {
         $how = Send-ChatText $chat $inputBox $message ([int]$Content.SettleMs)
         if (-not $how) {
-            Write-RunLog "실패: '$Room' — 전송되지 않았습니다. 입력칸을 비우고 넘어갑니다."
+            $why = $script:lastSendProblem
+            if (-not $why) { $why = '까닭을 알 수 없습니다.' }
+            Write-RunLog "실패: '$Room' — $why 입력칸을 비우고 넘어갑니다."
             Clear-ChatInput $inputBox
             Close-ChatWindow $chat
             return $false
@@ -2261,11 +2352,22 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
     # 아직 불러오는 중이면 여기서 기다립니다.
     [void](Wait-ChatContentSettled $Chat $SettleMs)
 
-    $way = Set-ChatMessageText $Chat $InputBox $Message
-    if (-not $way) {
-        Write-RunLog '건너뜀: 입력칸에 문구를 넣지 못했습니다. (전송하지 않음)'
+    # 여기서 예외가 나면 위쪽에서 방만 닫고 끝나 버려,
+    # 사용자는 "채팅창이 켜졌다 바로 꺼진다" 로만 보입니다.
+    # 무슨 일이 있었는지 반드시 남깁니다.
+    $way = ''
+    try { $way = Set-ChatMessageText $Chat $InputBox $Message }
+    catch {
+        $script:lastSendProblem = "글을 넣는 중 문제가 생겼습니다: $($_.Exception.Message)"
+        Write-RunLog $script:lastSendProblem
         return ''
     }
+    if (-not $way) {
+        $script:lastSendProblem = '입력칸에 문구를 넣지 못했습니다.'
+        Write-RunLog "건너뜀: $($script:lastSendProblem) (전송하지 않음)"
+        return ''
+    }
+    $script:lastSendProblem = ''
 
     $tries = @(
         [pscustomobject]@{ Name = '입력칸에 Enter'; Act = { [NativeKakao]::PressKey($InputBox.Handle, 0x0D) } },
@@ -2274,6 +2376,7 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
         [pscustomobject]@{ Name = '창을 앞으로 가져와 Enter'; Act = {
             if (Enter-ChatForeground $Chat $InputBox) { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') } } }
     )
+    $script:lastSendProblem = 'Enter 를 눌러도 전송되지 않았습니다. (대화를 아직 불러오는 중일 수 있습니다)'
     $attempt = 0
     foreach ($try in $tries) {
         $attempt++
@@ -2765,6 +2868,8 @@ function ConvertTo-SendKeysText([string]$Text) {
 # 채팅창 아래 아이콘이 창 메시지를 받아 주는지 한 번만 확인하고 기억합니다.
 # 안 받아 주는데 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
 $script:toolbarClickNeedsMouse = $false
+$script:lastSendProblem = ''
+$script:roomRepairNote = ''
 $script:pendingSwap = ''
 $script:sendMethodLogged = ''
 
@@ -4149,8 +4254,10 @@ $script:lstFiles.BorderStyle = 'None'
 $script:lstFiles.Font = $FontBase
 $script:lstFiles.Location = New-Object System.Drawing.Point(12, 12)
 $script:lstFiles.Size = New-Object System.Drawing.Size(552, 188)
+$script:lstFiles.DisplayMember = 'Name'
+$script:lstFiles.ItemHeight = 24
 $frameFiles.Controls.Add($script:lstFiles)
-foreach ($file in @($script:config.Attachments)) { [void]$script:lstFiles.Items.Add([string]$file) }
+foreach ($file in @($script:config.Attachments)) { [void]$script:lstFiles.Items.Add((New-AttachmentItem ([string]$file))) }
 
 $btnAddFile    = New-AppButton $cardFiles '파일 추가' 616 78 144 40 'primary'
 $btnFileUp     = New-AppButton $cardFiles '위로' 616 128 144 36
@@ -4775,7 +4882,7 @@ function Sync-ConfigFromForm {
     $script:config.KnownRooms = @($script:roomEntries | ForEach-Object { [string]$_.Name })
     foreach ($entry in $script:roomEntries) { Set-RoomType $entry.Name $entry.Type }
     $script:config.Message = $script:txtMessage.Text
-    $script:config.Attachments = @($script:lstFiles.Items | ForEach-Object { [string]$_ })
+    $script:config.Attachments = @(Get-AttachmentPaths)
     $script:config.ScheduledAt = $script:dtSchedule.Value.ToString('yyyy-MM-dd HH:mm:ss')
     $script:config.IntervalSeconds = [int]$script:numInterval.Value
     $script:config.DryRun = [bool]$script:rdoDry.Checked
@@ -4965,7 +5072,7 @@ $btnHeaderStart.Add_Click({
 $btnCheckAttach.Add_Click({
     try {
         Sync-ConfigFromForm
-        $files = @($script:lstFiles.Items | ForEach-Object { [string]$_ })
+        $files = @(Get-AttachmentPaths)
         if ($files.Count -eq 0) {
             [System.Windows.Forms.MessageBox]::Show('먼저 [파일 추가]로 첨부할 파일을 넣어 주세요.', '첨부 시험') | Out-Null
             return
@@ -5009,7 +5116,11 @@ $btnAddFile.Add_Click({
     $dialog.Multiselect = $true
     $dialog.Title = '사진 또는 파일 선택'
     if ($dialog.ShowDialog() -eq 'OK') {
-        foreach ($file in $dialog.FileNames) { if (-not $script:lstFiles.Items.Contains($file)) { [void]$script:lstFiles.Items.Add($file) } }
+        $already = @(Get-AttachmentPaths)
+    foreach ($file in $dialog.FileNames) {
+        if ($already -contains [string]$file) { continue }
+        [void]$script:lstFiles.Items.Add((New-AttachmentItem ([string]$file)))
+    }
         Sync-ConfigFromForm
     }
 })
@@ -6255,6 +6366,7 @@ function Show-SplashScreen {
 
 Show-AppPage 'compose'
 Write-RunLog "프로그램 시작 (v$($script:AppVersion)). 설정은 자동 저장됩니다."
+if ($script:roomRepairNote) { Write-RunLog $script:roomRepairNote }
 
 if ($ScreenshotDir) {
     if (-not (Test-Path -LiteralPath $ScreenshotDir)) { New-Item -ItemType Directory -Path $ScreenshotDir -Force | Out-Null }
