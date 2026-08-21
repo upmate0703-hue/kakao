@@ -3546,7 +3546,7 @@ $cardFolders = New-Card $pageSettings 28 512 784 176 '도움말 및 관리'
 $btnGuide      = New-AppButton $cardFolders '가이드 다시 보기' 24 62 160 40 'primary'
 $btnOpenApp    = New-AppButton $cardFolders '프로그램 폴더 열기' 194 62 170 40
 $btnOpenLogs   = New-AppButton $cardFolders '로그 폴더 열기' 374 62 150 40
-$btnResetConf  = New-AppButton $cardFolders '설정 초기화' 534 62 150 40 'danger'
+$btnResetConf  = New-AppButton $cardFolders '처음 상태로 되돌리기' 534 62 200 40 'danger'
 [void](New-CardLabel $cardFolders "설정 파일 위치: $ConfigPath" 24 114 736 22 $FontSmall $Theme.Muted)
 [void](New-CardLabel $cardFolders '카카오 계정, 비밀번호, 인증 정보는 저장하지 않습니다. 설정은 이 PC 안에만 보관됩니다.' 24 136 736 22 $FontSmall $Theme.Muted)
 
@@ -4886,10 +4886,23 @@ $btnOpenLogs.Add_Click({ Start-Process 'explorer.exe' $LogDir })
 $btnOpenLogDir.Add_Click({ Start-Process 'explorer.exe' $LogDir })
 $btnClearLog.Add_Click({ $script:txtLog.Clear() })
 $btnResetConf.Add_Click({
-    if ([System.Windows.Forms.MessageBox]::Show("모든 설정(방 목록, 문구, 첨부)을 지우고 처음 상태로 되돌립니다.`r`n계속할까요?", '설정 초기화', 'YesNo', 'Warning') -ne 'Yes') { return }
+    # 이 PC 에 쌓인 것을 모두 지웁니다. 다른 사람에게 폴더를 넘길 때도 이 버튼을 쓰면 됩니다.
+    $msg = '이 프로그램을 처음 받은 상태로 되돌립니다.' + "`r`n`r`n" +
+           '아래를 모두 지웁니다.' + "`r`n" +
+           '  - 받을 채팅방 목록과 그룹' + "`r`n" +
+           '  - 보낼 문구와 첨부 파일' + "`r`n" +
+           '  - 예약, 반복, 발송 간격 등 모든 설정' + "`r`n" +
+           '  - 지난 실행 기록 (logs 폴더의 기록 파일)' + "`r`n`r`n" +
+           '지운 것은 되돌릴 수 없습니다. 계속할까요?'
+    if ([System.Windows.Forms.MessageBox]::Show($msg, '처음 상태로 되돌리기', 'YesNo', 'Warning') -ne 'Yes') { return }
     $script:config = New-DefaultConfig
     Save-Config $script:config
-    [System.Windows.Forms.MessageBox]::Show('초기화했습니다. 프로그램을 다시 시작합니다.', '설정 초기화') | Out-Null
+    $removed = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $LogDir -Filter '*.log' -File -ErrorAction SilentlyContinue)) {
+        try { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop; $removed++ } catch { }
+    }
+    try { $script:txtLog.Clear() } catch { }
+    [System.Windows.Forms.MessageBox]::Show("처음 상태로 되돌렸습니다. 지난 실행 기록 $($removed)개도 지웠습니다." + "`r`n" + '프로그램을 다시 시작합니다.', '처음 상태로 되돌리기') | Out-Null
     Restart-App
 })
 
