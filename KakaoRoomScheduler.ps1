@@ -1733,10 +1733,13 @@ function Remove-RoomNameNoise([string]$RawName) {
     # 진짜 이름이 숫자로 시작하는 방도 있어서, 뱃지로 확실한 0 과 O 만 뗍니다.
     $name = $name -replace '^[0OoＯ]\s+', ''
     $name = $name -replace '^0(?=[가-힣A-Za-z])', ''
+    # 뱃지 뒤에 기호가 바로 오는 경우도 있습니다. '0※자유 홍보 방' 같은 것입니다.
+    $name = $name -replace '^[0O](?=[^\s0-9A-Za-z가-힣])', ''
     # 이름이 길면 카카오톡이 뒤를 … 로 줄여 보여 줍니다. 그 표시를 뗍니다.
     $name = $name -replace '[…⋯]+\s*$', ''
     # 화면 글자 인식이 줄 끝에 남기는 찌꺼기입니다.
-    $name = $name -replace '[′`´ˊˋ˙·,]+$', ''
+    # 줄 끝에 남는 찌꺼기입니다. '마케팅 자유 홍보.-' 의 '.-' 같은 것입니다.
+    $name = $name -replace '[′`´ˊˋ˙·,\.\-]+$', ''
     # 이모티콘이나 그림 문자는 이름에서 뺍니다. 목록이 읽기 어려워집니다.
     # 뺀 뒤에도 방을 찾는 데는 문제가 없습니다. 방 찾기는 한글·영문·숫자만 견줍니다.
     $kept = New-Object System.Text.StringBuilder
@@ -3091,9 +3094,74 @@ function Open-RoomAtLine([object]$List, [object]$Line, [IntPtr]$MainHandle, [int
 }
 
 # 목록을 훑어 대상 방들을 처리합니다. 결과를 돌려줍니다.
+# 목록에서 이름으로 찾는 방식은 한계가 있습니다.
+# 목록에 보이는 이름은 길면 잘리고, 화면 글자 인식도 가끔 틀립니다.
+#   저장된 '스마트스토어 불로'  <->  실제 '스마트스토어 블로그 인스타그램 홍보방'
+# 그래서 비슷한 다른 줄이 걸려 엉뚱한 방이 열리곤 했습니다.
+#
+# 창을 열고 나면 제목은 정확한 글자로 읽을 수 있습니다. 그것을 기준으로 삼습니다.
+# 열린 방이 우리가 보내려던 방 중 어느 것인지 다시 정하고, 맞으면 그 방으로 보냅니다.
+function Resolve-OpenedRoom([string]$Title, [object]$Pending) {
+    $title = ([string]$Title).Trim()
+    if (-not $title) { return '' }
+    $keyTitle = ConvertTo-CompareKey $title
+    if (-not $keyTitle) { return '' }
+    $best = ''
+    $bestScore = 0.0
+    $secondScore = 0.0
+    foreach ($candidate in @($Pending)) {
+        $name = [string]$candidate
+        if (-not $name) { continue }
+        $keyName = ConvertTo-CompareKey $name
+        if (-not $keyName) { continue }
+        $score = 0.0
+        try { $score = [double](Get-NameSimilarity $title $name) } catch { $score = 0.0 }
+        # 저장된 이름이 잘려 있으면 제목의 앞부분과 같습니다.
+        if ($keyName.Length -ge 4 -and $keyTitle.StartsWith($keyName)) { $score = [Math]::Max($score, 0.95) }
+        if ($keyTitle.Length -ge 4 -and $keyName.StartsWith($keyTitle)) { $score = [Math]::Max($score, 0.90) }
+        # 화면 글자 인식이 한 글자쯤 틀리는 일이 있습니다. (블 -> 불)
+        # 앞부분을 글자 단위로 견주어, 거의 같으면 같은 방으로 봅니다.
+        $shorter = [Math]::Min($keyName.Length, $keyTitle.Length)
+        if ($shorter -ge 6) {
+            $same = 0
+            for ($i = 0; $i -lt $shorter; $i++) { if ($keyName[$i] -eq $keyTitle[$i]) { $same++ } }
+            $ratio = [double]$same / [double]$shorter
+            if ($ratio -ge 0.8) { $score = [Math]::Max($score, 0.85) }
+        }
+        if ($score -gt $bestScore) { $secondScore = $bestScore; $bestScore = $score; $best = $name }
+        elseif ($score -gt $secondScore) { $secondScore = $score }
+    }
+    if ($bestScore -lt 0.62) { return '' }
+    # 두 방이 비슷하게 걸리면 어느 쪽인지 알 수 없습니다. 그때는 보내지 않습니다.
+    if (($bestScore - $secondScore) -lt 0.06) {
+        Write-RunLog "지나감: 열린 방 '$title' 이 보낼 목록의 여러 방과 비슷해 어느 쪽인지 정할 수 없습니다."
+        return ''
+    }
+    return $best
+}
+
+# 다음부터는 헤매지 않도록, 저장된 이름을 실제 창 제목으로 바꿔 둡니다.
+# 목록에서 찾을 때 쓰던 글자는 따로 기억해 둡니다.
+function Update-RoomRealName([string]$OldName, [string]$RealTitle, [string]$ListText) {
+    if (-not $OldName -or -not $RealTitle) { return $OldName }
+    if ($OldName -eq $RealTitle) { return $OldName }
+    try {
+        $type = Get-RoomType $OldName
+        Set-RoomType $RealTitle $type
+        if ($ListText) { Set-RoomListName $RealTitle $ListText }
+        Rename-RoomInGroups $OldName $RealTitle
+        $script:config.Rooms = @(@($script:config.Rooms) | ForEach-Object { if ([string]$_ -eq $OldName) { $RealTitle } else { [string]$_ } } | Select-Object -Unique)
+        $script:config.KnownRooms = @(@($script:config.KnownRooms) | ForEach-Object { if ([string]$_ -eq $OldName) { $RealTitle } else { [string]$_ } } | Select-Object -Unique)
+        Write-RunLog "이름 바로잡음: '$OldName' → '$RealTitle'"
+    } catch { }
+    return $RealTitle
+}
+
 function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPages, [int]$IntervalSeconds, [int]$BatchSize, [int]$BatchRestMinutes) {
     $remaining = @{}
     foreach ($name in $Targets) { $remaining[[string]$name] = $true }
+    # 열어 봤더니 보낼 목록에 없던 줄입니다. 같은 줄을 되풀이해 고르지 않도록 기억합니다.
+    $rejected = @{}
     $sent = 0
     $failed = 0
     $processed = 0
@@ -3120,6 +3188,7 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
             $hit = $null
             $hitName = ''
             foreach ($line in $nameLines) {
+                if ($rejected.ContainsKey((ConvertTo-CompareKey ([string]$line.Text)))) { continue }
                 foreach ($candidate in @($remaining.Keys)) {
                     # 저장된 이름과, 목록에서 글자로 읽히던 이름 둘 다로 찾습니다.
                     $listName = Get-RoomListName $candidate
@@ -3138,16 +3207,35 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
             if ($null -eq $hit) { break }
 
             if (Test-RunInterrupted) { break }
-            $remaining.Remove($hitName)
-            $processed++
-            Set-StatusPill ("발송 중 $($processed)/$($Targets.Count) — $($hitName)") 'run'
 
             $chat = Get-SingleChatWindow (Open-RoomAtLine $list $hit $main.Handle)
             if ($null -eq $chat) {
+                # 이 줄로는 열리지 않습니다. 다시 고르지 않도록 기억해 둡니다.
+                $rejected[(ConvertTo-CompareKey ([string]$hit.Text))] = $true
+                $remaining.Remove($hitName)
+                $processed++
                 $failed++
                 Write-RunLog "건너뜀: '$hitName' — 채팅창을 열지 못했습니다."
             } else {
-                if (Send-ToChatWindow $chat $hitName $Content) { $sent++ } else { $failed++ }
+                # 열린 창 제목이 정답입니다. 목록에서 읽은 이름보다 정확합니다.
+                $openedTitle = ([string]$chat.Title).Trim()
+                $realName = Resolve-OpenedRoom $openedTitle @($remaining.Keys)
+                if (-not $realName) {
+                    # 보내려던 방이 아닙니다. 닫고 이 줄은 다시 고르지 않습니다.
+                    Write-RunLog "지나감: 열린 방 '$openedTitle' 은(는) 보낼 목록에 없습니다."
+                    Close-ChatWindow $chat
+                    $rejected[(ConvertTo-CompareKey ([string]$hit.Text))] = $true
+                    continue
+                }
+                if ($realName -ne $hitName) {
+                    Write-RunLog "바로잡음: '$hitName' 로 찾았는데 실제로 열린 방은 '$realName' 입니다."
+                }
+                $remaining.Remove($realName)
+                $processed++
+                Set-StatusPill ("발송 중 $($processed)/$($Targets.Count) — $($realName)") 'run'
+                # 다음부터 정확히 찾도록 저장된 이름을 실제 제목으로 바꿔 둡니다.
+                $realName = Update-RoomRealName $realName $openedTitle ([string]$hit.Text)
+                if (Send-ToChatWindow $chat $realName $Content) { $sent++ } else { $failed++ }
             }
 
             # 방 간격
@@ -3613,6 +3701,16 @@ if ($SelfTest) {
     # 진짜 이름이 숫자로 시작하는 방을 잘못 깎으면 안 됩니다.
     if ((Remove-RoomNameNoise '5K 디자인') -ne '5K 디자인') { throw '이름 다듬기가 진짜 이름을 깎았습니다' }
     if ((Remove-RoomNameNoise '95 비와이') -ne '95 비와이') { throw '이름 다듬기가 진짜 이름을 깎았습니다 (숫자)' }
+    if ((Remove-RoomNameNoise '0※자유 홍보 방 ※') -ne '※자유 홍보 방 ※') { throw '이름 다듬기 실패 (기호 앞 뱃지)' }
+    if ((Remove-RoomNameNoise '마케팅 자유 홍보.-') -ne '마케팅 자유 홍보') { throw '이름 다듬기 실패 (끝 찌꺼기)' }
+    # 열린 창 제목으로 어느 방인지 다시 정하는 기능입니다.
+    # 목록에서 읽은 이름은 잘리거나 틀릴 수 있지만 창 제목은 정확합니다.
+    $probePending = @('자유홍보 광고/마', '스마트스토어 불로', '전혀 다른 방 이름')
+    if ((Resolve-OpenedRoom '자유홍보 광고/마케팅 공유방' $probePending) -ne '자유홍보 광고/마') { throw '잘린 이름을 제목으로 찾지 못합니다' }
+    if ((Resolve-OpenedRoom '스마트스토어 블로그 인스타그램 홍보방' $probePending) -ne '스마트스토어 불로') { throw '글자 인식이 틀린 이름을 찾지 못합니다' }
+    if ((Resolve-OpenedRoom '무한,광고,홍보,유통,제조,소통,' $probePending) -ne '') { throw '보낼 목록에 없는 방을 같다고 합니다' }
+    # 비슷한 방이 둘이면 어느 쪽인지 알 수 없으므로 보내면 안 됩니다.
+    if ((Resolve-OpenedRoom '홍보방 하나' @('홍보방 하나', '홍보방 하나')) -ne '') { throw '헷갈리는데도 한쪽을 골랐습니다' }
     foreach ($fn in @('Wait-ChatContentSettled', 'Get-ChatListControl', 'Get-ChatInputState')) {
         if (-not (Get-Command $fn -ErrorAction SilentlyContinue)) { throw "필수 기능 누락: $fn" }
     }
