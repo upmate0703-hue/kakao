@@ -2425,7 +2425,32 @@ function Add-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message,
         }
         default { return $false }
     }
-    return ((Get-ChatInputState $InputBox $Message) -eq '그대로')
+    if ((Get-ChatInputState $InputBox $Message) -ne '그대로') { return $false }
+
+    # 글자는 들어갔는데 전송 버튼이 안 켜지는 경우가 있습니다.
+    # 카카오톡이 붙여넣은 글을 사람이 친 것으로 인정하지 않은 것입니다.
+    # 그대로 Enter 를 눌러 봐야 먹통이라, 눌러 보기 전에 여기서 걸러 냅니다.
+    $ready = Test-ChatSendReady $Chat $InputBox
+    if ($ready -ne 'no') { return $true }
+
+    # 바로 포기하지 않고 한 번 깨워 봅니다.
+    # 공백을 하나 넣었다 지우면 진짜 입력이 있었던 것이 되어 버튼이 켜집니다.
+    # 이러면 빠른 붙여넣기를 그대로 쓸 수 있습니다.
+    try {
+        [NativeKakao]::SendChar($InputBox.Handle, 32)
+        Start-Sleep -Milliseconds 140
+        [NativeKakao]::PressKey($InputBox.Handle, 0x08)
+        Start-Sleep -Milliseconds 240
+    } catch { }
+    if ((Get-ChatInputState $InputBox $Message) -ne '그대로') { return $false }
+    if ((Test-ChatSendReady $Chat $InputBox) -ne 'no') {
+        Write-RunLog "'$Way' 로 넣은 뒤 전송 버튼이 꺼져 있어 한 번 깨웠습니다."
+        return $true
+    }
+    # 깨워도 안 켜집니다. 카카오톡이 이 방법으로 넣은 글은 받지 않습니다.
+    # Enter 를 눌러 봐야 먹통이므로 여기서 접고 다른 방법으로 넘어갑니다.
+    Write-RunLog "'$Way' 로 넣었지만 전송 버튼이 켜지지 않아 다른 방법으로 넘어갑니다."
+    return $false
 }
 
 # 글을 보냅니다.
