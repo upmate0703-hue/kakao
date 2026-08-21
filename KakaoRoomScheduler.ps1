@@ -665,8 +665,7 @@ function Repair-RoomNames([object]$Config) {
 
     $Config.KnownRooms = @($names)
     $Config.Rooms = @($names | Where-Object { $picked[(ConvertTo-CompareKey $_)] })
-    $script:lastSendProblem = ''
-$script:roomRepairNote = ''
+    $script:roomRepairNote = ''
     if ($cleaned -gt 0 -or $merged -gt 0) {
         $script:roomRepairNote = "채팅방 목록을 정리했습니다: 이름 다듬음 $($cleaned)개 · 같은 방 합침 $($merged)개"
     }
@@ -1452,10 +1451,22 @@ function Enter-KakaoTab([string]$Type) {
 # ---------------------------------------------------------------------------
 # 클립보드 및 채팅창
 # ---------------------------------------------------------------------------
+# 클립보드에 넣은 뒤 다시 읽어서 정말 들어갔는지 확인합니다.
+# 넣기가 성공한 것처럼 보여도 실제로는 반영되지 않거나
+# 다른 프로그램이 곧바로 덮어쓰는 경우가 있습니다.
+# 확인하지 않고 Ctrl+V 를 누르면 사용자가 복사해 두었던 엉뚱한 내용이 붙습니다.
+function Test-ClipboardHasText([string]$Text) {
+    try { return ([string][System.Windows.Forms.Clipboard]::GetText() -eq $Text) } catch { return $false }
+}
+
 function Set-ClipboardTextSafe([string]$Text) {
-    for ($attempt = 0; $attempt -lt 6; $attempt++) {
-        try { [System.Windows.Forms.Clipboard]::SetText($Text); return }
-        catch { Start-Sleep -Milliseconds 200 }
+    for ($attempt = 0; $attempt -lt 8; $attempt++) {
+        try {
+            [System.Windows.Forms.Clipboard]::SetText($Text)
+            Start-Sleep -Milliseconds 90
+            if (Test-ClipboardHasText $Text) { return }
+        } catch { }
+        Start-Sleep -Milliseconds 180
     }
     throw '클립보드에 문구를 넣지 못했습니다. 다른 프로그램이 클립보드를 사용 중일 수 있습니다.'
 }
@@ -2341,6 +2352,8 @@ function Add-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message,
         '실제 붙여넣기' {
             if (-not (Enter-ChatForeground $Chat $InputBox)) { return $false }
             try { Set-ClipboardTextSafe $Message } catch { return $false }
+            # 누르기 바로 직전에 한 번 더 봅니다. 그 사이 다른 프로그램이 바꿨을 수 있습니다.
+            if (-not (Test-ClipboardHasText $Message)) { return $false }
             [NativeKakao]::PressCtrlKey(0x56)
             Start-Sleep -Milliseconds 380
         }
@@ -2351,6 +2364,7 @@ function Add-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message,
         }
         '창 붙여넣기' {
             try { Set-ClipboardTextSafe $Message } catch { return $false }
+            if (-not (Test-ClipboardHasText $Message)) { return $false }
             [NativeKakao]::PasteInto($InputBox.Handle)
             Start-Sleep -Milliseconds 340
         }
@@ -2883,6 +2897,7 @@ function ConvertTo-SendKeysText([string]$Text) {
 # 채팅창 아래 아이콘이 창 메시지를 받아 주는지 한 번만 확인하고 기억합니다.
 # 안 받아 주는데 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
 $script:toolbarClickNeedsMouse = $false
+$script:savedClipboard = $null
 $script:lastSendProblem = ''
 $script:roomRepairNote = ''
 $script:pendingSwap = ''
@@ -3184,6 +3199,20 @@ function Invoke-Broadcast {
         Write-RunLog "묶음 발송: $($batchSize)개마다 $($batchRest)분 쉽니다."
     }
     Write-RunLog ("작업 시작: 방 {0}개 / 모드={1} / 간격 {2}초" -f $rooms.Count, $mode, $interval)
+    if (-not $dryRun) {
+        Write-RunLog ("보낼 문구 {0}자 / 첨부 {1}개" -f ([string]$script:config.Message).Length, @($script:config.Attachments).Count)
+    }
+    # 글을 붙여넣으려면 클립보드를 써야 합니다.
+    # 사용자가 복사해 두었던 것이 날아가지 않도록 챙겨 두었다가 끝나면 되돌립니다.
+    $script:savedClipboard = $null
+    try { $script:savedClipboard = [string][System.Windows.Forms.Clipboard]::GetText() } catch { }
+    if (-not $dryRun) {
+        Write-RunLog ("보낼 문구 {0}자 / 첨부 {1}개" -f ([string]$script:config.Message).Length, @($script:config.Attachments).Count)
+    }
+    # 글을 붙여넣으려면 클립보드를 써야 합니다.
+    # 사용자가 복사해 두었던 것이 날아가지 않도록 미리 챙겨 두었다가 끝나면 되돌립니다.
+    $script:savedClipboard = $null
+    try { $script:savedClipboard = [string][System.Windows.Forms.Clipboard]::GetText() } catch { }
 
     # PC 카카오톡의 [채팅] 목록에는 일반 채팅방과 오픈채팅방이 함께 들어 있습니다.
     # 그래서 종류로 나누지 않고, 지금 보이는 목록을 한 번 훑어 찾을 수 있는 방을 모두 처리합니다.
@@ -3238,6 +3267,22 @@ function Invoke-Broadcast {
 
     if (@($pending).Count -gt 0) {
         Write-RunLog "처리하지 못한 방 $(@($pending).Count)개: 이름이 카카오톡 표시와 다를 수 있습니다. 체크한 뒤 [이름 확인·보정]을 실행해 보세요."
+    }
+    # 챙겨 두었던 클립보드를 되돌립니다.
+    if ($null -ne $script:savedClipboard -and $script:savedClipboard -ne '') {
+        try {
+            if (-not (Test-ClipboardHasText $script:savedClipboard)) {
+                [System.Windows.Forms.Clipboard]::SetText($script:savedClipboard)
+            }
+        } catch { }
+    }
+    # 챙겨 두었던 클립보드를 되돌립니다.
+    if ($null -ne $script:savedClipboard -and $script:savedClipboard -ne '') {
+        try {
+            if (-not (Test-ClipboardHasText $script:savedClipboard)) {
+                [System.Windows.Forms.Clipboard]::SetText($script:savedClipboard)
+            }
+        } catch { }
     }
     if ($dryRun) {
         # 확인 전용은 아무것도 보내지 않습니다. 완료라고 하면 보낸 줄 알게 됩니다.
