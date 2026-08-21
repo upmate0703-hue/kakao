@@ -5135,7 +5135,8 @@ function Show-SendConfirm([string]$Action) {
     $list.Size = New-Object System.Drawing.Size(520, 200)
     [void]$list.Columns.Add('채팅방 이름', 380)
     [void]$list.Columns.Add('종류', 120)
-    foreach ($entry in ($rooms | Sort-Object -Property Type, Name)) {
+    # 보내기 전 확인 목록도 종류로 묶지 않고 이름 순서로 보여 줍니다.
+    foreach ($entry in ($rooms | Sort-Object -Property Name)) {
         $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Name)
         [void]$item.SubItems.Add([string]$entry.Type)
         [void]$list.Items.Add($item)
