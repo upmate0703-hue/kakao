@@ -84,6 +84,16 @@ public static class NativeKakao {
         PostMessageW(hWnd, 0x00F5, IntPtr.Zero, IntPtr.Zero);
     }
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessageText(IntPtr hWnd, uint msg, IntPtr wParam, string lParam);
+
+    // 입력칸에 글을 끼워 넣습니다. EM_REPLACESEL 입니다.
+    // 실제로 확인해 보니 카카오톡은 이 방법으로 넣은 글도 사람이 친 것으로 인정합니다.
+    // (전송 버튼이 노랗게 켜집니다)
+    // 줄바꿈이 있는 글도 한 번에 들어가고, 클립보드도 창 활성화도 필요 없습니다.
+    public static void ReplaceSelection(IntPtr hWnd, string text) {
+        SendMessageText(hWnd, 0x00C2, (IntPtr)1, text);
+    }
+
     static WindowInfo Describe(IntPtr hWnd, uint pid) {
         var title = new StringBuilder(512);
         var cls = new StringBuilder(256);
@@ -2122,6 +2132,8 @@ function Enter-ChatForeground([object]$Chat, [object]$InputBox) {
 # 실제 키보드 입력으로 붙여넣고 보냅니다. 성공은 입력칸이 비워졌는지로 판단합니다.
 # 입력칸에 우리가 넣은 글이 그대로 남아 있는지 봅니다.
 # 비어 있으면 이미 전송된 것이므로 다시 보내면 안 됩니다. 두 번 가 버립니다.
+# 입력칸에 우리가 넣은 글이 그대로 남아 있는지 봅니다.
+# 비어 있으면 이미 전송된 것이므로 다시 보내면 안 됩니다. 두 번 가 버립니다.
 function Get-ChatInputState([object]$InputBox, [string]$Message) {
     if (-not (Test-ControlAlive $InputBox)) { return '사라짐' }
     $written = [string](Get-ChatInputText $InputBox)
@@ -2130,77 +2142,105 @@ function Get-ChatInputState([object]$InputBox, [string]$Message) {
     return '다름'
 }
 
-# 글을 넣습니다. 붙여넣기가 먼저, 안 되면 실제 키 입력입니다.
-function Set-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message) {
+# 입력칸을 비웁니다. 창을 앞으로 가져오지 않습니다.
+function Reset-ChatInput([object]$InputBox) {
+    if ([string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) { return }
+    [NativeKakao]::SelectAllIn($InputBox.Handle)
+    [NativeKakao]::ReplaceSelection($InputBox.Handle, '')
+    Start-Sleep -Milliseconds 120
     if (-not [string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) {
-        [NativeKakao]::PressCtrlKey(0x41)
-        [NativeKakao]::PressPlainKey(0x2E)
+        [NativeKakao]::SelectAllIn($InputBox.Handle)
+        [NativeKakao]::ClearSelection($InputBox.Handle)
         Start-Sleep -Milliseconds 120
     }
-    $pasted = $false
-    try {
-        Set-ClipboardTextSafe $Message
-        [NativeKakao]::PressCtrlKey(0x56)
-        Start-Sleep -Milliseconds 320
-        $pasted = $true
-    } catch {
-        Write-RunLog '클립보드를 쓰지 못해 직접 입력으로 넘어갑니다.'
-    }
-    if ((Get-ChatInputState $InputBox $Message) -ne '그대로') {
-        if (-not [string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) {
-            [NativeKakao]::PressCtrlKey(0x41)
-            [NativeKakao]::PressPlainKey(0x2E)
+}
+
+# 글을 입력칸에 넣습니다.
+# 컴퓨터마다 되고 안 되고가 갈리던 이유가 여기에 있었습니다.
+# 예전에는 클립보드를 먼저 쓰고, 안 되면 창을 앞으로 가져와 키보드로 쳤습니다.
+# 그런데 클립보드는 다른 프로그램이 잡고 있으면 못 쓰고,
+# 창을 앞으로 가져오는 것도 윈도우가 막는 경우가 있습니다.
+# 둘 다 그 컴퓨터가 그때 어떤 상태냐에 따라 달라집니다.
+# 그래서 클립보드도 창 활성화도 필요 없는 방법을 먼저 씁니다.
+function Set-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message) {
+    # 1순위: 창 메시지로 끼워 넣기. 줄바꿈까지 한 번에 들어갑니다.
+    Reset-ChatInput $InputBox
+    [NativeKakao]::ReplaceSelection($InputBox.Handle, $Message)
+    Start-Sleep -Milliseconds 260
+    if ((Get-ChatInputState $InputBox $Message) -eq '그대로') { return '창 메시지' }
+
+    # 2순위: 한 글자씩 넣기. 줄바꿈은 다시 창 메시지로 넣습니다.
+    Reset-ChatInput $InputBox
+    $lines = @($Message -split "`r?`n")
+    $first = $true
+    foreach ($line in $lines) {
+        if (-not $first) {
+            [NativeKakao]::ReplaceSelection($InputBox.Handle, [string][char]13)
             Start-Sleep -Milliseconds 120
         }
+        if ($line) { [NativeKakao]::TypeText($InputBox.Handle, $line) }
+        Start-Sleep -Milliseconds 160
+        $first = $false
+    }
+    Start-Sleep -Milliseconds 240
+    if ((Get-ChatInputState $InputBox $Message) -eq '그대로') { return '한 글자씩' }
+
+    # 3순위: 클립보드 붙여넣기. 다른 프로그램이 잡고 있으면 실패합니다.
+    try {
+        Reset-ChatInput $InputBox
+        Set-ClipboardTextSafe $Message
+        [NativeKakao]::PasteInto($InputBox.Handle)
+        Start-Sleep -Milliseconds 320
+        if ((Get-ChatInputState $InputBox $Message) -eq '그대로') { return '붙여넣기' }
+    } catch { }
+
+    # 4순위: 창을 앞으로 가져와 실제 키보드로 칩니다. 윈도우가 막으면 실패합니다.
+    if (Enter-ChatForeground $Chat $InputBox) {
+        Reset-ChatInput $InputBox
         [System.Windows.Forms.SendKeys]::SendWait((ConvertTo-SendKeysText $Message))
         Start-Sleep -Milliseconds 400
-        $pasted = $false
+        if ((Get-ChatInputState $InputBox $Message) -eq '그대로') { return '실제 키보드' }
     }
-    return $pasted
+    return ''
 }
 
 # 글을 보냅니다.
-# 오픈채팅처럼 대화가 아직 불러와지는 중이면 Enter 가 먹지 않습니다.
-# 그래서 한 번 보내고 끝내지 않고, 확인해서 안 갔으면 기다렸다 다시 보냅니다.
-# 다시 보내기 전에 입력칸을 꼭 확인합니다. 비어 있으면 이미 간 것이라 다시 보내면
-# 같은 글이 두 번 갑니다.
+# 창을 앞으로 가져오지 못해도 포기하지 않습니다.
+# 실제로 확인해 보니 창 메시지로 보낸 키도 카카오톡이 그대로 받습니다.
+# (백스페이스, 방향키, 글자 모두 창을 앞으로 가져오지 않고 동작했습니다)
+# 오픈채팅처럼 대화를 아직 불러오는 중이면 Enter 가 먹지 않으므로,
+# 한 번 보내고 끝내지 않고 확인해서 안 갔으면 기다렸다 다시 보냅니다.
+# 다시 보내기 전에 입력칸을 꼭 봅니다. 비어 있으면 이미 간 것이라
+# 다시 보내면 같은 글이 두 번 갑니다.
 function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]$SettleMs = 4000) {
-    if (-not (Enter-ChatForeground $Chat $InputBox)) {
-        Write-RunLog '경고: 채팅창을 앞으로 가져오지 못했습니다.'
-        return ''
-    }
     # 아직 불러오는 중이면 여기서 기다립니다.
     [void](Wait-ChatContentSettled $Chat $SettleMs)
 
-    $pasted = Set-ChatMessageText $Chat $InputBox $Message
-    $state = Get-ChatInputState $InputBox $Message
-    if ($state -ne '그대로') {
-        Write-RunLog "건너뜀: 입력칸 내용이 문구와 다릅니다. (전송하지 않음)"
+    $way = Set-ChatMessageText $Chat $InputBox $Message
+    if (-not $way) {
+        Write-RunLog '건너뜀: 입력칸에 문구를 넣지 못했습니다. (전송하지 않음)'
         return ''
     }
 
-    $base = '직접 입력'
-    if ($pasted) { $base = '붙여넣기' }
     $tries = @(
-        [pscustomobject]@{ Name = 'Enter (실제 키 입력)'; Act = {
-            if (Enter-ChatForeground $Chat $InputBox) { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') } } },
-        [pscustomobject]@{ Name = '입력칸에 Enter 키'; Act = { [NativeKakao]::PressKey($InputBox.Handle, 0x0D) } },
-        [pscustomobject]@{ Name = 'Enter (실제 키 입력, 재시도)'; Act = {
-            if (Enter-ChatForeground $Chat $InputBox) { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') } } },
-        [pscustomobject]@{ Name = '채팅창에 Enter 키'; Act = { [NativeKakao]::PressKey($Chat.Handle, 0x0D) } }
+        [pscustomobject]@{ Name = '입력칸에 Enter'; Act = { [NativeKakao]::PressKey($InputBox.Handle, 0x0D) } },
+        [pscustomobject]@{ Name = '입력칸에 Enter 다시'; Act = { [NativeKakao]::PressKey($InputBox.Handle, 0x0D) } },
+        [pscustomobject]@{ Name = '채팅창에 Enter'; Act = { [NativeKakao]::PressKey($Chat.Handle, 0x0D) } },
+        [pscustomobject]@{ Name = '창을 앞으로 가져와 Enter'; Act = {
+            if (Enter-ChatForeground $Chat $InputBox) { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') } } }
     )
     $attempt = 0
     foreach ($try in $tries) {
         $attempt++
         $state = Get-ChatInputState $InputBox $Message
-        if ($state -eq '비어있음') { return ($base + ' + ' + $try.Name) }
+        if ($state -eq '비어있음') { return ($way + ' + ' + $try.Name) }
         if ($state -eq '사라짐') { return '' }
         if ($state -eq '다름') {
             Write-RunLog '건너뜀: 보내는 도중 입력칸 내용이 바뀌었습니다. (전송하지 않음)'
             return ''
         }
         try { & $try.Act } catch { continue }
-        if (Wait-ChatInputCleared $InputBox 2200) { return ($base + ' + ' + $try.Name) }
+        if (Wait-ChatInputCleared $InputBox 2200) { return ($way + ' + ' + $try.Name) }
         # 아직 불러오는 중이라 안 먹었을 수 있습니다. 잠깐 기다렸다 다시 해 봅니다.
         if ($attempt -lt $tries.Count) { [void](Wait-ChatContentSettled $Chat 2500) }
     }
@@ -2316,23 +2356,38 @@ function Close-KakaoPreview([object]$Preview) {
 }
 
 # 미리보기 창의 [전송] 을 누릅니다. 창 아래 가운데에 넓게 있는 단추입니다.
-# 이 창도 카카오톡이 직접 그려서 창 메시지를 받지 않으므로 실제 마우스로 누릅니다.
+# 한 가지 방법만 쓰면 컴퓨터에 따라 안 눌립니다.
+# 창 메시지 클릭 → 실제 마우스 클릭 → Enter 순서로 해 보고, 창이 닫히면 성공입니다.
 function Submit-KakaoPreview([object]$Preview, [int]$TimeoutMs) {
     $window = [NativeKakao]::GetWindow($Preview.Handle)
     if ($null -eq $window -or $window.Width -le 0) { return '미리보기 창이 사라짐' }
-    if (-not [NativeKakao]::ForceForeground($window.Handle)) { return '미리보기 창을 앞으로 가져오지 못함' }
-    Start-Sleep -Milliseconds 250
-    if ([NativeKakao]::GetForegroundWindow() -ne $window.Handle) { return '미리보기 창이 앞에 오지 않음' }
     $x = $window.Rect.Left + [int]($window.Width / 2)
     $y = $window.Rect.Bottom - 24
-    Invoke-PointClick $x $y $false
-    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
-    while ((Get-Date) -lt $deadline) {
-        $still = [NativeKakao]::GetWindow($Preview.Handle)
-        if ($null -eq $still -or -not $still.Visible) { return '' }
-        Start-Sleep -Milliseconds 120
+    $each = [Math]::Max(1200, [int]($TimeoutMs / 3))
+    $lastReason = '전송을 눌렀지만 미리보기 창이 닫히지 않음'
+
+    $ways = @(
+        [pscustomobject]@{ Name = '창 메시지 클릭'; Act = {
+            [NativeKakao]::ClickControl($window.Handle, $x, $y, $false) } },
+        [pscustomobject]@{ Name = '실제 마우스 클릭'; Act = {
+            if ([NativeKakao]::ForceForeground($window.Handle)) {
+                Start-Sleep -Milliseconds 250
+                if ([NativeKakao]::GetForegroundWindow() -eq $window.Handle) { Invoke-PointClick $x $y $false }
+            } } },
+        [pscustomobject]@{ Name = 'Enter'; Act = {
+            [NativeKakao]::PressKey($window.Handle, 0x0D) } }
+    )
+    foreach ($way in $ways) {
+        try { & $way.Act } catch { $lastReason = $way.Name + ' 도중 문제: ' + $_.Exception.Message; continue }
+        $deadline = (Get-Date).AddMilliseconds($each)
+        while ((Get-Date) -lt $deadline) {
+            $still = [NativeKakao]::GetWindow($Preview.Handle)
+            if ($null -eq $still -or -not $still.Visible) { return '' }
+            Start-Sleep -Milliseconds 120
+        }
+        $lastReason = $way.Name + ' 으로는 닫히지 않음'
     }
-    return '전송을 눌렀지만 미리보기 창이 닫히지 않음'
+    return $lastReason
 }
 
 # 입력칸 아래 아이콘 줄의 위치입니다. (창 안에서의 좌표)
@@ -3425,7 +3480,12 @@ function Exit-SingleInstance {
 }
 
 # 진단용 실행은 막지 않습니다.
-if (-not (Enter-SingleInstance)) { exit 0 }
+# 점검 모드는 화면을 만들어 보기만 하고 카카오톡을 건드리지 않습니다.
+# 실행 중인 앱과 겹쳐도 문제가 없으므로 중복 실행 검사를 건너뜁니다.
+# 이걸 안 하면 앱을 켜 둔 채로는 점검을 돌릴 수 없습니다.
+if (-not $UiSmokeTest) {
+    if (-not (Enter-SingleInstance)) { exit 0 }
+}
 
 # ---------------------------------------------------------------------------
 # 디자인 토큰
