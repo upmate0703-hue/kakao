@@ -534,6 +534,9 @@ function New-DefaultConfig {
         AttachmentWaitMs = 1500
         OpenTimeoutMs = 8000
         SettleMs = 4000
+        PreloadRooms = $true
+        PreloadDone = $false
+        TruncatedRooms = @()
         AutoCheckUpdate = $true
         TourDone = $false
         Calibration = [pscustomobject]@{
@@ -1382,6 +1385,9 @@ function Test-RoomTitle([string]$Actual, [string]$Expected) {
     if ($keyActual -match ('^' + [regex]::Escape($keyExpected) + '\d{1,4}$')) { return $true }
 
     # 여기부터는 잘린 이름 처리입니다.
+    # 실제로 잘려 있던 이름에만 씁니다. 그러지 않으면
+    # "우리반 공지방" 이 "우리반 공지방 2기" 와 같은 방으로 보입니다.
+    if (-not (Test-TruncatedRoom $e)) { return $false }
     if ($keyExpected.Length -lt 6) { return $false }
     if (-not $keyActual.StartsWith($keyExpected)) { return $false }
     # 저장된 방 중에 같은 앞부분을 가진 방이 딱 하나일 때만 인정합니다.
@@ -1392,7 +1398,10 @@ function Test-RoomTitle([string]$Actual, [string]$Expected) {
         foreach ($known in @($script:config.KnownRooms)) {
             $keyKnown = ConvertTo-CompareKey ([string]$known)
             if (-not $keyKnown) { continue }
-            if ($keyKnown.StartsWith($keyExpected) -or $keyExpected.StartsWith($keyKnown)) { $sameStart++ }
+            # 저장된 이름이 잘린 이름으로 시작하는 경우만 셉니다.
+            # 반대 방향까지 세면 짧은 이름의 다른 방까지 걸려들어
+            # 엉뚱한 방을 같은 방으로 볼 수 있습니다.
+            if ($keyKnown.StartsWith($keyExpected)) { $sameStart++ }
         }
     } catch { return $false }
     if ($sameStart -ne 1) { return $false }
@@ -1608,10 +1617,29 @@ function Remove-RoomNameNoise([string]$RawName) {
     return $name.Trim()
 }
 
+# 카카오톡 목록은 긴 이름의 뒤를 … 로 줄여 보여 줍니다.
+# 그렇게 잘린 이름은 창 제목과 정확히 같을 수가 없어서 앞부분으로 견줘야 합니다.
+# 다만 앞부분 비교는 위험합니다. "우리반 공지방" 과 "우리반 공지방 2기" 를
+# 같은 방으로 볼 수 있기 때문입니다.
+# 그래서 실제로 잘려 있던 이름만 따로 기억해 두고, 그 이름에만 앞부분 비교를 씁니다.
+function Add-TruncatedRoom([string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Name)) { return }
+    try {
+        $list = @($script:config.TruncatedRooms)
+        if ($list -contains $Name) { return }
+        $script:config.TruncatedRooms = @($list + $Name)
+    } catch { }
+}
+
+function Test-TruncatedRoom([string]$Name) {
+    try { return (@($script:config.TruncatedRooms) -contains $Name) } catch { return $false }
+}
+
 function ConvertTo-RoomCandidate([string]$RawName) {
     if ([string]::IsNullOrWhiteSpace($RawName)) { return $null }
     $parts = @($RawName -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if ($parts.Count -eq 0) { return $null }
+    $wasTruncated = ($parts[0] -match '[…⋯]\s*$')
     $name = Remove-RoomNameNoise $parts[0]
     if ($name.Length -lt 2 -or $name.Length -gt 60) { return $null }
     if ($name -notmatch '[0-9A-Za-z가-힣]') { return $null }
@@ -1623,6 +1651,7 @@ function ConvertTo-RoomCandidate([string]$RawName) {
     if ($name -match '^안 읽은 메시지') { return $null }
     if ($name -match '^\d+개') { return $null }
     if ($name -in $script:RoomNoiseLabels) { return $null }
+    if ($wasTruncated) { Add-TruncatedRoom $name }
     return $name
 }
 
@@ -2950,6 +2979,36 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
     }
 }
 
+# 카카오톡을 막 켰거나 이 프로그램을 처음 쓰는 경우,
+# 채팅방마다 대화를 처음부터 새로 불러옵니다. 방에 따라 12초까지 걸립니다.
+# 다 불러오기 전에는 Enter 를 눌러도 전송이 되지 않습니다.
+# 그래서 보내기 전에 대상 방을 한 번씩 열어 두면 이후가 훨씬 안정적입니다.
+# 한 번 열어 둔 방은 카카오톡이 기억하고 있어서 다음부터는 금방 열립니다.
+function Invoke-RoomPreload([string[]]$Rooms) {
+    $targets = @($Rooms | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
+    if ($targets.Count -eq 0) { return $false }
+    Write-RunLog "방 미리 열기: $($targets.Count)개를 한 번씩 열어 대화가 다 불러와지는지 봅니다."
+    Write-RunLog '보내지 않습니다. 처음 한 번만 하면 되고, 이후 발송이 훨씬 안정적입니다.'
+    $content = New-SendContent $true
+    # 미리 열 때는 넉넉히 기다립니다. 여기서 오래 걸려도 실제 발송이 빨라집니다.
+    $content.OpenTimeoutMs = [Math]::Max(12000, [int]$content.OpenTimeoutMs)
+    $content.SettleMs = [Math]::Max(8000, [int]$content.SettleMs)
+    $outcome = $null
+    try {
+        $outcome = Invoke-SweepOverList $targets $content ([int]$script:config.ScanPages) 0 0 0
+    } catch {
+        Write-RunLog "방 미리 열기 중단: $($_.Exception.Message)"
+        return $false
+    }
+    if ($null -eq $outcome) { return $false }
+    $missed = @($outcome.NotFound)
+    Write-RunLog "방 미리 열기 끝: 확인 $($outcome.Sent)개 / 열지 못함 $($outcome.Failed)개 / 목록에서 못 찾음 $($missed.Count)개"
+    if ($missed.Count -gt 0) {
+        Write-RunLog "  못 찾은 방: $(($missed | Select-Object -First 5) -join ', ')$(if ($missed.Count -gt 5) { ' 외 ' + ($missed.Count - 5) + '개' } else { '' })"
+    }
+    return $true
+}
+
 function New-SendContent([bool]$DryRun) {
     return [pscustomobject]@{
         Message = [string]$script:config.Message
@@ -2994,6 +3053,15 @@ function Invoke-Broadcast {
     # 그러고도 못 찾은 방이 있으면 다른 탭으로 바꿔 한 번 더 훑습니다.
     $ready = Test-KakaoReady $true $false
     if (-not $ready.Ok) { throw $ready.Reason }
+
+    # 처음 보내는 경우에는 대상 방을 먼저 한 번씩 열어 둡니다.
+    # 대화를 불러오는 중에는 전송이 먹지 않기 때문입니다.
+    if ((-not $dryRun) -and [bool]$script:config.PreloadRooms -and (-not [bool]$script:config.PreloadDone)) {
+        [void](Invoke-RoomPreload $rooms)
+        $script:config.PreloadDone = $true
+        try { Save-Config $script:config } catch { }
+        Write-RunLog '이제 실제 발송을 시작합니다.'
+    }
 
     $totalSent = 0
     $totalFailed = 0
@@ -3210,7 +3278,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'AutoCheckUpdate', 'TourDone', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'AutoCheckUpdate', 'TourDone', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -3224,6 +3292,19 @@ if ($SelfTest) {
     if ((ConvertTo-RoomCandidate "테스트 채팅방`r`n안녕하세요") -ne '테스트 채팅방') { throw '후보 추출 자체 점검 실패' }
     if (-not (Test-RoomTitle '우리반 공지방 (24)' '우리반 공지방')) { throw '창 제목 비교 자체 점검 실패' }
     if (Test-RoomTitle '우리반 공지방 2기' '우리반 공지방') { throw '창 제목 비교가 너무 느슨합니다' }
+    # 이름이 잘린 방은 앞부분으로 찾을 수 있어야 합니다.
+    $savedTrunc = @($script:config.TruncatedRooms)
+    $savedKnown = @($script:config.KnownRooms)
+    try {
+        $script:config.TruncatedRooms = @('길게 쓴 방이름')
+        $script:config.KnownRooms = @('길게 쓴 방이름')
+        if (-not (Test-RoomTitle '길게 쓴 방이름입니다 진짜' '길게 쓴 방이름')) { throw '잘린 이름을 찾지 못합니다' }
+        $script:config.KnownRooms = @('길게 쓴 방이름', '길게 쓴 방이름 둘째')
+        if (Test-RoomTitle '길게 쓴 방이름입니다 진짜' '길게 쓴 방이름') { throw '헷갈리는 방인데도 같다고 합니다' }
+    } finally {
+        $script:config.TruncatedRooms = $savedTrunc
+        $script:config.KnownRooms = $savedKnown
+    }
     if ((Remove-RoomNameNoise '0 홍보방') -ne '홍보방') { throw '이름 다듬기 자체 점검 실패 (안읽음 뱃지)' }
     if ((Remove-RoomNameNoise '긴 방이름입니다…') -ne '긴 방이름입니다') { throw '이름 다듬기 자체 점검 실패 (잘림 표시)' }
     # 진짜 이름이 숫자로 시작하는 방을 잘못 깎으면 안 됩니다.
@@ -3483,7 +3564,7 @@ function Exit-SingleInstance {
 # 점검 모드는 화면을 만들어 보기만 하고 카카오톡을 건드리지 않습니다.
 # 실행 중인 앱과 겹쳐도 문제가 없으므로 중복 실행 검사를 건너뜁니다.
 # 이걸 안 하면 앱을 켜 둔 채로는 점검을 돌릴 수 없습니다.
-if (-not $UiSmokeTest) {
+if (-not $UiSmokeTest -and -not $ScreenshotDir) {
     if (-not (Enter-SingleInstance)) { exit 0 }
 }
 
@@ -4112,58 +4193,19 @@ if ($script:dtSchedule.Value -lt $script:dtSchedule.MinDate -or $script:dtSchedu
 $cardSchedule.Controls.Add($script:dtSchedule)
 
 $btnPickSchedule = New-AppButton $cardSchedule '달력에서 고르기' 254 78 148 32
-[void](New-CardLabel $cardSchedule '방 사이 간격(초) — 0이면 쉬지 않음' 424 56 300 22 $FontSmall $Theme.Muted)
-$script:numInterval = New-Object System.Windows.Forms.NumericUpDown
-$script:numInterval.Minimum = 0
-$script:numInterval.Maximum = 300
-$script:numInterval.Value = [Math]::Max(0, [Math]::Min(300, [int]$script:config.IntervalSeconds))
-$script:numInterval.Location = New-Object System.Drawing.Point(424, 80)
-$script:numInterval.Size = New-Object System.Drawing.Size(94, 30)
-$script:numInterval.Font = $FontBase
-$script:numInterval.BorderStyle = 'FixedSingle'
-$cardSchedule.Controls.Add($script:numInterval)
-
 $btnRunNow    = New-AppButton $cardSchedule '지금 실행' 24 134 164 46 'primary'
 $btnArm       = New-AppButton $cardSchedule '예약 시작' 200 134 164 46
 $btnCancelArm = New-AppButton $cardSchedule '예약 취소' 376 134 164 46
 $btnSave      = New-AppButton $cardSchedule '설정 저장' 552 134 164 46 'ghost'
 $btnCancelArm.Enabled = $false
 
-# ----- 반복 발송 -----
-$script:chkRepeat = New-Object System.Windows.Forms.CheckBox
-$script:chkRepeat.Text = '반복 발송 — 한 번 다 보낸 뒤 일정 시간마다 다시 보내기'
-$script:chkRepeat.Checked = [bool]$script:config.RepeatEnabled
-$script:chkRepeat.Location = New-Object System.Drawing.Point(24, 192)
-$script:chkRepeat.Size = New-Object System.Drawing.Size(430, 28)
-$script:chkRepeat.BackColor = $Theme.Card
-$script:chkRepeat.Font = $FontBase
-$cardSchedule.Controls.Add($script:chkRepeat)
-
-$script:numRepeatMinutes = New-Object System.Windows.Forms.NumericUpDown
-$script:numRepeatMinutes.Minimum = 1
-$script:numRepeatMinutes.Maximum = 1440
-$script:numRepeatMinutes.Value = [Math]::Max(1, [Math]::Min(1440, [int]$script:config.RepeatMinutes))
-$script:numRepeatMinutes.Location = New-Object System.Drawing.Point(462, 190)
-$script:numRepeatMinutes.Size = New-Object System.Drawing.Size(80, 30)
-$script:numRepeatMinutes.Font = $FontBase
-$script:numRepeatMinutes.BorderStyle = 'FixedSingle'
-$cardSchedule.Controls.Add($script:numRepeatMinutes)
-[void](New-CardLabel $cardSchedule '분마다 ·  최대' 548 194 92 24 $FontSmall $Theme.Muted)
-
-$script:numRepeatCount = New-Object System.Windows.Forms.NumericUpDown
-$script:numRepeatCount.Minimum = 0
-$script:numRepeatCount.Maximum = 999
-$script:numRepeatCount.Value = [Math]::Max(0, [Math]::Min(999, [int]$script:config.RepeatCount))
-$script:numRepeatCount.Location = New-Object System.Drawing.Point(642, 190)
-$script:numRepeatCount.Size = New-Object System.Drawing.Size(70, 30)
-$script:numRepeatCount.Font = $FontBase
-$script:numRepeatCount.BorderStyle = 'FixedSingle'
-$cardSchedule.Controls.Add($script:numRepeatCount)
-[void](New-CardLabel $cardSchedule '회' 718 194 30 24 $FontSmall $Theme.Muted)
-[void](New-CardLabel $cardSchedule '최대 횟수를 0으로 두면 [예약 취소]를 누를 때까지 계속 반복합니다.' 24 224 736 22 $FontSmall $Theme.Muted)
-
+# 간격과 반복은 [설정] 화면 한 곳에서만 정합니다.
+# 두 화면에 같은 항목이 있으면 어느 쪽이 진짜인지 헷갈립니다.
+# 여기서는 지금 어떻게 설정돼 있는지만 보여 줍니다.
+$script:lblRunPace = New-CardLabel $cardSchedule '' 24 194 540 52 $FontBase $Theme.Sub
+$btnGoPaceSettings = New-AppButton $cardSchedule '설정에서 바꾸기' 576 196 184 44
 $script:lblCountdown = New-CardLabel $cardSchedule '예약이 설정되지 않았습니다.' 24 250 736 26 $FontStrong $Theme.Muted
-[void](New-CardLabel $cardSchedule '방해금지 시간대, 주말·공휴일 제외, 묶음 발송 같은 상세 설정은 [설정] 화면에 있습니다.' 24 282 736 22 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardSchedule '발송 간격, 반복, 방해금지, 묶음 발송 등 모든 설정은 [설정] 화면 한 곳에 있습니다.' 24 282 736 22 $FontSmall $Theme.Muted)
 [void](New-CardLabel $cardSchedule '예약 시각까지 이 프로그램과 PC 카카오톡을 모두 켜 두어야 합니다. 화면 잠금·절전 상태에서는 동작하지 않습니다.' 24 304 736 22 $FontSmall $Theme.Muted)
 
 # ===========================================================================
@@ -4210,7 +4252,91 @@ $btnResetConf  = New-AppButton $cardFolders '처음 상태로 되돌리기' 534 
 
 # ===========================================================================
 
-$cardLimit = New-Card $pageSettings 28 704 784 306 '발송 제한 및 묶음 발송' '보내면 안 되는 시간과 날짜, 그리고 몇 개마다 쉴지 정할 수 있습니다.'
+# 발송이 어떤 속도로 진행되는지 정하는 곳입니다.
+# 예전에는 간격과 반복이 [보내기] 화면에, 나머지가 [설정] 화면에 흩어져 있어서
+# 어디서 바꿔야 하는지 헷갈렸습니다. 이제 모두 여기 모았습니다.
+$cardPace = New-Card $pageSettings 28 704 784 316 '발송 진행 방식' '방 사이 간격, 기다리는 시간, 반복을 여기서 정합니다. [보내기] 화면에는 요약만 보입니다.'
+
+[void](New-CardLabel $cardPace '방 사이 간격' 24 82 110 24 $FontSmall $Theme.Muted)
+$script:numInterval = New-Object System.Windows.Forms.NumericUpDown
+$script:numInterval.Minimum = 0
+$script:numInterval.Maximum = 300
+$script:numInterval.Value = [Math]::Max(0, [Math]::Min(300, [int]$script:config.IntervalSeconds))
+$script:numInterval.Location = New-Object System.Drawing.Point(144, 78)
+$script:numInterval.Size = New-Object System.Drawing.Size(80, 30)
+$script:numInterval.Font = $FontBase
+$script:numInterval.BorderStyle = 'FixedSingle'
+$cardPace.Controls.Add($script:numInterval)
+[void](New-CardLabel $cardPace '초 — 0이면 쉬지 않고 바로 다음 방으로 갑니다' 234 82 520 24 $FontSmall $Theme.Muted)
+
+[void](New-CardLabel $cardPace '방 열림 대기' 24 124 110 24 $FontSmall $Theme.Muted)
+$script:numOpenTimeout = New-Object System.Windows.Forms.NumericUpDown
+$script:numOpenTimeout.Minimum = 3
+$script:numOpenTimeout.Maximum = 60
+$script:numOpenTimeout.Value = [Math]::Max(3, [Math]::Min(60, [int]([Math]::Round([int]$script:config.OpenTimeoutMs / 1000))))
+$script:numOpenTimeout.Location = New-Object System.Drawing.Point(144, 120)
+$script:numOpenTimeout.Size = New-Object System.Drawing.Size(80, 30)
+$script:numOpenTimeout.Font = $FontBase
+$script:numOpenTimeout.BorderStyle = 'FixedSingle'
+$cardPace.Controls.Add($script:numOpenTimeout)
+[void](New-CardLabel $cardPace '초까지 방이 열리기를 기다립니다 (대화가 많은 방은 늘리세요)' 234 124 520 24 $FontSmall $Theme.Muted)
+
+[void](New-CardLabel $cardPace '대화 로딩 대기' 24 166 110 24 $FontSmall $Theme.Muted)
+$script:numSettle = New-Object System.Windows.Forms.NumericUpDown
+$script:numSettle.Minimum = 0
+$script:numSettle.Maximum = 30
+$script:numSettle.Value = [Math]::Max(0, [Math]::Min(30, [int]([Math]::Round([int]$script:config.SettleMs / 1000))))
+$script:numSettle.Location = New-Object System.Drawing.Point(144, 162)
+$script:numSettle.Size = New-Object System.Drawing.Size(80, 30)
+$script:numSettle.Font = $FontBase
+$script:numSettle.BorderStyle = 'FixedSingle'
+$cardPace.Controls.Add($script:numSettle)
+[void](New-CardLabel $cardPace '초 동안 화면이 멈추기를 기다린 뒤 보냅니다 (오픈채팅은 늘리세요)' 234 166 520 24 $FontSmall $Theme.Muted)
+
+$script:chkPreload = New-Object System.Windows.Forms.CheckBox
+$script:chkPreload.Text = '처음 보내기 전에 대상 채팅방을 모두 한 번씩 열어 둡니다'
+$script:chkPreload.Checked = [bool]$script:config.PreloadRooms
+$script:chkPreload.Location = New-Object System.Drawing.Point(24, 208)
+$script:chkPreload.Size = New-Object System.Drawing.Size(500, 28)
+$script:chkPreload.BackColor = $Theme.Card
+$script:chkPreload.Font = $FontBase
+$cardPace.Controls.Add($script:chkPreload)
+$btnPreloadNow = New-AppButton $cardPace '지금 미리 열기' 576 204 184 36
+
+$script:chkRepeat = New-Object System.Windows.Forms.CheckBox
+$script:chkRepeat.Text = '다 보낸 뒤 일정 시간마다 다시 보내기'
+$script:chkRepeat.Checked = [bool]$script:config.RepeatEnabled
+$script:chkRepeat.Location = New-Object System.Drawing.Point(24, 250)
+$script:chkRepeat.Size = New-Object System.Drawing.Size(330, 28)
+$script:chkRepeat.BackColor = $Theme.Card
+$script:chkRepeat.Font = $FontBase
+$cardPace.Controls.Add($script:chkRepeat)
+
+$script:numRepeatMinutes = New-Object System.Windows.Forms.NumericUpDown
+$script:numRepeatMinutes.Minimum = 1
+$script:numRepeatMinutes.Maximum = 1440
+$script:numRepeatMinutes.Value = [Math]::Max(1, [Math]::Min(1440, [int]$script:config.RepeatMinutes))
+$script:numRepeatMinutes.Location = New-Object System.Drawing.Point(364, 248)
+$script:numRepeatMinutes.Size = New-Object System.Drawing.Size(80, 30)
+$script:numRepeatMinutes.Font = $FontBase
+$script:numRepeatMinutes.BorderStyle = 'FixedSingle'
+$cardPace.Controls.Add($script:numRepeatMinutes)
+[void](New-CardLabel $cardPace '분마다 ·  최대' 452 252 96 24 $FontSmall $Theme.Muted)
+
+$script:numRepeatCount = New-Object System.Windows.Forms.NumericUpDown
+$script:numRepeatCount.Minimum = 0
+$script:numRepeatCount.Maximum = 999
+$script:numRepeatCount.Value = [Math]::Max(0, [Math]::Min(999, [int]$script:config.RepeatCount))
+$script:numRepeatCount.Location = New-Object System.Drawing.Point(552, 248)
+$script:numRepeatCount.Size = New-Object System.Drawing.Size(74, 30)
+$script:numRepeatCount.Font = $FontBase
+$script:numRepeatCount.BorderStyle = 'FixedSingle'
+$cardPace.Controls.Add($script:numRepeatCount)
+[void](New-CardLabel $cardPace '회 (0이면 멈출 때까지 계속)' 634 252 130 24 $FontSmall $Theme.Muted)
+
+[void](New-CardLabel $cardPace '방 300개를 10분 안에 보내려면 간격을 0~1초로 두세요. 간격 8초면 300개에 약 48분 걸립니다.' 24 286 736 24 $FontSmall $Theme.Muted)
+
+$cardLimit = New-Card $pageSettings 28 1036 784 306 '발송 제한 및 묶음 발송' '보내면 안 되는 시간과 날짜, 그리고 몇 개마다 쉴지 정할 수 있습니다.'
 $script:chkQuiet = New-Object System.Windows.Forms.CheckBox
 $script:chkQuiet.Text = '방해금지 시간대에는 보내지 않기'
 $script:chkQuiet.Checked = [bool]$script:config.QuietEnabled
@@ -4282,32 +4408,7 @@ $script:numBatchRest.BorderStyle = 'FixedSingle'
 $cardLimit.Controls.Add($script:numBatchRest)
 [void](New-CardLabel $cardLimit '분 쉬기  (0개면 쉬지 않고 계속)' 376 200 384 24 $FontSmall $Theme.Muted)
 
-[void](New-CardLabel $cardLimit '방 열림 대기' 430 200 90 24 $FontSmall $Theme.Muted)
-$script:numOpenTimeout = New-Object System.Windows.Forms.NumericUpDown
-$script:numOpenTimeout.Minimum = 3
-$script:numOpenTimeout.Maximum = 60
-$script:numOpenTimeout.Value = [Math]::Max(3, [Math]::Min(60, [int]([Math]::Round([int]$script:config.OpenTimeoutMs / 1000))))
-$script:numOpenTimeout.Location = New-Object System.Drawing.Point(524, 196)
-$script:numOpenTimeout.Size = New-Object System.Drawing.Size(70, 30)
-$script:numOpenTimeout.Font = $FontBase
-$script:numOpenTimeout.BorderStyle = 'FixedSingle'
-$cardLimit.Controls.Add($script:numOpenTimeout)
-[void](New-CardLabel $cardLimit '초까지 기다림 (대화 많은 방은 늘리세요)' 600 200 200 24 $FontSmall $Theme.Muted)
-
-# 오픈채팅처럼 대화가 많이 쌓인 방은 창이 뜬 뒤에도 한참 더 불러옵니다.
-# 다 불러오기 전에 Enter 를 누르면 아무 일도 일어나지 않습니다.
-[void](New-CardLabel $cardLimit '대화 로딩 대기' 24 240 100 24 $FontSmall $Theme.Muted)
-$script:numSettle = New-Object System.Windows.Forms.NumericUpDown
-$script:numSettle.Minimum = 0
-$script:numSettle.Maximum = 30
-$script:numSettle.Value = [Math]::Max(0, [Math]::Min(30, [int]([Math]::Round([int]$script:config.SettleMs / 1000))))
-$script:numSettle.Location = New-Object System.Drawing.Point(130, 236)
-$script:numSettle.Size = New-Object System.Drawing.Size(64, 28)
-$script:numSettle.Font = $FontBase
-$cardLimit.Controls.Add($script:numSettle)
-[void](New-CardLabel $cardLimit '초 동안 화면이 멈추기를 기다린 뒤 보냅니다 (오픈채팅은 늘리세요)' 200 240 380 24 $FontSmall $Theme.Muted)
-
-$script:lblLimitState = New-CardLabel $cardLimit '' 24 234 736 56 $FontSmall $Theme.Sub
+$script:lblLimitState = New-CardLabel $cardLimit '' 24 236 736 56 $FontSmall $Theme.Sub
 
 # 페이지 5 — 실행 기록
 # ===========================================================================
@@ -4551,6 +4652,20 @@ function Update-HeaderSummary {
     }
     $script:lblHeaderPlan.Text = "$when`r`n$repeat"
     $script:lblHeaderPlan.ForeColor = if ($script:armed) { $Theme.Info } else { $Theme.Muted }
+
+    # [보내기] 화면의 요약도 같이 맞춥니다.
+    # 설정은 [설정] 화면 한 곳에서만 바꾸고, 여기는 그 결과를 보여 주기만 합니다.
+    if ($null -ne $script:lblRunPace) {
+        $gap = [int]$script:numInterval.Value
+        $gapText = if ($gap -le 0) { '방 사이 간격  쉬지 않음' } else { "방 사이 간격  $($gap)초" }
+        $waitText = "방 열림 대기  $([int]$script:numOpenTimeout.Value)초 · 대화 로딩 대기  $([int]$script:numSettle.Value)초"
+        $repeatLine = if ([bool]$script:chkRepeat.Checked) {
+            $limit = [int]$script:numRepeatCount.Value
+            $limitText = if ($limit -gt 0) { "최대 $($limit)회" } else { '멈출 때까지' }
+            "반복  $([int]$script:numRepeatMinutes.Value)분마다 · $limitText"
+        } else { '반복  안 함' }
+        $script:lblRunPace.Text = "$gapText`r`n$waitText`r`n$repeatLine"
+    }
 }
 
 function Update-LimitStateLabel {
@@ -4595,6 +4710,7 @@ function Sync-ConfigFromForm {
     $script:config.BatchRestMinutes = [int]$script:numBatchRest.Value
     $script:config.OpenTimeoutMs = [int]$script:numOpenTimeout.Value * 1000
     $script:config.SettleMs = [int]$script:numSettle.Value * 1000
+    $script:config.PreloadRooms = [bool]$script:chkPreload.Checked
     $script:config.RepeatEnabled = [bool]$script:chkRepeat.Checked
     $script:config.RepeatMinutes = [int]$script:numRepeatMinutes.Value
     $script:config.RepeatCount = [int]$script:numRepeatCount.Value
@@ -4645,6 +4761,7 @@ $script:numBatchSize.Add_ValueChanged({ Request-AutoSave })
 $script:numBatchRest.Add_ValueChanged({ Request-AutoSave })
 $script:numOpenTimeout.Add_ValueChanged({ Request-AutoSave })
 $script:numSettle.Add_ValueChanged({ Request-AutoSave })
+$script:chkPreload.Add_CheckedChanged({ Request-AutoSave })
 $script:chkRepeat.Add_CheckedChanged({ Request-AutoSave })
 $script:numRepeatMinutes.Add_ValueChanged({ Request-AutoSave })
 $script:numRepeatCount.Add_ValueChanged({ Request-AutoSave })
@@ -4721,6 +4838,39 @@ $script:btnHeaderStop.Add_Click({
     }
 })
 $btnHeaderEdit.Add_Click({ Show-AppPage 'compose' })
+
+# 설정은 [설정] 화면 한 곳에서만 바꿉니다. 여기서는 그리로 보내 줍니다.
+$btnGoPaceSettings.Add_Click({ Show-AppPage 'settings' })
+
+$btnPreloadNow.Add_Click({
+    try {
+        Sync-ConfigFromForm
+        $rooms = @($script:config.Rooms | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
+        if ($rooms.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('먼저 [2. 받을 채팅방]에서 보낼 방을 골라 주세요.', '방 미리 열기') | Out-Null
+            return
+        }
+        $ask = "방 $($rooms.Count)개를 한 번씩 열어 대화가 다 불러와지는지 봅니다." + "`r`n`r`n" +
+               '메시지는 보내지 않습니다.' + "`r`n" +
+               '방이 많으면 시간이 걸립니다. 계속할까요?'
+        if ([System.Windows.Forms.MessageBox]::Show($ask, '방 미리 열기 (보내지 않음)', 'YesNo', 'Question') -ne 'Yes') { return }
+        $script:form.Enabled = $false
+        Set-StatusPill '방 미리 여는 중' 'run'
+        $ok = $false
+        try { $ok = Invoke-RoomPreload $rooms } catch { Write-RunLog "방 미리 열기 실패: $($_.Exception.Message)" }
+        $script:config.PreloadDone = $true
+        try { Save-Config $script:config } catch { }
+        $script:form.Enabled = $true
+        $script:form.Activate()
+        if ($ok) { Set-StatusPill '방 미리 열기 끝' 'done' } else { Set-StatusPill '방 미리 열기 실패' 'error' }
+        [System.Windows.Forms.MessageBox]::Show('끝났습니다. 어떤 방이 잘 열렸는지는 [기록] 화면에서 볼 수 있습니다.', '방 미리 열기') | Out-Null
+    } catch {
+        $script:form.Enabled = $true
+        $script:form.Activate()
+        Set-StatusPill '방 미리 열기 실패' 'error'
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '방 미리 열기 실패') | Out-Null
+    }
+})
 $btnHeaderStart.Add_Click({
     try {
         Sync-ConfigFromForm
@@ -6054,7 +6204,44 @@ if ($ScreenshotDir) {
     exit 0
 }
 
+# 화면 요소가 서로 겹치는지 검사합니다.
+# 설정 화면에 칸을 더하다가 기존 항목 위에 겹쳐 놓은 적이 있어서,
+# 눈으로 보지 않고도 알 수 있게 검사를 넣었습니다.
+function Get-LayoutOverlaps {
+    $found = New-Object System.Collections.Generic.List[string]
+    function Test-Container([object]$Container, [string]$Path) {
+        $kids = @($Container.Controls | Where-Object { $_.Visible -or $_ -is [System.Windows.Forms.Control] })
+        for ($i = 0; $i -lt $kids.Count; $i++) {
+            for ($j = $i + 1; $j -lt $kids.Count; $j++) {
+                $a = $kids[$i]; $b = $kids[$j]
+                if ($a.Bounds.Width -le 0 -or $a.Bounds.Height -le 0) { continue }
+                if ($b.Bounds.Width -le 0 -or $b.Bounds.Height -le 0) { continue }
+                $hit = [System.Drawing.Rectangle]::Intersect($a.Bounds, $b.Bounds)
+                if ($hit.Width -gt 2 -and $hit.Height -gt 2) {
+                    $ta = if ($a.Text) { $a.Text } else { $a.GetType().Name }
+                    $tb = if ($b.Text) { $b.Text } else { $b.GetType().Name }
+                    if ($ta.Length -gt 24) { $ta = $ta.Substring(0,24) }
+                    if ($tb.Length -gt 24) { $tb = $tb.Substring(0,24) }
+                    $found.Add(("{0}: [{1}] {2} <-> [{3}] {4}" -f $Path, $ta, $a.Bounds, $tb, $b.Bounds))
+                }
+            }
+        }
+        foreach ($kid in $kids) {
+            if ($kid.Controls.Count -gt 0) { Test-Container $kid ($Path + " > " + $kid.GetType().Name) }
+        }
+    }
+    foreach ($key in $script:pages.Keys) { Test-Container $script:pages[$key] $key }
+    return $found
+}
+
 if ($UiSmokeTest) {
+    $overlaps = @(Get-LayoutOverlaps)
+    if ($overlaps.Count -gt 0) {
+        Write-Output ("LAYOUT_OVERLAP " + $overlaps.Count + "건")
+        foreach ($line in ($overlaps | Select-Object -First 20)) { Write-Output ("  " + $line) }
+    } else {
+        Write-Output 'LAYOUT_OK 겹치는 화면 요소 없음'
+    }
     Write-Output ("UI_SMOKETEST_OK pages={0} nav={1}" -f $script:pages.Count, $script:navItems.Count)
     $script:form.Dispose()
     exit 0
