@@ -456,6 +456,7 @@ function New-DefaultConfig {
         ScanPages = 30
         TestRoom = '나와의 채팅'
         AttachmentWaitMs = 1500
+        OpenTimeoutMs = 8000
         AutoCheckUpdate = $true
         TourDone = $false
         Calibration = [pscustomobject]@{
@@ -1324,6 +1325,50 @@ function Close-ChatWindow([object]$Window) {
 }
 
 # 채팅창의 글 입력칸(RICHEDIT50W)을 찾습니다.
+# 창이나 컨트롤이 아직 살아 있는지 확인합니다.
+# 사라진 컨트롤에서 글자를 읽으면 빈 값이 나오는데,
+# 그걸 '입력칸이 비었다 = 전송 성공' 으로 오해하면 안 됩니다.
+function Test-ControlAlive([object]$Control) {
+    if ($null -eq $Control) { return $false }
+    try {
+        $window = [NativeKakao]::GetWindow($Control.Handle)
+        return ($null -ne $window -and $window.Width -gt 0 -and $window.Height -gt 0)
+    } catch { return $false }
+}
+
+# 방이 완전히 열릴 때까지 기다립니다.
+# 제목이 목표 방과 일치하고, 그 제목이 흔들리지 않고, 입력칸까지 준비돼야 통과입니다.
+function Wait-ChatWindowReady([object]$Chat, [string]$Room, [int]$TimeoutMs = 8000) {
+    if ($TimeoutMs -le 0) { $TimeoutMs = 8000 }
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $lastTitle = ''
+    $stable = 0
+    $sawTitle = ''
+    while ((Get-Date) -lt $deadline) {
+        $fresh = $null
+        try { $fresh = [NativeKakao]::GetWindow($Chat.Handle) } catch { }
+        if ($null -eq $fresh -or $fresh.Width -le 0 -or $fresh.Height -le 0) { return $null }
+
+        $title = ([string]$fresh.Title).Trim()
+        if ($title -and $title -eq $lastTitle) { $stable++ } else { $stable = 0 }
+        $lastTitle = $title
+        if ($title) { $sawTitle = $title }
+
+        # 제목이 두 번 연속 같고(=바뀌는 중이 아니고) 목표 방과 맞을 때만 봅니다.
+        if ($stable -ge 2 -and (Test-RoomTitle $title $Room)) {
+            $box = Get-ChatInputControl $fresh
+            if ($null -ne $box -and (Test-ControlAlive $box)) {
+                return [pscustomobject]@{ Window = $fresh; InputBox = $box }
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    if ($sawTitle -and -not (Test-RoomTitle $sawTitle $Room)) {
+        Write-RunLog "  (열린 창 제목은 '$sawTitle' 이었습니다)"
+    }
+    return $null
+}
+
 function Get-ChatInputControl([object]$ChatWindow) {
     $children = @([NativeKakao]::GetChildWindows($ChatWindow.Handle))
     $rich = @($children | Where-Object {
@@ -1784,12 +1829,17 @@ function Invoke-OneRoom([string]$Room, [string]$RoomType, [object]$Content) {
 
 # 이미 열린 채팅창에 보냅니다. 제목이 정확히 일치할 때만 전송합니다.
 function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
-    $chat = $Chat
-    if (-not (Test-RoomTitle $chat.Title $Room)) {
-        Write-RunLog "건너뜀: '$Room' — 열린 채팅창 제목('$($chat.Title)')이 정확히 일치하지 않습니다."
-        Close-ChatWindow $chat
+    # 대화가 많이 쌓인 방은 창이 뜬 뒤에도 한참 뒤에야 내용이 채워집니다.
+    # 그 사이에 판단하면 제목이 아직 이전 방이거나 입력칸이 준비되지 않은 상태라
+    # 엉뚱한 방에 보내거나, 보내지도 않고 보낸 것으로 착각합니다.
+    # 그래서 방이 완전히 열릴 때까지 기다린 뒤에만 손을 댑니다.
+    $ready = Wait-ChatWindowReady $Chat $Room ([int]$Content.OpenTimeoutMs)
+    if ($null -eq $ready) {
+        Write-RunLog "건너뜀: '$Room' — 방이 다 열리지 않았습니다. (대화가 많으면 오래 걸립니다)"
+        Close-ChatWindow $Chat
         return $false
     }
+    $chat = $ready.Window
 
     if ([bool]$Content.DryRun) {
         Write-RunLog "확인 성공: '$Room' (전송하지 않음)"
@@ -1797,12 +1847,7 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
         return $true
     }
 
-    $inputBox = Get-ChatInputControl $chat
-    if ($null -eq $inputBox) {
-        Write-RunLog "건너뜀: '$Room' — 글 입력칸을 찾지 못했습니다."
-        Close-ChatWindow $chat
-        return $false
-    }
+    $inputBox = $ready.InputBox
 
     $message = [string]$Content.Message
     if (-not [string]::IsNullOrWhiteSpace($message)) {
@@ -2083,9 +2128,13 @@ function Get-ChatInputText([object]$InputBox) {
     return $text
 }
 
+# 입력칸이 비워졌는지로 전송 성공을 판단합니다.
+# 단, 컨트롤이 사라졌거나 읽을 수 없는 상태에서 나오는 빈 값은 성공이 아닙니다.
+# 예전에는 이걸 구분하지 않아, 방이 덜 열린 상태에서 '보낸 것'으로 착각했습니다.
 function Wait-ChatInputCleared([object]$InputBox, [int]$TimeoutMs) {
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
+        if (-not (Test-ControlAlive $InputBox)) { return $false }
         if ([string]::IsNullOrWhiteSpace((Get-ChatInputText $InputBox))) { return $true }
         Start-Sleep -Milliseconds 70
     }
@@ -2146,7 +2195,8 @@ function Get-VisibleWindowHandles {
     return $set
 }
 
-function Open-RoomAtLine([object]$List, [object]$Line, [IntPtr]$MainHandle, [int]$TimeoutMs = 3500) {
+function Open-RoomAtLine([object]$List, [object]$Line, [IntPtr]$MainHandle, [int]$TimeoutMs = 0) {
+    if ($TimeoutMs -le 0) { $TimeoutMs = [Math]::Max(3000, [int]$script:config.OpenTimeoutMs) }
     $before = Get-VisibleWindowHandles
     $x = $List.Rect.Left + [int]($List.Width * 0.35)
     $y = $List.Rect.Top + $Line.Top + 8
@@ -2261,6 +2311,7 @@ function New-SendContent([bool]$DryRun) {
         Message = [string]$script:config.Message
         Attachments = @($script:config.Attachments)
         AttachmentWaitMs = [int]$script:config.AttachmentWaitMs
+        OpenTimeoutMs = [Math]::Max(3000, [int]$script:config.OpenTimeoutMs)
         DryRun = $DryRun
     }
 }
@@ -2514,7 +2565,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'AutoCheckUpdate', 'TourDone', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'AutoCheckUpdate', 'TourDone', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -3573,6 +3624,18 @@ $script:numBatchRest.BorderStyle = 'FixedSingle'
 $cardLimit.Controls.Add($script:numBatchRest)
 [void](New-CardLabel $cardLimit '분 쉬기  (0개면 쉬지 않고 계속)' 376 200 384 24 $FontSmall $Theme.Muted)
 
+[void](New-CardLabel $cardLimit '방 열림 대기' 430 200 90 24 $FontSmall $Theme.Muted)
+$script:numOpenTimeout = New-Object System.Windows.Forms.NumericUpDown
+$script:numOpenTimeout.Minimum = 3
+$script:numOpenTimeout.Maximum = 60
+$script:numOpenTimeout.Value = [Math]::Max(3, [Math]::Min(60, [int]([Math]::Round([int]$script:config.OpenTimeoutMs / 1000))))
+$script:numOpenTimeout.Location = New-Object System.Drawing.Point(524, 196)
+$script:numOpenTimeout.Size = New-Object System.Drawing.Size(70, 30)
+$script:numOpenTimeout.Font = $FontBase
+$script:numOpenTimeout.BorderStyle = 'FixedSingle'
+$cardLimit.Controls.Add($script:numOpenTimeout)
+[void](New-CardLabel $cardLimit '초까지 기다림 (대화 많은 방은 늘리세요)' 600 200 200 24 $FontSmall $Theme.Muted)
+
 $script:lblLimitState = New-CardLabel $cardLimit '' 24 234 736 56 $FontSmall $Theme.Sub
 
 # 페이지 5 — 실행 기록
@@ -3859,6 +3922,7 @@ function Sync-ConfigFromForm {
     $script:config.HolidayIntervalMultiplier = [int]$script:numHolidayMultiplier.Value
     $script:config.BatchSize = [int]$script:numBatchSize.Value
     $script:config.BatchRestMinutes = [int]$script:numBatchRest.Value
+    $script:config.OpenTimeoutMs = [int]$script:numOpenTimeout.Value * 1000
     $script:config.RepeatEnabled = [bool]$script:chkRepeat.Checked
     $script:config.RepeatMinutes = [int]$script:numRepeatMinutes.Value
     $script:config.RepeatCount = [int]$script:numRepeatCount.Value
@@ -3907,6 +3971,7 @@ $script:cmbHoliday.Add_SelectedIndexChanged({ Request-AutoSave })
 $script:numHolidayMultiplier.Add_ValueChanged({ Request-AutoSave })
 $script:numBatchSize.Add_ValueChanged({ Request-AutoSave })
 $script:numBatchRest.Add_ValueChanged({ Request-AutoSave })
+$script:numOpenTimeout.Add_ValueChanged({ Request-AutoSave })
 $script:chkRepeat.Add_CheckedChanged({ Request-AutoSave })
 $script:numRepeatMinutes.Add_ValueChanged({ Request-AutoSave })
 $script:numRepeatCount.Add_ValueChanged({ Request-AutoSave })
