@@ -2291,107 +2291,122 @@ function Reset-ChatInput([object]$InputBox) {
     }
 }
 
-# 글을 입력칸에 넣습니다.
-# 컴퓨터마다 되고 안 되고가 갈리던 이유가 여기에 있었습니다.
-# 예전에는 클립보드를 먼저 쓰고, 안 되면 창을 앞으로 가져와 키보드로 쳤습니다.
-# 그런데 클립보드는 다른 프로그램이 잡고 있으면 못 쓰고,
-# 창을 앞으로 가져오는 것도 윈도우가 막는 경우가 있습니다.
-# 둘 다 그 컴퓨터가 그때 어떤 상태냐에 따라 달라집니다.
-# 그래서 클립보드도 창 활성화도 필요 없는 방법을 먼저 씁니다.
-function Set-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message) {
-    # 1순위: 창 메시지로 끼워 넣기. 줄바꿈까지 한 번에 들어갑니다.
-    Reset-ChatInput $InputBox
-    [NativeKakao]::ReplaceSelection($InputBox.Handle, $Message)
-    Start-Sleep -Milliseconds 260
-    if ((Get-ChatInputState $InputBox $Message) -eq '그대로') { return '창 메시지' }
-
-    # 2순위: 한 글자씩 넣기. 줄바꿈은 다시 창 메시지로 넣습니다.
-    Reset-ChatInput $InputBox
-    $lines = @($Message -split "`r?`n")
-    $first = $true
-    foreach ($line in $lines) {
-        if (-not $first) {
-            [NativeKakao]::ReplaceSelection($InputBox.Handle, [string][char]13)
-            Start-Sleep -Milliseconds 120
-        }
-        if ($line) { [NativeKakao]::TypeText($InputBox.Handle, $line) }
-        Start-Sleep -Milliseconds 160
-        $first = $false
-    }
-    Start-Sleep -Milliseconds 240
-    if ((Get-ChatInputState $InputBox $Message) -eq '그대로') { return '한 글자씩' }
-
-    # 3순위: 클립보드 붙여넣기. 다른 프로그램이 잡고 있으면 실패합니다.
+# 대화창 아래쪽만 자세히 봅니다. 새 말풍선은 항상 맨 아래에 생깁니다.
+# 전체를 보면 작은 변화를 놓치므로 아래쪽을 따로 잘라 봅니다.
+function Get-ChatTailSignature([object]$List) {
+    if ($null -eq $List) { return '' }
+    $window = [NativeKakao]::GetWindow($List.Handle)
+    if ($null -eq $window -or $window.Width -le 0 -or $window.Height -le 0) { return '' }
+    $image = $null
+    try { $image = Get-WindowImage $window } catch { return '' }
     try {
-        Reset-ChatInput $InputBox
-        Set-ClipboardTextSafe $Message
-        [NativeKakao]::PasteInto($InputBox.Handle)
-        Start-Sleep -Milliseconds 320
-        if ((Get-ChatInputState $InputBox $Message) -eq '그대로') { return '붙여넣기' }
-    } catch { }
+        $parts = @()
+        $from = [int]($image.Height * 0.55)
+        for ($i = 0; $i -lt 5; $i++) {
+            $top = $from + [int](($image.Height - $from) * $i / 5)
+            $bottom = $from + [int](($image.Height - $from) * ($i + 1) / 5) - 1
+            if ($bottom -le $top) { continue }
+            $parts += [Math]::Round([FastImage]::DarkRatio($image, 0, $top, ($image.Width - 1), $bottom, 0.72), 6)
+        }
+        return ($parts -join '|')
+    } catch { return '' }
+    finally { if ($null -ne $image) { try { $image.Dispose() } catch { } } }
+}
 
-    # 4순위: 창을 앞으로 가져와 실제 키보드로 칩니다. 윈도우가 막으면 실패합니다.
-    if (Enter-ChatForeground $Chat $InputBox) {
-        Reset-ChatInput $InputBox
-        [System.Windows.Forms.SendKeys]::SendWait((ConvertTo-SendKeysText $Message))
-        Start-Sleep -Milliseconds 400
-        if ((Get-ChatInputState $InputBox $Message) -eq '그대로') { return '실제 키보드' }
+# 입력칸이 비었다고 해서 보낸 것이 아닙니다.
+# 카카오톡은 프로그램이 넣은 글을 Enter 를 누르는 순간 그냥 지워 버리기도 합니다.
+# 그러면 입력칸은 비지만 아무것도 가지 않습니다.
+# 예전에 이것을 성공으로 잘못 판단해서, 보내지 않고도 완료라고 알렸습니다.
+# 이제 대화창에 새 말풍선이 생겼는지까지 확인합니다.
+function Test-ChatMessageLanded([object]$List, [string]$Before, [int]$TimeoutMs) {
+    # 확인할 방법이 없으면 막지 않습니다. 다만 이때는 확신할 수 없습니다.
+    if ($null -eq $List -or [string]::IsNullOrEmpty($Before)) { return $true }
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $now = Get-ChatTailSignature $List
+        if ($now -and $now -ne $Before) { return $true }
+        Start-Sleep -Milliseconds 150
     }
-    return ''
+    return $false
+}
+
+# 글을 입력칸에 넣습니다.
+# 카카오톡은 사람이 직접 친 것처럼 들어온 글만 실제로 보냅니다.
+# 창 메시지로 넣으면 전송 버튼이 노랗게 켜지기까지 하지만,
+# Enter 를 누르면 글을 지우고 보내지 않는 경우가 있습니다.
+# 그래서 실제 입력(붙여넣기, 키보드)을 먼저 쓰고, 창 메시지는 마지막에 씁니다.
+function Add-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message, [string]$Way) {
+    Reset-ChatInput $InputBox
+    switch ($Way) {
+        '실제 붙여넣기' {
+            if (-not (Enter-ChatForeground $Chat $InputBox)) { return $false }
+            try { Set-ClipboardTextSafe $Message } catch { return $false }
+            [NativeKakao]::PressCtrlKey(0x56)
+            Start-Sleep -Milliseconds 380
+        }
+        '실제 키보드' {
+            if (-not (Enter-ChatForeground $Chat $InputBox)) { return $false }
+            [System.Windows.Forms.SendKeys]::SendWait((ConvertTo-SendKeysText $Message))
+            Start-Sleep -Milliseconds 440
+        }
+        '창 붙여넣기' {
+            try { Set-ClipboardTextSafe $Message } catch { return $false }
+            [NativeKakao]::PasteInto($InputBox.Handle)
+            Start-Sleep -Milliseconds 340
+        }
+        '창 메시지' {
+            [NativeKakao]::ReplaceSelection($InputBox.Handle, $Message)
+            Start-Sleep -Milliseconds 280
+        }
+        default { return $false }
+    }
+    return ((Get-ChatInputState $InputBox $Message) -eq '그대로')
 }
 
 # 글을 보냅니다.
-# 창을 앞으로 가져오지 못해도 포기하지 않습니다.
-# 실제로 확인해 보니 창 메시지로 보낸 키도 카카오톡이 그대로 받습니다.
-# (백스페이스, 방향키, 글자 모두 창을 앞으로 가져오지 않고 동작했습니다)
-# 오픈채팅처럼 대화를 아직 불러오는 중이면 Enter 가 먹지 않으므로,
-# 한 번 보내고 끝내지 않고 확인해서 안 갔으면 기다렸다 다시 보냅니다.
-# 다시 보내기 전에 입력칸을 꼭 봅니다. 비어 있으면 이미 간 것이라
-# 다시 보내면 같은 글이 두 번 갑니다.
+# 넣는 방법을 확실한 것부터 시도하고, 보낸 뒤에는 대화창을 보고 진짜 갔는지 확인합니다.
+# 갔는지 확인되지 않으면 성공이라고 하지 않습니다.
 function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]$SettleMs = 4000) {
-    # 아직 불러오는 중이면 여기서 기다립니다.
+    # 대화를 아직 불러오는 중이면 Enter 가 먹지 않습니다.
     [void](Wait-ChatContentSettled $Chat $SettleMs)
-
-    # 여기서 예외가 나면 위쪽에서 방만 닫고 끝나 버려,
-    # 사용자는 "채팅창이 켜졌다 바로 꺼진다" 로만 보입니다.
-    # 무슨 일이 있었는지 반드시 남깁니다.
-    $way = ''
-    try { $way = Set-ChatMessageText $Chat $InputBox $Message }
-    catch {
-        $script:lastSendProblem = "글을 넣는 중 문제가 생겼습니다: $($_.Exception.Message)"
-        Write-RunLog $script:lastSendProblem
-        return ''
-    }
-    if (-not $way) {
-        $script:lastSendProblem = '입력칸에 문구를 넣지 못했습니다.'
-        Write-RunLog "건너뜀: $($script:lastSendProblem) (전송하지 않음)"
-        return ''
-    }
+    $list = Get-ChatListControl $Chat
     $script:lastSendProblem = ''
 
-    $tries = @(
-        [pscustomobject]@{ Name = '입력칸에 Enter'; Act = { [NativeKakao]::PressKey($InputBox.Handle, 0x0D) } },
-        [pscustomobject]@{ Name = '입력칸에 Enter 다시'; Act = { [NativeKakao]::PressKey($InputBox.Handle, 0x0D) } },
-        [pscustomobject]@{ Name = '채팅창에 Enter'; Act = { [NativeKakao]::PressKey($Chat.Handle, 0x0D) } },
-        [pscustomobject]@{ Name = '창을 앞으로 가져와 Enter'; Act = {
-            if (Enter-ChatForeground $Chat $InputBox) { [System.Windows.Forms.SendKeys]::SendWait('{ENTER}') } } }
-    )
-    $script:lastSendProblem = 'Enter 를 눌러도 전송되지 않았습니다. (대화를 아직 불러오는 중일 수 있습니다)'
-    $attempt = 0
-    foreach ($try in $tries) {
-        $attempt++
-        $state = Get-ChatInputState $InputBox $Message
-        if ($state -eq '비어있음') { return ($way + ' + ' + $try.Name) }
-        if ($state -eq '사라짐') { return '' }
-        if ($state -eq '다름') {
-            Write-RunLog '건너뜀: 보내는 도중 입력칸 내용이 바뀌었습니다. (전송하지 않음)'
-            return ''
+    $ways = @('실제 붙여넣기', '실제 키보드', '창 붙여넣기', '창 메시지')
+    foreach ($way in $ways) {
+        $before = ''
+        if ($null -ne $list) { $before = Get-ChatTailSignature $list }
+
+        $ready = $false
+        try { $ready = Add-ChatMessageText $Chat $InputBox $Message $way }
+        catch { $script:lastSendProblem = "글을 넣는 중 문제가 생겼습니다: $($_.Exception.Message)"; continue }
+        if (-not $ready) {
+            $script:lastSendProblem = "'$way' 로는 입력칸에 글을 넣지 못했습니다."
+            continue
         }
-        try { & $try.Act } catch { continue }
-        if (Wait-ChatInputCleared $InputBox 2200) { return ($way + ' + ' + $try.Name) }
-        # 아직 불러오는 중이라 안 먹었을 수 있습니다. 잠깐 기다렸다 다시 해 봅니다.
-        if ($attempt -lt $tries.Count) { [void](Wait-ChatContentSettled $Chat 2500) }
+
+        $presses = @('입력칸에 Enter', '창을 앞으로 가져와 Enter')
+        foreach ($press in $presses) {
+            if ((Get-ChatInputState $InputBox $Message) -ne '그대로') { break }
+            if ($press -eq '입력칸에 Enter') {
+                [NativeKakao]::PressKey($InputBox.Handle, 0x0D)
+            } else {
+                if (-not (Enter-ChatForeground $Chat $InputBox)) { continue }
+                [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+            }
+            if (-not (Wait-ChatInputCleared $InputBox 2200)) {
+                $script:lastSendProblem = "'$way' 로 넣고 Enter 를 눌렀지만 입력칸이 그대로입니다."
+                continue
+            }
+            if (Test-ChatMessageLanded $list $before 3000) { return "$way + $press" }
+            # 입력칸은 비워졌는데 대화창에 아무것도 안 올라왔습니다.
+            # 카카오톡이 글을 지운 것입니다. 다른 방법으로 다시 해 봅니다.
+            $script:lastSendProblem = "'$way' 로 넣은 글을 카카오톡이 지웠습니다. 보내지지 않았습니다."
+            break
+        }
     }
+    if (-not $script:lastSendProblem) { $script:lastSendProblem = '전송되지 않았습니다.' }
+    try { Reset-ChatInput $InputBox } catch { }
     return ''
 }
 
