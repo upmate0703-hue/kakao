@@ -3,6 +3,8 @@ name: release
 # 이 워크플로 하나로 어디서든(휴대폰 브라우저 포함) 배포할 수 있습니다.
 #   Actions 탭 → release → Run workflow → 버전 입력 → 실행
 # 태그를 직접 밀어도(v3.1.0) 같은 흐름이 동작합니다.
+#
+# 윈도우에서 돌립니다. 프로그램(.exe)을 만들어야 하기 때문입니다.
 
 on:
   workflow_dispatch:
@@ -24,7 +26,10 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,38 +38,42 @@ jobs:
       - name: 버전 결정
         id: ver
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            V="${{ inputs.version }}"
-          else
-            V="${GITHUB_REF_NAME}"
-          fi
-          V="${V#v}"
-          if ! echo "$V" | grep -Eq '^[0-9]+(\.[0-9]+){1,3}$'; then
-            echo "버전 형식이 올바르지 않습니다: $V (예: 3.1.0)"
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $v = "${{ inputs.version }}"
+          } else {
+            $v = "${{ github.ref_name }}"
+          }
+          $v = $v -replace '^v', ''
+          if ($v -notmatch '^[0-9]+(\.[0-9]+){1,3}$') {
+            Write-Host "버전 형식이 올바르지 않습니다: $v (예: 3.1.0)"
             exit 1
-          fi
-          echo "value=$V" >> "$GITHUB_OUTPUT"
-          echo "배포 버전: $V"
+          }
+          "value=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "배포 버전: $v"
 
       - name: 스크립트에 버전 기록
         env:
           V: ${{ steps.ver.outputs.value }}
         run: |
-          python3 - <<'PY'
-          import io, os, re
-          version = os.environ["V"]
-          path = "KakaoRoomScheduler.ps1"
-          text = io.open(path, encoding="utf-8-sig").read()
-          text, count = re.subn(
-              r"(?m)^\$script:AppVersion\s*=\s*'[^']*'",
-              "$script:AppVersion = '%s'" % version,
-              text, count=1)
-          if count != 1:
-              raise SystemExit("AppVersion 줄을 찾지 못했습니다.")
+          $path = 'KakaoRoomScheduler.ps1'
           # PowerShell 5.1 이 한글을 바르게 읽으려면 UTF-8 BOM 이 필요합니다.
-          io.open(path, "w", encoding="utf-8-sig").write(text)
-          print("버전 기록 완료:", version)
-          PY
+          $enc = New-Object System.Text.UTF8Encoding($true)
+          $text = [System.IO.File]::ReadAllText($path, $enc)
+          $pattern = "(?m)^\`$script:AppVersion\s*=\s*'[^']*'"
+          # .NET 치환에서 $ 는 특별한 뜻이 있으므로 $$ 로 적어 글자 그대로 넣습니다.
+          $replacement = "`$`$script:AppVersion = '$env:V'"
+          $count = ([regex]::Matches($text, $pattern)).Count
+          if ($count -ne 1) { throw "AppVersion 줄을 찾지 못했습니다 ($count 건)" }
+          $text = [regex]::Replace($text, $pattern, $replacement)
+          [System.IO.File]::WriteAllText($path, $text, $enc)
+          Write-Host "버전 기록 완료: $env:V"
+
+      - name: 자체 점검
+        run: |
+          # 배포 전에 반드시 통과해야 합니다.
+          powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\KakaoRoomScheduler.ps1 -SelfTest
+          if ($LASTEXITCODE -ne 0) { throw "자체 점검 실패" }
+          Write-Host "자체 점검 통과"
 
       - name: 버전 커밋 및 태그
         if: github.event_name == 'workflow_dispatch'
@@ -74,37 +83,53 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add KakaoRoomScheduler.ps1
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(release): v$V"
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "chore(release): v$env:V"
             git push origin "HEAD:${{ github.ref_name }}"
-          fi
-          git tag -f "v$V"
-          git push -f origin "v$V"
+          }
+          git tag -f "v$env:V"
+          git push -f origin "v$env:V"
+
+      - name: 프로그램(.exe) 만들기
+        env:
+          V: ${{ steps.ver.outputs.value }}
+        run: |
+          # 스크립트를 그대로 담은 실행 파일을 만듭니다.
+          # 이러면 다른 컴퓨터에서 실행 정책이나 파워셸을 몰라도 두 번 눌러 실행됩니다.
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name ps2exe -Scope CurrentUser -Force -AllowClobber
+          Import-Module ps2exe
+          $exe = '카카오 발송기.exe'
+          Invoke-PS2EXE -inputFile 'KakaoRoomScheduler.ps1' -outputFile $exe `
+            -noConsole -STA -title '카카오 발송기' -product '카카오 발송기' `
+            -description '카카오톡 채팅방 예약 발송기' -version $env:V
+          if (-not (Test-Path $exe)) { throw "프로그램을 만들지 못했습니다." }
+          $kb = [Math]::Round((Get-Item $exe).Length / 1KB)
+          Write-Host "프로그램 만듦: $exe ($kb KB)"
 
       - name: 배포 파일 만들기
         env:
           V: ${{ steps.ver.outputs.value }}
         run: |
-          mkdir -p dist/KakaoRoomScheduler
-          cp KakaoRoomScheduler.ps1 README.md dist/KakaoRoomScheduler/
-          # 맥용 도구도 함께 담습니다. 실행 권한을 유지합니다.
-          if [ -d mac ]; then
-            mkdir -p dist/KakaoRoomScheduler/mac
-            cp mac/* dist/KakaoRoomScheduler/mac/
-            chmod +x dist/KakaoRoomScheduler/mac/*.command dist/KakaoRoomScheduler/mac/*.js || true
-          fi
-          if [ -f 사용설명서.html ]; then cp 사용설명서.html dist/KakaoRoomScheduler/; fi
+          $dist = 'dist/KakaoRoomScheduler'
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          Copy-Item '카카오 발송기.exe' $dist -Force
+          Copy-Item 'KakaoRoomScheduler.ps1', 'README.md' $dist -Force
+          if (Test-Path '사용설명서.html') { Copy-Item '사용설명서.html' $dist -Force }
           # 실행 파일 이름은 바뀔 수 있으므로 있는 것을 모두 담습니다.
-          shopt -s nullglob
-          launchers=(*.cmd)
-          if [ ${#launchers[@]} -eq 0 ]; then
-            echo "실행용 .cmd 파일이 없습니다."
-            exit 1
-          fi
-          cp "${launchers[@]}" dist/KakaoRoomScheduler/
-          echo "담은 실행 파일: ${launchers[*]}"
-          cd dist
-          zip -r "../KakaoRoomScheduler-v$V.zip" KakaoRoomScheduler
+          $launchers = @(Get-ChildItem -Filter '*.cmd' -File)
+          if ($launchers.Count -gt 0) {
+            Copy-Item $launchers.FullName $dist -Force
+            Write-Host ("담은 실행 파일: " + ($launchers.Name -join ', '))
+          }
+          # 맥용 도구도 함께 담습니다.
+          if (Test-Path 'mac') {
+            New-Item -ItemType Directory -Path "$dist/mac" -Force | Out-Null
+            Copy-Item 'mac/*' "$dist/mac" -Force
+          }
+          Compress-Archive -Path 'dist/KakaoRoomScheduler' -DestinationPath "KakaoRoomScheduler-v$env:V.zip" -Force
+          Write-Host "묶음 파일 만듦"
 
       - name: 릴리스 등록
         env:
@@ -112,11 +137,15 @@ jobs:
           V: ${{ steps.ver.outputs.value }}
           NOTES: ${{ inputs.notes }}
         run: |
-          BODY="${NOTES:-변경 내용이 기록되지 않았습니다.}"
-          if gh release view "v$V" >/dev/null 2>&1; then
-            gh release upload "v$V" "KakaoRoomScheduler-v$V.zip" --clobber
-            gh release edit "v$V" --notes "$BODY" --latest
-          else
-            gh release create "v$V" "KakaoRoomScheduler-v$V.zip" --title "v$V" --notes "$BODY" --latest
-          fi
-          echo "배포 완료: v$V"
+          $body = $env:NOTES
+          if (-not $body) { $body = '변경 내용이 기록되지 않았습니다.' }
+          $zip = "KakaoRoomScheduler-v$env:V.zip"
+          $exe = '카카오 발송기.exe'
+          gh release view "v$env:V" 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload "v$env:V" $zip $exe --clobber
+            gh release edit "v$env:V" --notes $body --latest
+          } else {
+            gh release create "v$env:V" $zip $exe --title "v$env:V" --notes $body --latest
+          }
+          Write-Host "배포 완료: v$env:V"

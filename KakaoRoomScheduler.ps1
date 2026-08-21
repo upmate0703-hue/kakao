@@ -84,7 +84,7 @@ public static class NativeKakao {
         PostMessageW(hWnd, 0x00F5, IntPtr.Zero, IntPtr.Zero);
     }
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessageText(IntPtr hWnd, uint msg, IntPtr wParam, string lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")] static extern IntPtr SendMessageText(IntPtr hWnd, uint msg, IntPtr wParam, string lParam);
 
     // 입력칸에 글을 끼워 넣습니다. EM_REPLACESEL 입니다.
     // 실제로 확인해 보니 카카오톡은 이 방법으로 넣은 글도 사람이 친 것으로 인정합니다.
@@ -475,7 +475,23 @@ public static class FastImage {
 # ---------------------------------------------------------------------------
 # 경로 및 설정
 # ---------------------------------------------------------------------------
-$AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 프로그램(.exe) 으로 만들어 실행하면 $MyInvocation.MyCommand.Path 가 비어 있습니다.
+# 그때는 실행 파일이 있는 폴더를 씁니다.
+$script:HostPath = ''
+try { $script:HostPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { }
+$script:IsExe = $false
+if ($script:HostPath) {
+    $hostName = [System.IO.Path]::GetFileName($script:HostPath)
+    if ($hostName -notmatch '^(powershell|pwsh)\.exe$') { $script:IsExe = $true }
+}
+# 프로그램(.exe) 으로 만들면 $MyInvocation.MyCommand.Path 에
+# 프로그램을 만들 때 쓰던 원본 경로가 그대로 남습니다.
+# 그 경로는 다른 컴퓨터에 없으므로 절대 쓰면 안 됩니다.
+# 그래서 프로그램일 때는 실행 파일 위치를 먼저 봅니다.
+$AppDir = ''
+if ($script:IsExe) { $AppDir = Split-Path -Parent $script:HostPath }
+elseif ($MyInvocation.MyCommand.Path) { $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $AppDir) { $AppDir = (Get-Location).Path }
 $ConfigPath = Join-Path $AppDir 'config.json'
 $LogDir = Join-Path $AppDir 'logs'
 $BackupDir = Join-Path $AppDir 'backup'
@@ -2749,6 +2765,7 @@ function ConvertTo-SendKeysText([string]$Text) {
 # 채팅창 아래 아이콘이 창 메시지를 받아 주는지 한 번만 확인하고 기억합니다.
 # 안 받아 주는데 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
 $script:toolbarClickNeedsMouse = $false
+$script:pendingSwap = ''
 $script:sendMethodLogged = ''
 
 function Clear-ChatInput([object]$InputBox) {
@@ -3194,9 +3211,20 @@ function Install-AppUpdate([object]$Release) {
     }
 
     $copied = 0
+    $script:pendingSwap = ''
     foreach ($file in (Get-ChildItem -LiteralPath $sourceDir -File)) {
         if ($file.Name -eq 'config.json') { continue }
-        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $AppDir $file.Name) -Force
+        $target = Join-Path $AppDir $file.Name
+        # 지금 돌고 있는 프로그램 파일은 덮어쓸 수 없습니다. 옆에 두고 나중에 바꿉니다.
+        if ($script:IsExe -and $script:HostPath -and ($target -eq $script:HostPath)) {
+            $staged = $target + '.new'
+            Copy-Item -LiteralPath $file.FullName -Destination $staged -Force
+            $script:pendingSwap = New-ExeSwapHelper $staged $target
+            Write-RunLog '새 프로그램 파일을 받아 두었습니다. 다시 시작하면 바뀝니다.'
+            $copied++
+            continue
+        }
+        Copy-Item -LiteralPath $file.FullName -Destination $target -Force
         $copied++
     }
     try { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue } catch { }
@@ -3204,19 +3232,60 @@ function Install-AppUpdate([object]$Release) {
     return $backup
 }
 
+# 실행 중인 .exe 는 자기 자신을 덮어쓸 수 없습니다.
+# 그래서 새 파일을 옆에 두고, 프로그램이 꺼지기를 기다렸다 바꿔치기하는
+# 작은 배치 파일을 만들어 둡니다. 프로그램을 다시 켜면서 이 파일이 돕니다.
+function New-ExeSwapHelper([string]$NewFile, [string]$TargetFile) {
+    $helper = Join-Path $AppDir '업데이트-적용.cmd'
+    $lines = @(
+        '@echo off',
+        'chcp 65001 > nul',
+        'set TRY=0',
+        ':retry',
+        'set /a TRY+=1',
+        ('move /y "' + $NewFile + '" "' + $TargetFile + '" > nul 2>&1'),
+        'if not errorlevel 1 goto done',
+        'if %TRY% GEQ 30 goto fail',
+        'timeout /t 1 /nobreak > nul',
+        'goto retry',
+        ':done',
+        ('start "" "' + $TargetFile + '"'),
+        'del "%~f0"',
+        'exit /b 0',
+        ':fail',
+        'echo 업데이트를 적용하지 못했습니다.',
+        'echo 프로그램을 끄고 아래 파일 이름을 바꿔 주세요.',
+        ('echo   ' + $NewFile),
+        'pause'
+    )
+    [System.IO.File]::WriteAllLines($helper, $lines, (New-Object System.Text.UTF8Encoding($false)))
+    return $helper
+}
+
 # 실행용 .cmd 파일을 찾습니다. 사용자가 이름을 바꿔도 동작하도록 폴더에서 찾습니다.
 function Find-Launcher {
     $preferred = Join-Path $AppDir 'Start-KakaoRoomScheduler.cmd'
     if (Test-Path -LiteralPath $preferred) { return $preferred }
-    $found = @(Get-ChildItem -LiteralPath $AppDir -Filter '*.cmd' -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    $found = @(Get-ChildItem -LiteralPath $AppDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in @('.exe', '.cmd') -and $_.Name -notlike '*.new' } | Sort-Object Extension, Name)
     if ($found.Count -gt 0) { return $found[0].FullName }
     return $null
 }
 
 function Restart-App {
-    $launcher = Find-Launcher
-    if ($launcher) { Start-Process -FilePath $launcher -WorkingDirectory $AppDir }
-    else { Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', (Join-Path $AppDir 'KakaoRoomScheduler.ps1')) -WorkingDirectory $AppDir }
+    if ($script:pendingSwap -and (Test-Path -LiteralPath $script:pendingSwap)) {
+        # 새 프로그램 파일로 바꿔치기한 뒤 다시 켜 줍니다.
+        Start-Process -FilePath $script:pendingSwap -WorkingDirectory $AppDir -WindowStyle Hidden
+        $script:armed = $false
+        $script:form.Close()
+        return
+    }
+    if ($script:IsExe -and $script:HostPath) {
+        Start-Process -FilePath $script:HostPath -WorkingDirectory $AppDir
+    } else {
+        $launcher = Find-Launcher
+        if ($launcher) { Start-Process -FilePath $launcher -WorkingDirectory $AppDir }
+        else { Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', (Join-Path $AppDir 'KakaoRoomScheduler.ps1')) -WorkingDirectory $AppDir }
+    }
     $script:armed = $false
     $script:form.Close()
 }
@@ -3292,6 +3361,20 @@ if ($SelfTest) {
     if ((ConvertTo-RoomCandidate "테스트 채팅방`r`n안녕하세요") -ne '테스트 채팅방') { throw '후보 추출 자체 점검 실패' }
     if (-not (Test-RoomTitle '우리반 공지방 (24)' '우리반 공지방')) { throw '창 제목 비교 자체 점검 실패' }
     if (Test-RoomTitle '우리반 공지방 2기' '우리반 공지방') { throw '창 제목 비교가 너무 느슨합니다' }
+    # 창 메시지로 글을 넣는 기능을 진짜로 불러 봅니다.
+    # 예전에 user32.dll 에 없는 이름으로 선언해 두어 부를 때마다 터졌는데,
+    # 코드만 봐서는 알 수 없었습니다. 실제로 넣어 보고 확인합니다.
+    $probe = New-Object System.Windows.Forms.TextBox
+    try {
+        [void]$probe.Handle
+        [NativeKakao]::ReplaceSelection($probe.Handle, '확인용')
+        [System.Windows.Forms.Application]::DoEvents()
+        if ($probe.Text -ne '확인용') { throw "창 메시지로 글을 넣지 못합니다 (넣은 결과: '$($probe.Text)')" }
+        $probe.Text = ''
+        [NativeKakao]::ReplaceSelection($probe.Handle, ('가' * 3000))
+        [System.Windows.Forms.Application]::DoEvents()
+        if ($probe.Text.Length -lt 3000) { throw "긴 글이 잘립니다 ($($probe.Text.Length)자만 들어감)" }
+    } finally { $probe.Dispose() }
     # 이름이 잘린 방은 앞부분으로 찾을 수 있어야 합니다.
     $savedTrunc = @($script:config.TruncatedRooms)
     $savedKnown = @($script:config.KnownRooms)
