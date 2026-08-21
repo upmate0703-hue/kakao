@@ -544,7 +544,7 @@ function New-DefaultConfig {
         Attachments = @()
         ScheduledAt = (Get-Date).Date.AddDays(1).ToString('yyyy-MM-dd HH:mm:ss')
         IntervalSeconds = 8
-        DryRun = $true
+        DryRun = $false
         ScanPages = 30
         TestRoom = '나와의 채팅'
         AttachmentWaitMs = 1500
@@ -2193,7 +2193,7 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
     $chat = $ready.Window
 
     if ([bool]$Content.DryRun) {
-        Write-RunLog "확인 성공: '$Room' (전송하지 않음)"
+        Write-RunLog "확인만 함: '$Room' — 방은 열렸습니다. 아무것도 보내지 않았습니다."
         Close-ChatWindow $chat
         return $true
     }
@@ -3239,7 +3239,13 @@ function Invoke-Broadcast {
     if (@($pending).Count -gt 0) {
         Write-RunLog "처리하지 못한 방 $(@($pending).Count)개: 이름이 카카오톡 표시와 다를 수 있습니다. 체크한 뒤 [이름 확인·보정]을 실행해 보세요."
     }
-    Write-RunLog ("작업 종료: 성공 {0} / 실패 {1} / 미처리 {2} (전체 {3})" -f $totalSent, $totalFailed, @($pending).Count, $rooms.Count)
+    if ($dryRun) {
+        # 확인 전용은 아무것도 보내지 않습니다. 완료라고 하면 보낸 줄 알게 됩니다.
+        Write-RunLog ("확인 전용으로 끝났습니다: 방 {0}개를 열어 보았고, 실제로 보낸 메시지는 없습니다." -f $totalSent)
+        Write-RunLog "실제로 보내시려면 [3. 보내기] 화면에서 [실제 발송] 을 고르세요."
+    } else {
+        Write-RunLog ("작업 종료: 성공 {0} / 실패 {1} / 미처리 {2} (전체 {3})" -f $totalSent, $totalFailed, @($pending).Count, $rooms.Count)
+    }
     return $totalSent
 }
 
@@ -4229,14 +4235,14 @@ $script:lblHeaderPlan = New-Object System.Windows.Forms.Label
 $script:lblHeaderPlan.Font = $FontSmall
 $script:lblHeaderPlan.ForeColor = $Theme.Sub
 $script:lblHeaderPlan.BackColor = $Theme.Bg
-$script:lblHeaderPlan.Location = New-Object System.Drawing.Point(222, 46)
-$script:lblHeaderPlan.Size = New-Object System.Drawing.Size(268, 40)
+$script:lblHeaderPlan.Location = New-Object System.Drawing.Point(222, 40)
+$script:lblHeaderPlan.Size = New-Object System.Drawing.Size(374, 46)
 $script:lblHeaderPlan.Cursor = [System.Windows.Forms.Cursors]::Hand
 $header.Controls.Add($script:lblHeaderPlan)
 
 # 어느 화면에 있든 바로 누를 수 있게 위쪽에 둡니다.
 $btnHeaderEdit  = New-AppButton $header '내용 수정' 498 26 104 46
-$btnHeaderStart = New-AppButton $header '발송 시작' 610 26 132 46 'primary'
+$script:btnHeaderStart = New-AppButton $header '발송 시작' 610 26 132 46 'primary'
 # 예약 대기 중이거나 발송 중일 때 [발송 시작] 자리에 나타납니다.
 $script:btnHeaderStop = New-AppButton $header '중지' 610 26 132 46 'danger'
 $script:btnHeaderStop.Visible = $false
@@ -4245,7 +4251,7 @@ $btnHelp = New-AppButton $header '?' 750 26 36 46 'default'
 $btnHelp.Font = $FontStrong
 $tipHelp = New-Object System.Windows.Forms.ToolTip
 $tipHelp.SetToolTip($btnHelp, '사용 가이드 다시 보기')
-$tipHelp.SetToolTip($btnHeaderStart, '지금 발송을 시작합니다')
+$tipHelp.SetToolTip($script:btnHeaderStart, '지금 발송을 시작합니다')
 $tipHelp.SetToolTip($btnHeaderEdit, '보낼 문구와 첨부를 고칩니다')
 
 # ----- 페이지 컨테이너 -----
@@ -4382,7 +4388,7 @@ $pageRun = New-Page 'run'
 
 $cardMode = New-Card $pageRun 28 12 784 150 '발송 방식'
 $script:rdoLive = New-Object System.Windows.Forms.RadioButton
-$script:rdoLive.Text = '실제 발송 — 선택한 모든 방에 문구와 첨부를 보냅니다.'
+$script:rdoLive.Text = '실제 발송 — 선택한 모든 방에 문구와 첨부를 실제로 보냅니다.'
 $script:rdoLive.Location = New-Object System.Drawing.Point(24, 58)
 $script:rdoLive.Size = New-Object System.Drawing.Size(730, 28)
 $script:rdoLive.BackColor = $Theme.Card
@@ -4390,7 +4396,7 @@ $script:rdoLive.Font = $FontBase
 $cardMode.Controls.Add($script:rdoLive)
 
 $script:rdoDry = New-Object System.Windows.Forms.RadioButton
-$script:rdoDry.Text = '확인 전용 — 방을 하나씩 열어 이름만 확인하고 전송하지 않습니다.'
+$script:rdoDry.Text = '확인 전용 — 방만 열어 보고 아무것도 보내지 않습니다. (연습용)'
 $script:rdoDry.Location = New-Object System.Drawing.Point(24, 92)
 $script:rdoDry.Size = New-Object System.Drawing.Size(730, 28)
 $script:rdoDry.BackColor = $Theme.Card
@@ -4869,22 +4875,36 @@ function Get-EstimatedRunText {
 function Update-HeaderSummary {
     if ($null -eq $script:lblHeaderPlan) { return }
     $when = if ($script:armed) {
-        "예약  $($script:dtSchedule.Value.ToString('MM-dd HH:mm')) 대기 중"
+        "예약 $($script:dtSchedule.Value.ToString('MM-dd HH:mm')) 대기"
     } else {
-        "예약  $($script:dtSchedule.Value.ToString('MM-dd HH:mm')) (시작 안 함)"
+        "예약 없음"
     }
+    # 머리말은 짧게 둡니다. 자세한 것은 아래 요약과 [설정] 에 있습니다.
     $repeat = if ([bool]$script:chkRepeat.Checked) {
-        $limit = [int]$script:numRepeatCount.Value
-        $limitText = if ($limit -gt 0) { "최대 $($limit)회" } else { '계속' }
-        "반복  $([int]$script:numRepeatMinutes.Value)분마다 · $limitText"
+        "반복 $([int]$script:numRepeatMinutes.Value)분"
     } else {
-        "반복  안 함 · 방 간격 $([int]$script:numInterval.Value)초"
+        "간격 $([int]$script:numInterval.Value)초"
     }
-    $script:lblHeaderPlan.Text = "$when`r`n$repeat"
-    $script:lblHeaderPlan.ForeColor = if ($script:armed) { $Theme.Info } else { $Theme.Muted }
+    # 확인 전용인지 실제 발송인지가 가장 중요합니다. 맨 앞에 둡니다.
+    $dry = $false
+    try { $dry = [bool]$script:rdoDry.Checked } catch { }
+    $modeText = if ($dry) { '확인 전용 — 보내지 않습니다' } else { '실제 발송' }
+    $script:lblHeaderPlan.Text = "$modeText`r`n$when · $repeat"
+    $script:lblHeaderPlan.ForeColor = if ($dry) { $Theme.Danger } elseif ($script:armed) { $Theme.Info } else { $Theme.Muted }
 
     # [보내기] 화면의 요약도 같이 맞춥니다.
     # 설정은 [설정] 화면 한 곳에서만 바꾸고, 여기는 그 결과를 보여 주기만 합니다.
+    # 확인 전용이면 단추 이름부터 다르게 해서 헷갈리지 않게 합니다.
+    try {
+        if ($null -ne $script:btnHeaderStart) {
+            $label = if ($dry) { '확인 시작' } else { '발송 시작' }
+            if ($script:btnHeaderStart.Tag.Label -ne $label) {
+                $script:btnHeaderStart.Tag.Label = $label
+                $script:btnHeaderStart.AccessibleName = $label
+                $script:btnHeaderStart.Invalidate()
+            }
+        }
+    } catch { }
     if ($null -ne $script:lblRunPace) {
         $gap = [int]$script:numInterval.Value
         $gapText = if ($gap -le 0) { '방 사이 간격  쉬지 않음' } else { "방 사이 간격  $($gap)초" }
@@ -4978,7 +4998,9 @@ $script:txtTestRoom.Add_TextChanged({ Request-AutoSave })
 $script:dtSchedule.Add_ValueChanged({ Request-AutoSave })
 $script:numInterval.Add_ValueChanged({ $script:config.IntervalSeconds = [int]$script:numInterval.Value; try { Update-LimitStateLabel } catch { }; Request-AutoSave })
 $script:numScanPages.Add_ValueChanged({ Request-AutoSave })
-$script:rdoDry.Add_CheckedChanged({ Request-AutoSave })
+# 발송 방식을 바꾸면 머리말 표시도 곧바로 바꿉니다.
+# 확인 전용인지 실제 발송인지가 가장 헷갈리는 부분이라 항상 보이게 합니다.
+$script:rdoDry.Add_CheckedChanged({ try { Update-HeaderSummary } catch { }; Request-AutoSave })
 $script:chkAutoUpdate.Add_CheckedChanged({ Request-AutoSave })
 $script:chkAutoDownload.Add_CheckedChanged({ Request-AutoSave })
 $script:chkQuiet.Add_CheckedChanged({ Request-AutoSave })
@@ -5101,7 +5123,7 @@ $btnPreloadNow.Add_Click({
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '방 미리 열기 실패') | Out-Null
     }
 })
-$btnHeaderStart.Add_Click({
+$script:btnHeaderStart.Add_Click({
     try {
         Sync-ConfigFromForm
         Show-AppPage 'run'
