@@ -3776,29 +3776,34 @@ if (-not $UiSmokeTest -and -not $ScreenshotDir) {
 # ---------------------------------------------------------------------------
 function New-Rgb([int]$R, [int]$G, [int]$B) { [System.Drawing.Color]::FromArgb($R, $G, $B) }
 
+# 색은 적게 쓰고 밝게 갑니다.
+# 노란색은 [발송 시작] 같은 진짜 중요한 단추 하나에만 씁니다.
+# 나머지는 흰색과 회색으로만 만들어 눈이 어디를 봐야 하는지 분명하게 합니다.
 $Theme = @{
-    Sidebar    = (New-Rgb 26 27 32)
-    SidebarHi  = (New-Rgb 44 46 55)
-    NavIdle    = (New-Rgb 160 165 175)
+    Sidebar    = [System.Drawing.Color]::White
+    SidebarHi  = (New-Rgb 241 243 247)
+    NavIdle    = (New-Rgb 108 116 128)
     Accent     = (New-Rgb 254 229 0)
-    AccentInk  = (New-Rgb 26 26 30)
-    Bg         = (New-Rgb 245 246 248)
+    AccentInk  = (New-Rgb 26 26 26)
+    Bg         = (New-Rgb 247 248 250)
     Card       = [System.Drawing.Color]::White
-    Border     = (New-Rgb 228 231 236)
-    Ink        = (New-Rgb 24 25 31)
-    Sub        = (New-Rgb 88 94 105)
-    Muted      = (New-Rgb 130 137 148)
-    Success    = (New-Rgb 21 128 61)
-    Danger     = (New-Rgb 200 50 55)
-    Info       = (New-Rgb 30 90 220)
-    FieldEdge  = (New-Rgb 214 219 226)
+    Border     = (New-Rgb 237 239 243)
+    Ink        = (New-Rgb 22 24 29)
+    Sub        = (New-Rgb 91 98 112)
+    Muted      = (New-Rgb 152 160 172)
+    Success    = (New-Rgb 22 120 70)
+    Danger     = (New-Rgb 198 55 60)
+    Info       = (New-Rgb 37 88 200)
+    FieldEdge  = (New-Rgb 227 231 237)
+    Soft       = (New-Rgb 243 245 248)
+    SoftHover  = (New-Rgb 234 238 243)
 }
 
-$FontBase   = New-Object System.Drawing.Font('Malgun Gothic', 9.75)
+$FontBase   = New-Object System.Drawing.Font('Malgun Gothic', 10)
 $FontSmall  = New-Object System.Drawing.Font('Malgun Gothic', 9)
-$FontStrong = New-Object System.Drawing.Font('Malgun Gothic', 9.75, [System.Drawing.FontStyle]::Bold)
-$FontCard   = New-Object System.Drawing.Font('Malgun Gothic', 11.25, [System.Drawing.FontStyle]::Bold)
-$FontPage   = New-Object System.Drawing.Font('Malgun Gothic', 15.75, [System.Drawing.FontStyle]::Bold)
+$FontStrong = New-Object System.Drawing.Font('Malgun Gothic', 10, [System.Drawing.FontStyle]::Bold)
+$FontCard   = New-Object System.Drawing.Font('Malgun Gothic', 11.5, [System.Drawing.FontStyle]::Bold)
+$FontPage   = New-Object System.Drawing.Font('Malgun Gothic', 17, [System.Drawing.FontStyle]::Bold)
 $FontLogo   = New-Object System.Drawing.Font('Malgun Gothic', 12, [System.Drawing.FontStyle]::Bold)
 $FontLogoMark = New-Object System.Drawing.Font('Malgun Gothic', 13, [System.Drawing.FontStyle]::Bold)
 $FontTourTitle = New-Object System.Drawing.Font('Malgun Gothic', 13.5, [System.Drawing.FontStyle]::Bold)
@@ -3840,12 +3845,11 @@ function New-Card([object]$Parent, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$
         param($sender, $e)
         $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $rect = New-Object System.Drawing.Rectangle(0, 0, ($sender.Width - 1), ($sender.Height - 1))
-        $path = Get-RoundedPath $rect 12
+        # 테두리를 그리지 않습니다. 흰 면과 여백만으로 구역을 나누는 편이 깔끔합니다.
+        $path = Get-RoundedPath $rect 14
         $brush = New-Object System.Drawing.SolidBrush ($Theme.Card)
-        $pen = New-Object System.Drawing.Pen ($Theme.Border)
         $e.Graphics.FillPath($brush, $path)
-        $e.Graphics.DrawPath($pen, $path)
-        $brush.Dispose(); $pen.Dispose(); $path.Dispose()
+        $brush.Dispose(); $path.Dispose()
     })
     $Parent.Controls.Add($panel)
 
@@ -3953,6 +3957,13 @@ function New-AppButton([object]$Parent, [string]$Text, [int]$X, [int]$Y, [int]$W
             $button.FlatAppearance.BorderColor = (New-Rgb 240 202 202)
             $button.FlatAppearance.MouseOverBackColor = (New-Rgb 253 244 244)
         }
+        'strong' {
+            # 중요하지만 발송은 아닌 동작입니다. 짙은 면에 흰 글씨로 눈에 띄게 합니다.
+            $button.BackColor = $Theme.Ink
+            $button.ForeColor = [System.Drawing.Color]::White
+            $button.Font = $FontStrong
+            $button.FlatAppearance.BorderSize = 0
+        }
         'ghost' {
             $button.BackColor = $Theme.Card
             $button.ForeColor = $Theme.Sub
@@ -3995,9 +4006,16 @@ function New-AppButton([object]$Parent, [string]$Text, [int]$X, [int]$Y, [int]$W
                 $drawEdge = $false
             }
             'danger' {
-                $fill = if ($info.Hover -and $enabled) { (New-Rgb 253 244 244) } else { [System.Drawing.Color]::White }
-                $edge = (New-Rgb 240 202 202)
-                $ink = if ($enabled) { $Theme.Danger } else { (New-Rgb 190 160 160) }
+                # 지우는 단추는 글자색만 붉게 합니다. 면까지 붉히면 시끄럽습니다.
+                $fill = if ($info.Hover -and $enabled) { (New-Rgb 253 243 243) } else { $parentColor }
+                $ink = if ($enabled) { $Theme.Danger } else { $Theme.Muted }
+                $drawEdge = $false
+            }
+            'strong' {
+                $fill = if ($info.Hover -and $enabled) { (New-Rgb 48 52 60) } else { $Theme.Ink }
+                if (-not $enabled) { $fill = $Theme.Soft }
+                $ink = if ($enabled) { [System.Drawing.Color]::White } else { $Theme.Muted }
+                $drawEdge = $false
             }
             'ghost' {
                 $fill = if ($info.Hover -and $enabled) { $Theme.Bg } else { $parentColor }
@@ -4005,8 +4023,10 @@ function New-AppButton([object]$Parent, [string]$Text, [int]$X, [int]$Y, [int]$W
                 $drawEdge = $false
             }
             default {
-                $fill = if ($info.Hover -and $enabled) { (New-Rgb 246 247 250) } else { [System.Drawing.Color]::White }
-                $ink = if ($enabled) { $Theme.Ink } else { (New-Rgb 165 170 178) }
+                # 테두리를 그리지 않고 옅은 회색 면으로 단추임을 알립니다.
+                $fill = if ($info.Hover -and $enabled) { $Theme.SoftHover } else { $Theme.Soft }
+                $ink = if ($enabled) { $Theme.Ink } else { $Theme.Muted }
+                $drawEdge = $false
             }
         }
         $brush = New-Object System.Drawing.SolidBrush ($fill)
@@ -4066,7 +4086,7 @@ $logo.Add_Paint({
     $e.Graphics.FillPath($brush, $path)
     $brush.Dispose(); $path.Dispose()
     Write-Text $e.Graphics '톡' $FontLogoMark $Theme.AccentInk $mark $TextCenter
-    Write-Text $e.Graphics '카카오 발송기' $FontLogo ([System.Drawing.Color]::White) (New-Object System.Drawing.Rectangle(82, 32, 130, 22)) $TextLeft
+    Write-Text $e.Graphics '카카오 발송기' $FontLogo $Theme.Ink (New-Object System.Drawing.Rectangle(82, 32, 130, 22)) $TextLeft
     Write-Text $e.Graphics "v$($script:AppVersion)" $FontSmall $Theme.NavIdle (New-Object System.Drawing.Rectangle(82, 54, 130, 20)) $TextLeft
 })
 $sidebar.Controls.Add($logo)
@@ -4097,19 +4117,17 @@ foreach ($page in $script:NavPages) {
         $key = [string]$sender.Tag
         $isActive = ($script:activePage -eq $key)
         $isHover = ($script:hoverNav -eq $key)
+        # 고른 항목은 둥근 회색 면으로만 알립니다. 색 막대까지 두면 시끄럽습니다.
         if ($isActive -or $isHover) {
+            $inner = New-Object System.Drawing.Rectangle(14, 4, ($sender.Width - 28), ($sender.Height - 8))
+            $shape = Get-RoundedPath $inner 10
             $fill = New-Object System.Drawing.SolidBrush ($Theme.SidebarHi)
-            $e.Graphics.FillRectangle($fill, 0, 0, $sender.Width, $sender.Height)
-            $fill.Dispose()
+            $e.Graphics.FillPath($fill, $shape)
+            $fill.Dispose(); $shape.Dispose()
         }
-        if ($isActive) {
-            $bar = New-Object System.Drawing.SolidBrush ($Theme.Accent)
-            $e.Graphics.FillRectangle($bar, 0, 9, 4, ($sender.Height - 18))
-            $bar.Dispose()
-        }
-        $color = if ($isActive) { [System.Drawing.Color]::White } else { $Theme.NavIdle }
+        $color = if ($isActive) { $Theme.Ink } else { $Theme.NavIdle }
         $font = if ($isActive) { $FontStrong } else { $FontBase }
-        Write-Text $e.Graphics $script:navText[$key] $font $color (New-Object System.Drawing.Rectangle(30, 0, 176, $sender.Height)) $TextLeft
+        Write-Text $e.Graphics $script:navText[$key] $font $color (New-Object System.Drawing.Rectangle(32, 0, 174, $sender.Height)) $TextLeft
     })
     $item.Add_Click({ Show-AppPage ([string]$this.Tag) })
     $item.Add_MouseEnter({ $script:hoverNav = [string]$this.Tag; $this.Invalidate() })
@@ -4123,7 +4141,7 @@ foreach ($page in $script:NavPages) {
 $navDivider = New-Object System.Windows.Forms.Panel
 $navDivider.Location = New-Object System.Drawing.Point(28, ($bottomY - 18))
 $navDivider.Size = New-Object System.Drawing.Size(164, 1)
-$navDivider.BackColor = (New-Rgb 58 60 70)
+$navDivider.BackColor = $Theme.Border
 $sidebar.Controls.Add($navDivider)
 
 $script:pnlUpdate = New-Object System.Windows.Forms.Panel
@@ -4151,9 +4169,18 @@ $lblHint.Text = "수신에 동의한 채팅방에서만 사용하세요."
 $lblHint.Location = New-Object System.Drawing.Point(26, 684)
 $lblHint.Size = New-Object System.Drawing.Size(176, 40)
 $lblHint.BackColor = $Theme.Sidebar
-$lblHint.ForeColor = (New-Rgb 112 118 128)
+$lblHint.ForeColor = $Theme.Muted
 $lblHint.Font = $FontSmall
 $sidebar.Controls.Add($lblHint)
+
+
+# 사이드바와 본문을 나누는 얇은 선입니다. 밝은 바탕끼리는 이 선 하나면 충분합니다.
+$sideEdge = New-Object System.Windows.Forms.Panel
+$sideEdge.Location = New-Object System.Drawing.Point(219, 0)
+$sideEdge.Size = New-Object System.Drawing.Size(1, 740)
+$sideEdge.BackColor = $Theme.Border
+$script:form.Controls.Add($sideEdge)
+$sideEdge.BringToFront()
 
 # ----- 헤더 -----
 $header = New-Object System.Windows.Forms.Panel
@@ -4183,15 +4210,13 @@ $script:pillStatus.Add_Paint({
         'wait'  { $fill = New-Rgb 229 239 255; $ink = $Theme.Info }
         'done'  { $fill = New-Rgb 227 246 233; $ink = $Theme.Success }
         'error' { $fill = New-Rgb 253 237 237; $ink = $Theme.Danger }
-        default { $fill = [System.Drawing.Color]::White; $ink = $Theme.Sub }
+        default { $fill = $Theme.Soft; $ink = $Theme.Sub }
     }
     $rect = New-Object System.Drawing.Rectangle(0, 0, ($sender.Width - 1), ($sender.Height - 1))
-    $path = Get-RoundedPath $rect 19
+    $path = Get-RoundedPath $rect 16
     $brush = New-Object System.Drawing.SolidBrush ($fill)
-    $pen = New-Object System.Drawing.Pen ($Theme.Border)
     $e.Graphics.FillPath($brush, $path)
-    $e.Graphics.DrawPath($pen, $path)
-    $brush.Dispose(); $pen.Dispose(); $path.Dispose()
+    $brush.Dispose(); $path.Dispose()
     $dot = New-Object System.Drawing.SolidBrush ($ink)
     $e.Graphics.FillEllipse($dot, 17, ([int]($sender.Height / 2) - 4), 9, 9)
     $dot.Dispose()
@@ -4274,7 +4299,7 @@ $script:lstFiles.ItemHeight = 24
 $frameFiles.Controls.Add($script:lstFiles)
 foreach ($file in @($script:config.Attachments)) { [void]$script:lstFiles.Items.Add((New-AttachmentItem ([string]$file))) }
 
-$btnAddFile    = New-AppButton $cardFiles '파일 추가' 616 78 144 40 'primary'
+$btnAddFile    = New-AppButton $cardFiles '파일 추가' 616 78 144 40 'strong'
 $btnFileUp     = New-AppButton $cardFiles '위로' 616 128 144 36
 $btnFileDown   = New-AppButton $cardFiles '아래로' 616 170 144 36
 $btnRemoveFile = New-AppButton $cardFiles '선택 제거' 616 218 144 36 'danger'
@@ -4289,7 +4314,7 @@ $lblComposeHint.BackColor = $Theme.Bg
 $pageRooms = New-Page 'rooms'
 $cardRooms = New-Card $pageRooms 28 12 784 700 '발송 대상 채팅방' '[오픈채팅] 탭을 먼저 읽고 그다음 [채팅] 탭을 읽으면 종류가 정확히 나뉩니다.'
 
-$btnScanRooms  = New-AppButton $cardRooms '카카오톡에서 읽기' 24 80 170 38 'primary'
+$btnScanRooms  = New-AppButton $cardRooms '카카오톡에서 읽기' 24 80 170 38 'strong'
 $btnVerifyRoom = New-AppButton $cardRooms '이름 확인·보정' 202 80 140 38
 $btnAddRoom    = New-AppButton $cardRooms '직접 추가' 350 80 90 38
 $btnEditRoom   = New-AppButton $cardRooms '이름 수정' 448 80 84 38
@@ -4420,13 +4445,13 @@ $pageSettings = New-Page 'settings'
 
 $cardStatus = New-Card $pageSettings 28 12 784 240 '카카오톡 연결 상태' '좌표를 맞출 필요는 없습니다. 카카오톡 화면 구조를 그때그때 읽어 자동으로 찾습니다.'
 $script:lblKakaoState = New-CardLabel $cardStatus '확인 중입니다...' 24 78 736 104 $FontBase $Theme.Sub
-$btnCheckKakao = New-AppButton $cardStatus '지금 확인' 24 190 150 40 'primary'
+$btnCheckKakao = New-AppButton $cardStatus '지금 확인' 24 190 150 40 'strong'
 $btnOpenKakao = New-AppButton $cardStatus '카카오톡 창 앞으로 가져오기' 184 190 220 40
 
 $cardUpdate = New-Card $pageSettings 28 264 784 236 '업데이트' '최신 배포를 확인합니다.'
 $script:lblUpdateState = New-CardLabel $cardUpdate "현재 버전 v$($script:AppVersion)" 24 76 736 46 $FontBase $Theme.Ink
 $btnCheckUpdate  = New-AppButton $cardUpdate '업데이트 확인' 24 130 160 40
-$script:btnDoUpdate = New-AppButton $cardUpdate '지금 업데이트' 194 130 160 40 'primary'
+$script:btnDoUpdate = New-AppButton $cardUpdate '지금 업데이트' 194 130 160 40 'strong'
 $script:btnDoUpdate.Enabled = $false
 $btnClearLogFiles = New-AppButton $cardUpdate '로그 파일 모두 지우기' 364 130 200 40 'danger'
 $script:chkAutoUpdate = New-Object System.Windows.Forms.CheckBox
@@ -4448,7 +4473,7 @@ $script:chkAutoDownload.Font = $FontBase
 $cardUpdate.Controls.Add($script:chkAutoDownload)
 
 $cardFolders = New-Card $pageSettings 28 512 784 176 '도움말 및 관리'
-$btnGuide      = New-AppButton $cardFolders '가이드 다시 보기' 24 62 160 40 'primary'
+$btnGuide      = New-AppButton $cardFolders '가이드 다시 보기' 24 62 160 40 'strong'
 $btnOpenApp    = New-AppButton $cardFolders '프로그램 폴더 열기' 194 62 170 40
 $btnOpenLogs   = New-AppButton $cardFolders '로그 폴더 열기' 374 62 150 40
 $btnResetConf  = New-AppButton $cardFolders '처음 상태로 되돌리기' 534 62 200 40 'danger'
@@ -4792,7 +4817,7 @@ function Show-RoomPicker([string]$Title) {
     $txtFind.Add_TextChanged({ & $fill $txtFind.Text.Trim() })
 
     $script:pickedRoom = ''
-    $btnOk = New-AppButton $dialog '이 방으로 정하기' 262 466 148 38 'primary'
+    $btnOk = New-AppButton $dialog '이 방으로 정하기' 262 466 148 38 'strong'
     $btnCancelPick = New-AppButton $dialog '취소' 420 466 80 38
     $btnOk.Add_Click({
         if ($list.SelectedItems.Count -eq 0) {
@@ -5491,7 +5516,7 @@ function Show-SchedulePicker([datetime]$Current) {
     & $refresh
 
     $script:scheduleConfirmed = $false
-    $btnOk = New-AppButton $dialog '이 시각으로 정하기' 322 402 152 42 'primary'
+    $btnOk = New-AppButton $dialog '이 시각으로 정하기' 322 402 152 42 'strong'
     $btnCancelPick = New-AppButton $dialog '취소' 482 402 52 42
     $btnOk.Add_Click({ $script:scheduleConfirmed = $true; $dialog.Close() })
     $btnCancelPick.Add_Click({ $script:scheduleConfirmed = $false; $dialog.Close() })
@@ -6052,7 +6077,7 @@ function Show-GuideTour([string]$CaptureDir = '') {
 
     $btnSkip = New-AppButton $tour '건너뛰기' 226 370 96 38 'ghost'
     $btnPrev = New-AppButton $tour '이전' 332 370 106 38
-    $btnNext = New-AppButton $tour '다음' 448 370 116 38 'primary'
+    $btnNext = New-AppButton $tour '다음' 448 370 116 38 'strong'
 
     $renderStep = {
         $step = $script:TourSteps[$script:tourIndex]
@@ -6239,7 +6264,7 @@ function Show-SplashScreen {
     }
 
     $btnRetry = New-AppButton $splash '다시 확인' 42 356 130 40
-    $btnStart = New-AppButton $splash '시작하기' 306 356 96 40 'primary'
+    $btnStart = New-AppButton $splash '시작하기' 306 356 96 40 'strong'
     $btnQuit  = New-AppButton $splash '종료' 412 356 106 40
     $btnRetry.Visible = $false
     $btnStart.Visible = $false
