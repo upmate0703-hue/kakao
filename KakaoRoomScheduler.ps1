@@ -2438,9 +2438,18 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
     $script:lastSendProblem = ''
 
     $ways = @('실제 붙여넣기', '실제 키보드', '창 붙여넣기', '창 메시지')
+    # 이 컴퓨터에서 한 번 통한 방법을 기억해 두었다가 다음 방부터 먼저 씁니다.
+    # 안 되는 방법을 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
+    if ($script:preferredSendWay -and ($ways -contains $script:preferredSendWay)) {
+        $ways = @($script:preferredSendWay) + @($ways | Where-Object { $_ -ne $script:preferredSendWay })
+    }
     foreach ($way in $ways) {
+        # 창 메시지로 넣는 방법일 때만 보내기 전후 화면을 견줍니다.
+        # 실제 입력일 때는 확인이 필요 없으므로 화면을 뜨지 않습니다.
+        # 방 300개면 이 한 번이 쌓여 꽤 차이가 납니다.
+        $needsProof = ($way -eq '창 붙여넣기' -or $way -eq '창 메시지')
         $before = ''
-        if ($null -ne $list) { $before = Get-ChatTailSignature $list }
+        if ($needsProof -and $null -ne $list) { $before = Get-ChatTailSignature $list }
 
         $ready = $false
         try { $ready = Add-ChatMessageText $Chat $InputBox $Message $way }
@@ -2464,9 +2473,15 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
                 $script:lastSendProblem = "'$way' 로 넣고 Enter 를 눌렀지만 입력칸이 그대로입니다."
                 continue
             }
-            if (Test-ChatMessageLanded $list $before 3000) { return "$way + $press" }
-            # 입력칸은 비워졌는데 대화창에 아무것도 안 올라왔습니다.
-            # 카카오톡이 글을 지운 것입니다. 다른 방법으로 다시 해 봅니다.
+            # 사람이 직접 치는 것과 같은 방법으로 넣었다면, 입력칸이 비워진 것이
+            # 곧 전송된 것입니다. 카카오톡이 이런 글을 지우는 일은 없습니다.
+            # 여기서 또 확인한다고 다른 방법으로 다시 써 넣으면,
+            # 이미 간 글을 한 번 더 보내게 됩니다. 그래서 그냥 성공으로 봅니다.
+            if ($way -eq '실제 붙여넣기' -or $way -eq '실제 키보드') { $script:preferredSendWay = $way; return "$way + $press" }
+
+            # 창 메시지로 넣은 글은 카카오톡이 Enter 를 누르는 순간 지워 버리기도 합니다.
+            # 그때는 입력칸이 비어도 아무것도 가지 않습니다. 이 방법일 때만 확인합니다.
+            if (Test-ChatMessageLanded $list $before 3000) { $script:preferredSendWay = $way; return "$way + $press" }
             $script:lastSendProblem = "'$way' 로 넣은 글을 카카오톡이 지웠습니다. 보내지지 않았습니다."
             break
         }
@@ -2949,6 +2964,7 @@ function ConvertTo-SendKeysText([string]$Text) {
 # 채팅창 아래 아이콘이 창 메시지를 받아 주는지 한 번만 확인하고 기억합니다.
 # 안 받아 주는데 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
 $script:toolbarClickNeedsMouse = $false
+$script:preferredSendWay = ''
 $script:savedClipboard = $null
 $script:lastSendProblem = ''
 $script:roomRepairNote = ''

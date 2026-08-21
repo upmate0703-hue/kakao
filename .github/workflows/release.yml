@@ -110,6 +110,34 @@ jobs:
           $kb = [Math]::Round((Get-Item $exe).Length / 1KB)
           Write-Host "프로그램 만듦: $exe ($kb KB)"
 
+      - name: 설치 프로그램 만들기
+        env:
+          V: ${{ steps.ver.outputs.value }}
+        run: |
+          # Inno Setup 으로 설치 프로그램을 만듭니다.
+          # 깃허브 윈도우 러너에는 대개 들어 있고, 없으면 받아서 씁니다.
+          $iscc = ''
+          foreach ($p in @(
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe")) {
+            if (Test-Path $p) { $iscc = $p; break }
+          }
+          if (-not $iscc) {
+            Write-Host "Inno Setup 을 설치합니다."
+            choco install innosetup --no-progress -y
+            foreach ($p in @(
+                "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+                "$env:ProgramFiles\Inno Setup 6\ISCC.exe")) {
+              if (Test-Path $p) { $iscc = $p; break }
+            }
+          }
+          if (-not $iscc) { throw "Inno Setup 을 찾지 못했습니다." }
+          & $iscc "/DAppVersion=$env:V" "/O." "/FKakaoSender-Setup-v$env:V" 'installer.iss'
+          if ($LASTEXITCODE -ne 0) { throw "설치 프로그램을 만들지 못했습니다." }
+          $setup = "KakaoSender-Setup-v$env:V.exe"
+          if (-not (Test-Path $setup)) { throw "설치 프로그램 파일이 없습니다." }
+          $kb = [Math]::Round((Get-Item $setup).Length / 1KB)
+          Write-Host "설치 프로그램 만듦: $setup ($kb KB)"
       - name: 배포 파일 만들기
         env:
           V: ${{ steps.ver.outputs.value }}
@@ -147,11 +175,13 @@ jobs:
           # 그래서 올릴 때만 영문 이름을 씁니다. 묶음 파일 안에는 한글 이름 그대로 들어 있습니다.
           $exe = "KakaoSender-v$env:V.exe"
           Copy-Item '카카오 발송기.exe' $exe -Force
+          $setup = "KakaoSender-Setup-v$env:V.exe"
+          $files = @($setup, $zip, $exe) | Where-Object { Test-Path $_ }
           gh release view "v$env:V" 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload "v$env:V" $zip $exe --clobber
+            gh release upload "v$env:V" @files --clobber
             gh release edit "v$env:V" --notes $body --latest
           } else {
-            gh release create "v$env:V" $zip $exe --title "v$env:V" --notes $body --latest
+            gh release create "v$env:V" @files --title "v$env:V" --notes $body --latest
           }
           Write-Host "배포 완료: v$env:V"
