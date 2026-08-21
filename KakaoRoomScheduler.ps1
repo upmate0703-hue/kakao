@@ -94,6 +94,26 @@ public static class NativeKakao {
         SendMessageText(hWnd, 0x00C2, (IntPtr)1, text);
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GUIINFO {
+        public int cbSize; public int flags;
+        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+        public RECT rcCaret;
+    }
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint idThread, ref GUIINFO info);
+
+    // 지금 키보드 입력을 받고 있는 칸이 무엇인지 알아냅니다.
+    // 채팅창이 이미 열려 있던 경우 포커스가 다른 곳에 가 있을 수 있고,
+    // 그대로 Enter 를 눌러 봐야 아무 일도 일어나지 않습니다.
+    public static IntPtr GetFocusedControl(IntPtr windowOfThread) {
+        uint tid = GetWindowThreadId(windowOfThread, IntPtr.Zero);
+        if (tid == 0) { return IntPtr.Zero; }
+        GUIINFO info = new GUIINFO();
+        info.cbSize = Marshal.SizeOf(typeof(GUIINFO));
+        if (!GetGUIThreadInfo(tid, ref info)) { return IntPtr.Zero; }
+        return info.hwndFocus;
+    }
+
     static WindowInfo Describe(IntPtr hWnd, uint pid) {
         var title = new StringBuilder(512);
         var cls = new StringBuilder(256);
@@ -2281,6 +2301,32 @@ function Enter-ChatForeground([object]$Chat, [object]$InputBox) {
 # 비어 있으면 이미 전송된 것이므로 다시 보내면 안 됩니다. 두 번 가 버립니다.
 # 입력칸에 우리가 넣은 글이 그대로 남아 있는지 봅니다.
 # 비어 있으면 이미 전송된 것이므로 다시 보내면 안 됩니다. 두 번 가 버립니다.
+# 입력칸이 실제로 키보드 입력을 받는 상태인지 봅니다.
+function Test-ChatInputFocused([object]$InputBox) {
+    if ($null -eq $InputBox) { return $false }
+    try { return ([NativeKakao]::GetFocusedControl($InputBox.Handle) -eq $InputBox.Handle) } catch { return $false }
+}
+
+# 입력칸에 포커스를 줍니다.
+# 우리가 방금 연 방은 대개 입력칸이 활성화되어 있지만,
+# 사용자가 미리 열어 둔 방은 포커스가 대화 목록 쪽에 가 있는 경우가 있습니다.
+# 그 상태로 Enter 를 누르면 전송되지 않습니다. 그래서 눌러 주기 전에 확실히 맞춰 둡니다.
+function Enter-ChatInputFocus([object]$Chat, [object]$InputBox) {
+    if ($null -eq $InputBox) { return $false }
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        if (Test-ChatInputFocused $InputBox) { return $true }
+        [void](Set-ChatInputFocus $Chat)
+        if (Test-ChatInputFocused $InputBox) { return $true }
+        try {
+            [NativeKakao]::ClickControl($InputBox.Handle,
+                ($InputBox.Rect.Left + [int]($InputBox.Width / 2)),
+                ($InputBox.Rect.Top + [int]($InputBox.Height / 2)), $false)
+        } catch { }
+        Start-Sleep -Milliseconds 220
+    }
+    return (Test-ChatInputFocused $InputBox)
+}
+
 function Get-ChatInputState([object]$InputBox, [string]$Message) {
     if (-not (Test-ControlAlive $InputBox)) { return '사라짐' }
     $written = [string](Get-ChatInputText $InputBox)
@@ -2347,6 +2393,8 @@ function Test-ChatMessageLanded([object]$List, [string]$Before, [int]$TimeoutMs)
 # Enter 를 누르면 글을 지우고 보내지 않는 경우가 있습니다.
 # 그래서 실제 입력(붙여넣기, 키보드)을 먼저 쓰고, 창 메시지는 마지막에 씁니다.
 function Add-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message, [string]$Way) {
+    # 입력칸이 키보드 입력을 받는 상태여야 글이 들어가고 Enter 도 먹습니다.
+    [void](Enter-ChatInputFocus $Chat $InputBox)
     Reset-ChatInput $InputBox
     switch ($Way) {
         '실제 붙여넣기' {
@@ -2403,6 +2451,7 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
         foreach ($press in $presses) {
             if ((Get-ChatInputState $InputBox $Message) -ne '그대로') { break }
             if ($press -eq '입력칸에 Enter') {
+                [void](Enter-ChatInputFocus $Chat $InputBox)
                 [NativeKakao]::PressKey($InputBox.Handle, 0x0D)
             } else {
                 if (-not (Enter-ChatForeground $Chat $InputBox)) { continue }
@@ -4115,6 +4164,16 @@ $script:form.FormBorderStyle = 'FixedSingle'
 $script:form.MaximizeBox = $false
 $script:form.AutoScaleMode = 'None'
 $script:form.BackColor = $Theme.Bg
+# 창과 작업 표시줄에 쓸 아이콘입니다. 프로그램(.exe)에는 이미 박혀 있고,
+# 스크립트로 실행할 때는 옆에 있는 파일을 씁니다.
+try {
+    $iconPath = Join-Path $AppDir 'app.ico'
+    if ($script:IsExe -and $script:HostPath) {
+        $script:form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($script:HostPath)
+    } elseif (Test-Path -LiteralPath $iconPath) {
+        $script:form.Icon = New-Object System.Drawing.Icon($iconPath)
+    }
+} catch { }
 $script:form.Font = $FontBase
 
 # ----- 사이드바 -----
@@ -5390,11 +5449,19 @@ $btnScanRooms.Add_Click({
         Set-StatusPill '어떤 탭인지 확인 중' 'run'
         $detected = Get-ActiveKakaoTab $ready.Layout
         Set-StatusPill '준비됨' 'idle'
-        $guess = if ($detected -eq $script:RoomTypeUnknown) { '판별하지 못했습니다' } else { "$detected 탭" }
-        $ask = "지금 카카오톡에서 보고 있는 목록을 읽습니다.`r`n`r`n· 위쪽 탭 확인 결과: $guess`r`n· 카카오톡 화면 이름: $($ready.Layout.ViewName)`r`n`r`n맞으면 그대로 진행하시고, 다르면 아래에서 골라 주세요.`r`n`r`n[예] 오픈채팅으로 저장`r`n[아니오] 일반채팅으로 저장`r`n[취소] 그만두기"
-        $answer = [System.Windows.Forms.MessageBox]::Show($ask, "읽을 목록 확인 — $guess", 'YesNoCancel', 'Question')
-        if ($answer -eq 'Cancel') { return }
-        $type = if ($answer -eq 'Yes') { $script:RoomTypeOpen } else { $script:RoomTypeNormal }
+        # 종류는 카카오톡 위쪽 탭을 보고 알아서 정합니다.
+        # 예/아니오로 매번 고르게 하면 번거롭기만 하고 잘못 고르기도 쉽습니다.
+        $type = if ($detected -eq $script:RoomTypeUnknown) { $script:RoomTypeNormal } else { $detected }
+        $guess = if ($detected -eq $script:RoomTypeUnknown) { "판별하지 못해 $type 으로 저장합니다" } else { "$detected 으로 저장합니다" }
+        $ask = "지금 카카오톡에서 보고 있는 목록을 읽습니다." + "`r`n`r`n" +
+               "· 읽을 종류: $guess" + "`r`n" +
+               "· 카카오톡 화면: $($ready.Layout.ViewName)" + "`r`n`r`n" +
+               "카카오톡에서 오픈채팅을 따로 보고 계시면, 그 설정을 끄면" + "`r`n" +
+               "[채팅] 목록 하나에서 전부 읽을 수 있어 편합니다." + "`r`n" +
+               "  카카오톡 설정 → 채팅 → 오픈채팅 분리해서 보기 → 끄기" + "`r`n`r`n" +
+               "[확인] 읽기 시작    [취소] 그만두기"
+        $answer = [System.Windows.Forms.MessageBox]::Show($ask, "목록 읽기 — $type", 'OKCancel', 'Information')
+        if ($answer -ne 'OK') { return }
         if ($detected -ne $script:RoomTypeUnknown -and $detected -ne $type) {
             Write-RunLog "주의: 화면은 $detected 로 보였는데 $type 으로 저장합니다."
         }

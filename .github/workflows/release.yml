@@ -101,9 +101,11 @@ jobs:
           Install-Module -Name ps2exe -Scope CurrentUser -Force -AllowClobber
           Import-Module ps2exe
           $exe = '카카오 발송기.exe'
+          $iconArg = @{}
+          if (Test-Path 'app.ico') { $iconArg['iconFile'] = 'app.ico' }
           Invoke-PS2EXE -inputFile 'KakaoRoomScheduler.ps1' -outputFile $exe `
             -noConsole -STA -title '카카오 발송기' -product '카카오 발송기' `
-            -description '카카오톡 채팅방 예약 발송기' -version $env:V
+            -description '카카오톡 채팅방 예약 발송기' -version $env:V @iconArg
           if (-not (Test-Path $exe)) { throw "프로그램을 만들지 못했습니다." }
           $kb = [Math]::Round((Get-Item $exe).Length / 1KB)
           Write-Host "프로그램 만듦: $exe ($kb KB)"
@@ -116,6 +118,7 @@ jobs:
           New-Item -ItemType Directory -Path $dist -Force | Out-Null
           Copy-Item '카카오 발송기.exe' $dist -Force
           Copy-Item 'KakaoRoomScheduler.ps1', 'README.md' $dist -Force
+          if (Test-Path 'app.ico') { Copy-Item 'app.ico' $dist -Force }
           if (Test-Path '사용설명서.html') { Copy-Item '사용설명서.html' $dist -Force }
           # 실행 파일 이름은 바뀔 수 있으므로 있는 것을 모두 담습니다.
           $launchers = @(Get-ChildItem -Filter '*.cmd' -File)
