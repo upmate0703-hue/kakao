@@ -11,7 +11,11 @@
   한국어 문자 인식을 설치하려면 관리자 권한이 필요합니다.
   필요할 때만 물어보고 올립니다.
 #>
-param([switch]$Elevated)
+param(
+    [switch]$Elevated,
+    # 프로그램 안에서 부를 때는 이미 떠 있으므로 또 띄우지 않습니다.
+    [switch]$NoLaunch
+)
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -29,6 +33,7 @@ Say ''
 $missing = New-Object System.Collections.Generic.List[string]
 
 # --- 1. 윈도우 판 ---------------------------------------------------------
+Say '  윈도우 판을 확인하는 중...'
 try {
     $os = Get-CimInstance Win32_OperatingSystem
     $build = [int]$os.BuildNumber
@@ -42,6 +47,7 @@ try {
 # --- 2. .NET Framework ----------------------------------------------------
 # 프로그램(.exe)이 .NET Framework 로 돌아갑니다.
 # 윈도우 10 이상에는 대개 들어 있지만 확인해 둡니다.
+Say '  .NET Framework 를 확인하는 중...'
 $dotnetOk = $false
 try {
     $key = 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full'
@@ -57,6 +63,7 @@ if (-not $dotnetOk) { $missing.Add('.NET Framework 4.7.2') }
 # 채팅방 목록은 카카오톡이 직접 그려서 글자를 내놓지 않습니다.
 # 그래서 화면을 떠서 글자로 읽습니다. 이 기능이 없으면 목록을 한 개도 못 읽습니다.
 $ocrName = 'Language.OCR~~~ko-KR~0.0.1.0'
+Say '  한국어 문자 인식을 확인하는 중... (몇 초 걸립니다)'
 $ocrOk = $false
 # Get-WindowsCapability 는 확인만 해도 관리자 권한을 요구합니다.
 # 그래서 프로그램이 쓰는 것과 같은 방법으로 확인합니다.
@@ -74,6 +81,7 @@ try {
 if (-not $ocrOk) { $missing.Add('한국어 문자 인식') }
 
 # --- 4. PC 카카오톡 -------------------------------------------------------
+Say '  PC 카카오톡을 확인하는 중...'
 $kakaoOk = $false
 try {
     if (Get-Process -Name KakaoTalk -ErrorAction SilentlyContinue) { Ok 'PC 카카오톡 (지금 켜져 있습니다)'; $kakaoOk = $true }
@@ -89,9 +97,23 @@ try {
 
 Say ''
 if ($missing.Count -eq 0 -and $kakaoOk) {
-    Say '필요한 것이 모두 준비되어 있습니다. 그대로 쓰시면 됩니다.'
+    Say '필요한 것이 모두 준비되어 있습니다.'
     Say ''
-    if (-not $Elevated) { Read-Host '엔터를 누르면 닫힙니다' | Out-Null }
+    if ($Elevated) { exit 0 }
+    # 확인만 하고 끝내면 다음에 뭘 해야 할지 모르게 됩니다.
+    # 준비가 다 됐으면 바로 프로그램을 띄워 드립니다.
+    $appExe = Join-Path $PSScriptRoot '카카오 발송기.exe'
+    if ((-not $NoLaunch) -and (Test-Path -LiteralPath $appExe)) {
+        Say '프로그램을 실행합니다...'
+        try {
+            Start-Process -FilePath $appExe -WorkingDirectory $PSScriptRoot
+            Say ''
+            Say '창이 떴습니다. 이 창은 닫으셔도 됩니다.'
+            Start-Sleep -Seconds 3
+            exit 0
+        } catch { Say "프로그램을 띄우지 못했습니다: $($_.Exception.Message)" }
+    }
+    Read-Host '엔터를 누르면 닫힙니다' | Out-Null
     exit 0
 }
 

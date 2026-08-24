@@ -148,7 +148,7 @@ jobs:
           Copy-Item 'KakaoRoomScheduler.ps1', 'README.md' $dist -Force
           if (Test-Path 'app.ico') { Copy-Item 'app.ico' $dist -Force }
           # 필수 요소를 확인하고 없으면 설치해 주는 도구입니다.
-          if (Test-Path '필수요소.ps1') { Copy-Item '필수요소.ps1' $dist -Force }
+          if (Test-Path 'prereq.ps1') { Copy-Item 'prereq.ps1' $dist -Force }
           if (Test-Path '사용설명서.html') { Copy-Item '사용설명서.html' $dist -Force }
           # 실행 파일 이름은 바뀔 수 있으므로 있는 것을 모두 담습니다.
           $launchers = @(Get-ChildItem -Filter '*.cmd' -File)

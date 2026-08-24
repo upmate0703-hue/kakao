@@ -45,7 +45,7 @@ Source: "app.ico"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexis
 ; 스크립트 판도 함께 넣습니다. 예전 방식으로 쓰시던 분을 위해서입니다.
 Source: "KakaoRoomScheduler.ps1"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; 필수 요소를 확인하고 없으면 설치해 주는 도구입니다.
-Source: "필수요소.ps1"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "prereq.ps1"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "*.cmd"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]

@@ -6262,12 +6262,12 @@ $btnPrereq.Add_Click({
     # 한국어 문자 인식을 설치하려면 관리자 권한이 필요한데,
     # 이 프로그램 전체를 관리자로 띄울 이유는 없기 때문입니다.
     try {
-        $script = Join-Path $AppDir '필수요소.ps1'
+        $script = Join-Path $AppDir 'prereq.ps1'
         if (-not (Test-Path -LiteralPath $script)) {
-            [System.Windows.Forms.MessageBox]::Show('필수요소.ps1 을 찾지 못했습니다. 프로그램을 다시 받아 주세요.', '필수 요소 확인') | Out-Null
+            [System.Windows.Forms.MessageBox]::Show('prereq.ps1 을 찾지 못했습니다. 프로그램을 다시 받아 주세요.', '필수 요소 확인') | Out-Null
             return
         }
-        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script) -WorkingDirectory $AppDir
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script, '-NoLaunch') -WorkingDirectory $AppDir
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '필수 요소 확인') | Out-Null
     }
