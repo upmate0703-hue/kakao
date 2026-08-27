@@ -623,6 +623,25 @@ function Get-AttachmentPaths {
     return @($script:lstFiles.Items | ForEach-Object { [string]$_.Path })
 }
 
+# 화면 글자 인식이 한 글자쯤 틀리면 같은 방이 둘로 남습니다.
+#   [5K X 아우여 (따몽이)]  /  [5K X 아우여 (따봉이)]
+# 길이가 같고 한 글자만 다르면 같은 방으로 보고 합칩니다.
+# 짧은 이름은 진짜 다른 방일 수 있으므로 여덟 자 이상일 때만 합칩니다.
+function Test-NearSameRoomName([string]$A, [string]$B) {
+    $keyA = ConvertTo-CompareKey $A
+    $keyB = ConvertTo-CompareKey $B
+    if (-not $keyA -or -not $keyB) { return $false }
+    if ($keyA -eq $keyB) { return $true }
+    if ($keyA.Length -ne $keyB.Length) { return $false }
+    if ($keyA.Length -lt 8) { return $false }
+    $diff = 0
+    for ($i = 0; $i -lt $keyA.Length; $i++) {
+        if ($keyA[$i] -ne $keyB[$i]) { $diff++ }
+        if ($diff -gt 1) { return $false }
+    }
+    return ($diff -eq 1)
+}
+
 function Repair-RoomNames([object]$Config) {
     $order = New-Object System.Collections.Generic.List[string]
     $byKey = @{}
@@ -647,6 +666,12 @@ function Repair-RoomNames([object]$Config) {
         $key = ConvertTo-CompareKey $name
         if (-not $key) { continue }
         if ($byKey.ContainsKey($key)) { $merged++; continue }
+        # 한 글자만 다른 이름이 이미 있으면 같은 방으로 봅니다.
+        $near = ''
+        foreach ($seen in $order) {
+            if (Test-NearSameRoomName $name $byKey[$seen]) { $near = $seen; break }
+        }
+        if ($near) { $merged++; continue }
         $byKey[$key] = $name
         [void]$order.Add($key)
     }
@@ -1915,6 +1940,22 @@ function Get-WindowImage([object]$Window) {
     return $bitmap
 }
 
+# 화면 글자 인식은 글자가 클수록 잘 맞습니다.
+# 카카오톡 목록 글자는 작아서 그대로 읽히면 자주 틀립니다.
+#   확대 2배: [트4규형] [서인금융진흥원]
+#   확대 4배: [택규형]  [서민금융진흥원]
+# 실제로 재 보니 4배가 정확하고 속도도 2배와 거의 같았습니다.
+# 다만 창이 크면 그림도 커지므로, 가로 1300픽셀 언저리가 되게 배율을 정합니다.
+function Get-OcrScaleFor([object]$Window) {
+    $width = 0
+    try { $width = [int]$Window.Width } catch { }
+    if ($width -le 0) { return 4 }
+    $scale = [int][Math]::Round(1300.0 / $width)
+    if ($scale -lt 2) { $scale = 2 }
+    if ($scale -gt 4) { $scale = 4 }
+    return $scale
+}
+
 function Get-OcrLines([object]$Window, [int]$Scale = 2) {
     if ($null -eq $Window) { return @() }
     if (-not (Initialize-Ocr)) { throw "문자 인식을 사용할 수 없습니다. $($script:ocrError)" }
@@ -1994,7 +2035,7 @@ function Get-KakaoRoomNames([int]$MaxPages = 30) {
 
     for ($page = 0; $page -lt $pageLimit; $page++) {
         $before = $names.Count
-        $found = @(Get-RoomNamesFromOcrLines (Get-OcrLines $list 2) $list.Width)
+        $found = @(Get-RoomNamesFromOcrLines (Get-OcrLines $list (Get-OcrScaleFor $list)) $list.Width)
         foreach ($name in $found) {
             if (-not $names.Contains([string]$name)) { $names.Add([string]$name) }
         }
@@ -2055,7 +2096,7 @@ function Open-RoomFromList([string]$Query, [object]$Layout, [int]$MaxPages = 40)
     }
 
     for ($page = 0; $page -lt $MaxPages; $page++) {
-        $lines = @(Get-OcrLines $list 2)
+        $lines = @(Get-OcrLines $list (Get-OcrScaleFor $list))
         $matched = Find-SearchResultLine $lines $Query $list.Width
         if ($null -ne $matched) {
             $x = $list.Rect.Left + [int]($list.Width * 0.35)
@@ -2117,7 +2158,7 @@ function Open-RoomBySearch([string]$Query, [string]$RoomType, [int]$TimeoutMs = 
             try {
                 $refreshed = Get-KakaoLayout (Get-MainKakaoWindow)
                 if ($null -ne $refreshed.List) { $list = $refreshed.List }
-                $lines = @(Get-OcrLines $list 2)
+                $lines = @(Get-OcrLines $list (Get-OcrScaleFor $list))
                 $matchedLine = Find-SearchResultLine $lines $Query $list.Width
                 if ($null -ne $matchedLine) { break }
             } catch { }
@@ -3091,7 +3132,7 @@ function Invoke-ChatSend([object]$Chat, [object]$InputBox) {
 # 그래서 검색을 쓰지 않고, 목록을 위에서 아래로 한 번 훑으며 대상 방을 처리합니다.
 # 방 300개도 목록 한 바퀴로 끝나므로 가장 빠르고 안정적입니다.
 function Get-ListNameLines([object]$List) {
-    $lines = @(Get-OcrLines $List 2)
+    $lines = @(Get-OcrLines $List (Get-OcrScaleFor $List))
     return @($lines | Where-Object {
         $_.Left -ge ($List.Width * 0.13) -and $_.Left -le ($List.Width * 0.46)
     } | Sort-Object Top)
@@ -3298,7 +3339,7 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
         if ($remaining.Count -eq 0) { break }
         $fresh = Get-KakaoLayout (Get-MainKakaoWindow)
         if ($null -eq $fresh.List) { break }
-        $names = @(Get-RoomNamesFromOcrLines (Get-OcrLines $fresh.List 2) $fresh.List.Width)
+        $names = @(Get-RoomNamesFromOcrLines (Get-OcrLines $fresh.List (Get-OcrScaleFor $fresh.List)) $fresh.List.Width)
         $notches = [Math]::Max(3, [Math]::Min(8, $names.Count - 1))
         Move-ListByWheel $fresh.List 'down' $notches
         Start-Sleep -Milliseconds 200
@@ -3831,6 +3872,16 @@ if ($SelfTest) {
     if ((Remove-RoomNameNoise '95 비와이') -ne '95 비와이') { throw '이름 다듬기가 진짜 이름을 깎았습니다 (숫자)' }
     if ((Remove-RoomNameNoise '0※자유 홍보 방 ※') -ne '※자유 홍보 방 ※') { throw '이름 다듬기 실패 (기호 앞 뱃지)' }
     if ((Remove-RoomNameNoise '마케팅 자유 홍보.-') -ne '마케팅 자유 홍보') { throw '이름 다듬기 실패 (끝 찌꺼기)' }
+    # 한 글자 오인식으로 같은 방이 둘로 남는 것을 합칩니다.
+    if (-not (Test-NearSameRoomName '5K X 아우여 (따몽이)' '5K X 아우여 (따봉이)')) { throw '비슷한 이름을 합치지 못합니다' }
+    # 짧은 이름은 진짜 다른 방일 수 있으므로 합치면 안 됩니다.
+    if (Test-NearSameRoomName '토스' '토트') { throw '짧은 이름까지 합칩니다' }
+    if (Test-NearSameRoomName '네이버쇼핑입니다' '카카오쇼핑입니다') { throw '두 글자 이상 달라도 합칩니다' }
+    # 화면 글자 인식 배율은 창 폭에 맞춰 2~4배 사이여야 합니다.
+    $probeWin = [pscustomobject]@{ Width = 325 }
+    if ((Get-OcrScaleFor $probeWin) -ne 4) { throw '좁은 목록에서 확대 배율이 4배가 아닙니다' }
+    $probeWide = [pscustomobject]@{ Width = 900 }
+    if ((Get-OcrScaleFor $probeWide) -lt 2) { throw '넓은 목록에서 확대 배율이 너무 작습니다' }
     # 열린 창 제목으로 어느 방인지 다시 정하는 기능입니다.
     # 목록에서 읽은 이름은 잘리거나 틀릴 수 있지만 창 제목은 정확합니다.
     $probePending = @('자유홍보 광고/마', '스마트스토어 불로', '전혀 다른 방 이름')
