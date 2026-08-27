@@ -2220,7 +2220,7 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
     # 그래서 방이 완전히 열릴 때까지 기다린 뒤에만 손을 댑니다.
     $ready = Wait-ChatWindowReady $Chat $Room ([int]$Content.OpenTimeoutMs)
     if ($null -eq $ready) {
-        Write-RunLog "건너뜀: '$Room' — 방이 다 열리지 않았습니다. (대화가 많으면 오래 걸립니다)"
+        Write-RunLog "건너뜀: '$Room' — ROOM_OPEN_FAILED 방이 다 열리지 않았습니다. (대화가 많으면 오래 걸립니다)"
         Close-ChatWindow $Chat
         return $false
     }
@@ -2469,18 +2469,18 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
         $ways = @($script:preferredSendWay) + @($ways | Where-Object { $_ -ne $script:preferredSendWay })
     }
     foreach ($way in $ways) {
-        # 창 메시지로 넣는 방법일 때만 보내기 전후 화면을 견줍니다.
-        # 실제 입력일 때는 확인이 필요 없으므로 화면을 뜨지 않습니다.
-        # 방 300개면 이 한 번이 쌓여 꽤 차이가 납니다.
-        $needsProof = ($way -eq '창 붙여넣기' -or $way -eq '창 메시지')
+        # 보내기 전 대화창 모습을 기억해 둡니다.
+        # 보낸 뒤 이것과 견주어 글이 실제로 올라왔는지 확인합니다.
+        # 어떤 방법으로 넣었든 확인합니다. 키를 눌렀다는 것과
+        # 메시지가 갔다는 것은 다른 상태이기 때문입니다.
         $before = ''
-        if ($needsProof -and $null -ne $list) { $before = Get-ChatTailSignature $list }
+        if ($null -ne $list) { $before = Get-ChatTailSignature $list }
 
         $ready = $false
         try { $ready = Add-ChatMessageText $Chat $InputBox $Message $way }
         catch { $script:lastSendProblem = "글을 넣는 중 문제가 생겼습니다: $($_.Exception.Message)"; continue }
         if (-not $ready) {
-            $script:lastSendProblem = "'$way' 로는 입력칸에 글을 넣지 못했습니다."
+            $script:lastSendProblem = "INPUT_FAILED — '$way' 로는 입력칸에 글을 넣지 못했습니다."
             continue
         }
 
@@ -2495,23 +2495,25 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
                 [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
             }
             if (-not (Wait-ChatInputCleared $InputBox 2200)) {
-                $script:lastSendProblem = "'$way' 로 넣고 Enter 를 눌렀지만 입력칸이 그대로입니다."
+                $script:lastSendProblem = "SEND_ACTION_FAILED — '$way' 로 넣고 Enter 를 눌렀지만 입력칸이 그대로입니다."
                 continue
             }
-            # 사람이 직접 치는 것과 같은 방법으로 넣었다면, 입력칸이 비워진 것이
-            # 곧 전송된 것입니다. 카카오톡이 이런 글을 지우는 일은 없습니다.
-            # 여기서 또 확인한다고 다른 방법으로 다시 써 넣으면,
-            # 이미 간 글을 한 번 더 보내게 됩니다. 그래서 그냥 성공으로 봅니다.
-            if ($way -eq '실제 붙여넣기' -or $way -eq '실제 키보드') { $script:preferredSendWay = $way; return "$way + $press" }
+            # 입력칸이 비워진 것만으로는 보냈다고 할 수 없습니다.
+            # 카카오톡이 글을 그냥 지워 버리는 경우가 있고, 그때도 입력칸은 빕니다.
+            # 그래서 대화창에 글이 올라온 것까지 확인해야 성공으로 봅니다.
+            if (Test-ChatMessageLanded $list $before 3500) {
+                $script:preferredSendWay = $way
+                return "$way + $press"
+            }
 
-            # 창 메시지로 넣은 글은 카카오톡이 Enter 를 누르는 순간 지워 버리기도 합니다.
-            # 그때는 입력칸이 비어도 아무것도 가지 않습니다. 이 방법일 때만 확인합니다.
-            if (Test-ChatMessageLanded $list $before 3000) { $script:preferredSendWay = $way; return "$way + $press" }
-            $script:lastSendProblem = "'$way' 로 넣은 글을 카카오톡이 지웠습니다. 보내지지 않았습니다."
-            break
+            # 여기서 다른 방법으로 다시 써 넣으면 안 됩니다.
+            # 실제로는 갔는데 확인만 못 한 경우라면 같은 글이 두 번 가 버립니다.
+            # 확인되지 않았다고 알리고 끝냅니다.
+            $script:lastSendProblem = 'SEND_VERIFY_FAILED — 보낸 뒤 대화창에 글이 올라온 것을 확인하지 못했습니다.'
+            return ''
         }
     }
-    if (-not $script:lastSendProblem) { $script:lastSendProblem = '전송되지 않았습니다.' }
+    if (-not $script:lastSendProblem) { $script:lastSendProblem = 'SEND_ACTION_FAILED — 전송되지 않았습니다.' }
     try { Reset-ChatInput $InputBox } catch { }
     return ''
 }
@@ -3256,14 +3258,14 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
                 $remaining.Remove($hitName)
                 $processed++
                 $failed++
-                Write-RunLog "건너뜀: '$hitName' — 채팅창을 열지 못했습니다."
+                Write-RunLog "건너뜀: '$hitName' — ROOM_NOT_FOUND 채팅창을 열지 못했습니다."
             } else {
                 # 열린 창 제목이 정답입니다. 목록에서 읽은 이름보다 정확합니다.
                 $openedTitle = ([string]$chat.Title).Trim()
                 $realName = Resolve-OpenedRoom $openedTitle @($remaining.Keys)
                 if (-not $realName) {
                     # 보내려던 방이 아닙니다. 닫고 이 줄은 다시 고르지 않습니다.
-                    Write-RunLog "지나감: 열린 방 '$openedTitle' 은(는) 보낼 목록에 없습니다."
+                    Write-RunLog "지나감: ROOM_TYPE_MISMATCH 열린 방 '$openedTitle' 은(는) 보낼 목록에 없습니다."
                     Close-ChatWindow $chat
                     $rejected[(ConvertTo-CompareKey ([string]$hit.Text))] = $true
                     continue
@@ -3314,6 +3316,78 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
 # 다 불러오기 전에는 Enter 를 눌러도 전송이 되지 않습니다.
 # 그래서 보내기 전에 대상 방을 한 번씩 열어 두면 이후가 훨씬 안정적입니다.
 # 한 번 열어 둔 방은 카카오톡이 기억하고 있어서 다음부터는 금방 열립니다.
+# 이 컴퓨터가 어떤 환경인지 기록에 남깁니다.
+# PC 마다 되고 안 되고가 갈릴 때, 이 기록이 있어야 원인을 짚을 수 있습니다.
+# 대화 내용은 남기지 않습니다. 화면과 창 정보만 남깁니다.
+function Write-EnvironmentLog([object]$MainWindow) {
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        $osText = if ($null -ne $os) { "$($os.Caption) 빌드 $($os.BuildNumber)" } else { '알 수 없음' }
+        Write-RunLog "환경: $osText / 파워셸 $($PSVersionTable.PSVersion)"
+    } catch { }
+    try {
+        $screens = @([System.Windows.Forms.Screen]::AllScreens)
+        $primary = [System.Windows.Forms.Screen]::PrimaryScreen
+        # 화면 배율은 그리기 해상도로 알아냅니다. 96 이 100% 입니다.
+        $scale = 100
+        try {
+            $g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+            $scale = [int][Math]::Round($g.DpiX / 96 * 100)
+            $g.Dispose()
+        } catch { }
+        Write-RunLog ("환경: 모니터 {0}개 / 주 모니터 {1}x{2} / 화면 배율 {3}%" -f `
+            $screens.Count, $primary.Bounds.Width, $primary.Bounds.Height, $scale)
+        if ($scale -ne 100) {
+            Write-RunLog '  (배율이 100%가 아니면 화면 글자 인식이 어려워질 수 있습니다)'
+        }
+    } catch { }
+    try {
+        if ($null -ne $MainWindow) {
+            $min = [NativeKakao]::IsWindowMinimized($MainWindow.Handle)
+            Write-RunLog ("환경: 카카오톡 창 {0}x{1} @{2},{3} / 최소화={4}" -f `
+                $MainWindow.Width, $MainWindow.Height, $MainWindow.Rect.Left, $MainWindow.Rect.Top, $min)
+            if ($MainWindow.Width -lt 340 -or $MainWindow.Height -lt 480) {
+                Write-RunLog '  (카카오톡 창이 작습니다. 창을 키우면 목록을 더 정확히 읽습니다)'
+            }
+        }
+    } catch { }
+}
+
+# 보낼 방들이 어느 종류인지 보고, 지금 카카오톡이 그 탭을 보고 있는지 확인합니다.
+# 오픈채팅방으로 보내려는데 [채팅] 탭이 열려 있으면 방을 찾지 못합니다.
+# 그대로 진행하면 전부 실패하므로, 시작 전에 알려 드리고 멈춥니다.
+function Test-SendTabReady([string[]]$Rooms, [object]$Layout) {
+    $wantOpen = $false
+    $wantNormal = $false
+    foreach ($room in $Rooms) {
+        $type = Get-RoomType ([string]$room)
+        if ($type -eq $script:RoomTypeOpen) { $wantOpen = $true }
+        elseif ($type -eq $script:RoomTypeNormal) { $wantNormal = $true }
+    }
+    # 두 종류를 함께 보내는 경우에는 막지 않습니다.
+    # 한 바퀴 돈 뒤 다른 탭으로 바꿔 달라고 그때 여쭙습니다.
+    if ($wantOpen -and $wantNormal) { return '' }
+    if (-not $wantOpen -and -not $wantNormal) { return '' }
+
+    $now = $script:RoomTypeUnknown
+    try { $now = Get-ActiveKakaoTab $Layout } catch { }
+    if ($now -eq $script:RoomTypeUnknown) { return '' }
+
+    if ($wantOpen -and $now -ne $script:RoomTypeOpen) {
+        return "[오픈채팅 탭 확인 필요]" + "`r`n`r`n" +
+               "지금 오픈채팅방 발송이 선택되어 있습니다." + "`r`n`r`n" +
+               "카카오톡 PC 에서 [오픈채팅] 탭을 열어 둔 뒤 다시 시도해 주세요." + "`r`n`r`n" +
+               "(지금 카카오톡은 $now 을(를) 보고 있습니다)"
+    }
+    if ($wantNormal -and $now -ne $script:RoomTypeNormal) {
+        return "[일반채팅 탭 확인 필요]" + "`r`n`r`n" +
+               "지금 일반 채팅방 발송이 선택되어 있습니다." + "`r`n`r`n" +
+               "카카오톡 PC 에서 [채팅] 탭을 열어 둔 뒤 다시 시도해 주세요." + "`r`n`r`n" +
+               "(지금 카카오톡은 $now 을(를) 보고 있습니다)"
+    }
+    return ''
+}
+
 function Invoke-RoomPreload([string[]]$Rooms) {
     $targets = @($Rooms | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
     if ($targets.Count -eq 0) { return $false }
@@ -3397,6 +3471,19 @@ function Invoke-Broadcast {
     # 그러고도 못 찾은 방이 있으면 다른 탭으로 바꿔 한 번 더 훑습니다.
     $ready = Test-KakaoReady $true $false
     if (-not $ready.Ok) { throw $ready.Reason }
+
+    # 어떤 환경인지 남겨 둡니다. PC 마다 결과가 다를 때 짚어 보기 위해서입니다.
+    Write-EnvironmentLog $ready.Layout.Main
+
+    # 보낼 방 종류와 지금 열려 있는 탭이 맞는지 먼저 봅니다.
+    # 안 맞으면 전부 실패하므로 시작하지 않고 알려 드립니다.
+    if (-not $dryRun) {
+        $tabProblem = Test-SendTabReady $rooms $ready.Layout
+        if ($tabProblem) {
+            Write-RunLog 'WRONG_TAB — 보낼 방 종류와 카카오톡에 열린 탭이 다릅니다. 시작하지 않았습니다.'
+            throw $tabProblem
+        }
+    }
 
     # 처음 보내는 경우에는 대상 방을 먼저 한 번씩 열어 둡니다.
     # 대화를 불러오는 중에는 전송이 먹지 않기 때문입니다.
@@ -5621,7 +5708,19 @@ $btnScanRooms.Add_Click({
         Set-StatusPill '준비됨' 'idle'
         Write-RunLog "목록 읽기 완료: $($type) / 화면 $($scan.Pages)개 / 후보 $(@($scan.Names).Count)개 중 새 항목 $($added)개"
 
-        $result = "$($type) 방 $(@($scan.Names).Count)개를 읽었습니다. (새로 추가 $($added)개)"
+        $readCount = @($scan.Names).Count
+        $result = "$($type) 방 $($readCount)개를 읽었습니다. (새로 추가 $($added)개)"
+        # 카카오톡에 방이 많이 쌓여 있으면 처음에 목록이 제대로 안 그려지는 일이 있습니다.
+        # 예전에 알던 개수보다 크게 적으면 그 상황일 수 있어 알려 드립니다.
+        $knownBefore = @($script:config.KnownRooms).Count
+        if ($readCount -gt 0 -and $knownBefore -ge 20 -and $readCount -lt ($knownBefore * 0.5)) {
+            Write-RunLog "주의: 예전에 알던 $($knownBefore)개보다 훨씬 적은 $($readCount)개만 읽혔습니다."
+            $result += "`r`n`r`n[목록이 적게 읽혔습니다]"
+            $result += "`r`n예전에는 $($knownBefore)개였는데 이번에는 $($readCount)개만 읽혔습니다."
+            $result += "`r`n카카오톡에 방이 많이 쌓여 있으면 처음에 목록이 다 그려지지 않는 일이 있습니다."
+            $result += "`r`n`r`n카카오톡 채팅 화면을 한 번 닫았다가 다시 열고, 목록을 맨 위까지 올린 뒤"
+            $result += "`r`n[카카오톡에서 읽기]를 한 번 더 눌러 주세요."
+        }
         if (@($scan.Names).Count -eq 0) {
             $result += "`r`n`r`n한 개도 읽지 못했습니다. 카카오톡에서 목록이 실제로 보이는 상태인지 확인하고, 창을 조금 크게 한 뒤 다시 시도해 보세요."
         } else {
