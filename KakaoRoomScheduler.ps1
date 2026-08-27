@@ -7,6 +7,10 @@
     [switch]$SendBench,
     [int]$BenchCount = 3,
     [string]$ScreenshotDir = ''
+    ,
+    # 화면 배율을 일부러 바꿔 화면이 깨지지 않는지 보는 용도입니다.
+    # 100% 컴퓨터에서도 125%, 150% 모습을 확인할 수 있습니다.
+    [double]$UiScaleTest = 0
 )
 
 Set-StrictMode -Version Latest
@@ -112,6 +116,35 @@ public static class NativeKakao {
         info.cbSize = Marshal.SizeOf(typeof(GUIINFO));
         if (!GetGUIThreadInfo(tid, ref info)) { return IntPtr.Zero; }
         return info.hwndFocus;
+    }
+
+    [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+    [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int value);
+    [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hWnd);
+    [DllImport("gdi32.dll")] static extern int GetDeviceCaps(IntPtr hdc, int index);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
+
+    // 화면 배율을 그대로 인식하도록 선언합니다.
+    // 이걸 하지 않으면 윈도우가 화면을 대신 늘려 줍니다.
+    // 그러면 우리가 뜨는 카카오톡 그림도 줄어들어 글자 인식이 나빠집니다.
+    // 창을 하나라도 만들기 전에 불러야 합니다.
+    public static string MakeDpiAware() {
+        try { if (SetProcessDpiAwarenessContext((IntPtr)(-4))) { return "모니터별(V2)"; } } catch { }
+        try { if (SetProcessDpiAwarenessContext((IntPtr)(-3))) { return "모니터별"; } } catch { }
+        try { if (SetProcessDpiAwareness(2) == 0) { return "모니터별(shcore)"; } } catch { }
+        try { if (SetProcessDPIAware()) { return "시스템"; } } catch { }
+        return "";
+    }
+
+    // 지금 화면의 DPI 입니다. 96 이 100% 입니다.
+    public static int GetSystemDpi() {
+        IntPtr dc = GetDC(IntPtr.Zero);
+        if (dc == IntPtr.Zero) { return 96; }
+        int dpi = GetDeviceCaps(dc, 88);
+        ReleaseDC(IntPtr.Zero, dc);
+        if (dpi <= 0) { return 96; }
+        return dpi;
     }
 
     static WindowInfo Describe(IntPtr hWnd, uint pid) {
@@ -493,6 +526,43 @@ public static class FastImage {
 }
 
 # ---------------------------------------------------------------------------
+# 화면 배율 (DPI)
+# ---------------------------------------------------------------------------
+# 윈도우 배율이 125% 나 150% 인 컴퓨터가 많습니다.
+# 배율을 그대로 인식하지 않으면 윈도우가 창을 대신 늘려 줍니다.
+# 보기에는 비슷하지만, 우리가 뜨는 카카오톡 그림이 줄어들어
+# 채팅방 이름을 읽는 정확도가 떨어집니다.
+#
+# 그래서 배율을 그대로 받아들이고, 화면 요소 크기는 우리가 직접 곱합니다.
+# 아래 S / New-UiPoint / New-UiSize 를 거치면 어느 배율에서도 같은 모양이 됩니다.
+$script:DpiMode = ''
+try { $script:DpiMode = [NativeKakao]::MakeDpiAware() } catch { }
+$script:SystemDpi = 96
+try { $script:SystemDpi = [int][NativeKakao]::GetSystemDpi() } catch { }
+if ($script:SystemDpi -le 0) { $script:SystemDpi = 96 }
+$script:UiScale = [Math]::Round(($script:SystemDpi / 96.0), 3)
+if ($script:UiScale -lt 1.0) { $script:UiScale = 1.0 }
+if ($script:UiScale -gt 3.0) { $script:UiScale = 3.0 }
+# 시험용으로 배율을 지정했으면 그 값을 씁니다.
+if ($UiScaleTest -gt 0) { $script:UiScale = [Math]::Round($UiScaleTest, 3) }
+$script:UiScalePercent = [int][Math]::Round($script:UiScale * 100)
+
+# 크기 하나를 배율에 맞춰 늘립니다.
+function S([double]$Value) { return [int][Math]::Round($Value * $script:UiScale) }
+
+# 화면 요소의 위치와 크기는 반드시 이 두 가지를 거칩니다.
+function New-UiPoint([double]$X, [double]$Y) {
+    return New-Object System.Drawing.Point((S $X), (S $Y))
+}
+function New-UiSize([double]$W, [double]$H) {
+    return New-Object System.Drawing.Size((S $W), (S $H))
+}
+# 그림을 그릴 때 쓰는 네모입니다.
+function New-UiRect([double]$X, [double]$Y, [double]$W, [double]$H) {
+    return New-Object System.Drawing.Rectangle((S $X), (S $Y), (S $W), (S $H))
+}
+
+# ---------------------------------------------------------------------------
 # 경로 및 설정
 # ---------------------------------------------------------------------------
 # 프로그램(.exe) 으로 만들어 실행하면 $MyInvocation.MyCommand.Path 가 비어 있습니다.
@@ -573,6 +643,15 @@ function New-DefaultConfig {
         PreloadRooms = $true
         PreloadDone = $false
         TruncatedRooms = @()
+        # 공휴일마다 어떻게 할지 하나씩 정합니다.
+        #   { Date = '2026-09-24'; Name = '추석'; Action = 'move'; MoveTo = '2026-09-25' }
+        #   Action: normal(그대로 보냄) / skip(그날은 안 보냄) / move(다른 날로 옮김)
+        HolidayRules = @()
+        # 옮긴 날에 두 번 보내지 않도록, 보낸 날을 적어 둡니다.
+        SentDays = @()
+        # 방이 1:1 인지 단체인지 오픈채팅인지 적어 둡니다.
+        #   direct(1:1) / group(단체) / open(오픈채팅) / unknown(모름)
+        RoomKinds = [pscustomobject]@{}
         AutoCheckUpdate = $true
         TourDone = $false
         Calibration = [pscustomobject]@{
@@ -729,6 +808,7 @@ function Repair-Config([object]$Config) {
     }
     if ($null -eq $Config.RoomTypes) { $Config.RoomTypes = [pscustomobject]@{} }
     if ($null -eq $Config.RoomListNames) { $Config.RoomListNames = [pscustomobject]@{} }
+    if ($null -eq $Config.RoomKinds) { $Config.RoomKinds = [pscustomobject]@{} }
     # 예전 버전이 쓰던 표기를 현재 표기로 맞춥니다.
     foreach ($property in @($Config.RoomTypes.PSObject.Properties)) {
         if ([string]$property.Value -eq '확인 필요') { $Config.RoomTypes.($property.Name) = $script:RoomTypeUnknown }
@@ -760,6 +840,54 @@ function Write-RunLog([string]$Text) {
         $script:txtLog.SelectionStart = $script:txtLog.TextLength
         $script:txtLog.ScrollToCaret()
         [System.Windows.Forms.Application]::DoEvents()
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 방 종류 (1:1 / 단체 / 오픈채팅)
+# ---------------------------------------------------------------------------
+# 이름만 보고 짐작하지 않습니다. 창 제목에 실제로 적힌 것을 씁니다.
+# 카카오톡은 단체 채팅방 제목 뒤에 인원수를 붙입니다.  예: 우리반 공지방 (24)
+# 1:1 은 인원수가 붙지 않습니다.
+# 오픈채팅은 목록 탭에서 이미 알 수 있습니다.
+# 확실하지 않으면 unknown 으로 두고 일반채팅으로 다룹니다. 잘못 나누는 것보다 낫습니다.
+function Get-RoomKindFromTitle([string]$Title, [string]$RoomType) {
+    if ($RoomType -eq $script:RoomTypeOpen) { return 'open' }
+    $title = ([string]$Title).Trim()
+    if (-not $title) { return 'unknown' }
+    if ($title -match '\((\d{1,5})\)\s*$') {
+        $count = [int]$Matches[1]
+        if ($count -ge 3) { return 'group' }
+        if ($count -eq 2) { return 'direct' }
+    }
+    return 'unknown'
+}
+
+function Get-RoomKind([string]$Name) {
+    try {
+        $prop = $script:config.RoomKinds.PSObject.Properties[$Name]
+        if ($null -ne $prop -and [string]$prop.Value) { return [string]$prop.Value }
+    } catch { }
+    return 'unknown'
+}
+
+function Set-RoomKind([string]$Name, [string]$Kind) {
+    if (-not $Name -or -not $Kind -or $Kind -eq 'unknown') { return }
+    try {
+        if ($null -eq $script:config.RoomKinds) { $script:config.RoomKinds = [pscustomobject]@{} }
+        $prop = $script:config.RoomKinds.PSObject.Properties[$Name]
+        if ($null -eq $prop) { Add-Member -InputObject $script:config.RoomKinds -NotePropertyName $Name -NotePropertyValue $Kind }
+        else { $script:config.RoomKinds.$Name = $Kind }
+    } catch { }
+}
+
+# 화면에 보여 줄 때 쓰는 말입니다.
+function Get-RoomKindText([string]$Name) {
+    switch (Get-RoomKind $Name) {
+        'direct' { return '1:1' }
+        'group'  { return '단체' }
+        'open'   { return '오픈채팅' }
+        default    { return '일반채팅' }
     }
 }
 
@@ -932,6 +1060,73 @@ function Get-KoreanHolidays([int]$Year) {
     return $holidays
 }
 
+# ---------------------------------------------------------------------------
+# 공휴일 규칙
+# ---------------------------------------------------------------------------
+# 공휴일마다 그대로 보낼지, 건너뛸지, 다른 날로 옮길지 하나씩 정합니다.
+# 예전에는 공휴일 전체를 한꺼번에 처리해서 날짜마다 다르게 할 수 없었습니다.
+# 설정 파일에서 읽어 온 항목은 형식이 굳어 있어
+# 다른 형식을 그냥 넣으면 "형식이 맞지 않는다" 는 오류가 납니다.
+# 그래서 항목을 지우고 새로 만듭니다. 이러면 형식 문제가 생기지 않습니다.
+function Set-ConfigValue([string]$Name, [object]$Value) {
+    try { $script:config.PSObject.Properties.Remove($Name) } catch { }
+    try {
+        Add-Member -InputObject $script:config -NotePropertyName $Name -NotePropertyValue $Value -Force
+    } catch {
+        Write-RunLog "설정 저장 실패 ($Name): $($_.Exception.Message)"
+    }
+}
+
+function Get-HolidayRule([datetime]$Date) {
+    $key = $Date.ToString('yyyy-MM-dd')
+    foreach ($rule in @($script:config.HolidayRules)) {
+        try { if ([string]$rule.Date -eq $key) { return $rule } } catch { }
+    }
+    return $null
+}
+
+function Set-HolidayRule([string]$Date, [string]$Name, [string]$Action, [string]$MoveTo) {
+    # 이 날짜의 예전 규칙은 빼고 나머지를 남깁니다.
+    $kept = @()
+    foreach ($rule in @($script:config.HolidayRules)) {
+        try { if ([string]$rule.Date -ne $Date) { $kept = @($kept) + $rule } } catch { }
+    }
+    # 그대로 보내는 것이 기본이라 따로 적어 두지 않습니다.
+    if ($Action -ne 'normal') {
+        $kept = @($kept) + ([pscustomobject]@{ Date = $Date; Name = $Name; Action = $Action; MoveTo = $MoveTo })
+    }
+    Set-ConfigValue 'HolidayRules' @($kept)
+}
+
+# 이 날짜가 어떤 공휴일에서 옮겨 온 날인지 봅니다.
+function Get-MovedFromHoliday([datetime]$Date) {
+    $key = $Date.ToString('yyyy-MM-dd')
+    foreach ($rule in @($script:config.HolidayRules)) {
+        try {
+            if ([string]$rule.Action -eq 'move' -and [string]$rule.MoveTo -eq $key) { return $rule }
+        } catch { }
+    }
+    return $null
+}
+
+# 같은 날 두 번 보내지 않도록, 보낸 날을 적어 둡니다.
+# 공휴일을 다른 날로 옮겼는데 그날 원래 일정도 있으면 두 번 갈 수 있습니다.
+function Test-AlreadySentToday([datetime]$Date) {
+    $key = $Date.ToString('yyyy-MM-dd')
+    try { return (@($script:config.SentDays) -contains $key) } catch { return $false }
+}
+
+function Add-SentDay([datetime]$Date) {
+    $key = $Date.ToString('yyyy-MM-dd')
+    try {
+        $days = @($script:config.SentDays)
+        if ($days -contains $key) { return }
+        # 최근 60일치만 남깁니다. 오래된 것은 쓸 일이 없습니다.
+        $days = @($days + $key | Sort-Object -Unique | Select-Object -Last 60)
+        Set-ConfigValue 'SentDays' @($days)
+    } catch { }
+}
+
 function Get-HolidayName([datetime]$Date) {
     $key = $Date.ToString('yyyy-MM-dd')
     foreach ($extra in @($script:config.ExtraHolidays)) {
@@ -974,8 +1169,27 @@ function Get-SendBlockReason([datetime]$When) {
     }
     if (Test-BlockedWeekend $When) { return '주말에는 보내지 않도록 설정되어 있습니다.' }
     $holiday = Get-HolidayName $When
-    if ($holiday -and ([string]$script:config.HolidayMode -eq '보내지 않음')) {
-        return "오늘은 $holiday 입니다. 공휴일에는 보내지 않도록 설정되어 있습니다."
+    if ($holiday) {
+        # 그 날짜에 따로 정해 둔 규칙이 있으면 그것을 먼저 따릅니다.
+        $rule = Get-HolidayRule $When
+        if ($null -ne $rule) {
+            $action = [string]$rule.Action
+            if ($action -eq 'skip') {
+                return "오늘은 $holiday 입니다. 이 날은 보내지 않도록 정해 두셨습니다."
+            }
+            if ($action -eq 'move') {
+                $moveTo = [string]$rule.MoveTo
+                return "오늘은 $holiday 입니다. $moveTo 로 옮기도록 정해 두셨습니다."
+            }
+            # normal 이면 막지 않습니다.
+        } elseif ([string]$script:config.HolidayMode -eq '보내지 않음') {
+            return "오늘은 $holiday 입니다. 공휴일에는 보내지 않도록 설정되어 있습니다."
+        }
+    }
+    # 다른 공휴일에서 옮겨 온 날인데 이미 오늘 보냈으면 또 보내지 않습니다.
+    $moved = Get-MovedFromHoliday $When
+    if ($null -ne $moved -and (Test-AlreadySentToday $When)) {
+        return "오늘은 이미 보냈습니다. ($([string]$moved.Name) 에서 옮겨 온 날입니다)"
     }
     return $null
 }
@@ -3032,6 +3246,9 @@ function ConvertTo-SendKeysText([string]$Text) {
 # 채팅창 아래 아이콘이 창 메시지를 받아 주는지 한 번만 확인하고 기억합니다.
 # 안 받아 주는데 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
 $script:toolbarClickNeedsMouse = $false
+$script:lstProgress = $null
+$script:lblProgressCount = $null
+$script:barProgress = $null
 $script:preferredSendWay = ''
 $script:savedClipboard = $null
 $script:lastSendProblem = ''
@@ -3292,6 +3509,7 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
 
             if (Test-RunInterrupted) { break }
 
+            Set-SendProgress $hitName '채팅방 여는 중' ''
             $chat = Get-SingleChatWindow (Open-RoomAtLine $list $hit $main.Handle)
             if ($null -eq $chat) {
                 # 이 줄로는 열리지 않습니다. 다시 고르지 않도록 기억해 둡니다.
@@ -3299,6 +3517,7 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
                 $remaining.Remove($hitName)
                 $processed++
                 $failed++
+                Set-SendProgress $hitName '실패' '채팅방을 열지 못했습니다'
                 Write-RunLog "건너뜀: '$hitName' — ROOM_NOT_FOUND 채팅창을 열지 못했습니다."
             } else {
                 # 열린 창 제목이 정답입니다. 목록에서 읽은 이름보다 정확합니다.
@@ -3319,7 +3538,18 @@ function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPag
                 Set-StatusPill ("발송 중 $($processed)/$($Targets.Count) — $($realName)") 'run'
                 # 다음부터 정확히 찾도록 저장된 이름을 실제 제목으로 바꿔 둡니다.
                 $realName = Update-RoomRealName $realName $openedTitle ([string]$hit.Text)
-                if (Send-ToChatWindow $chat $realName $Content) { $sent++ } else { $failed++ }
+                # 창 제목에 인원수가 붙어 있으면 단체방입니다. 이름으로 짐작하지 않습니다.
+                Set-RoomKind $realName (Get-RoomKindFromTitle $openedTitle (Get-RoomType $realName))
+                Set-SendProgress $realName '전송 중' ''
+                if (Send-ToChatWindow $chat $realName $Content) {
+                    $sent++
+                    Set-SendProgress $realName '완료' ''
+                } else {
+                    $failed++
+                    $why = $script:lastSendProblem
+                    if (-not $why) { $why = '까닭을 알 수 없습니다' }
+                    Set-SendProgress $realName '실패' $why
+                }
             }
 
             # 방 간격
@@ -3429,6 +3659,75 @@ function Test-SendTabReady([string[]]$Rooms, [object]$Layout) {
     return ''
 }
 
+# ---------------------------------------------------------------------------
+# 방별 발송 진행 상태
+# ---------------------------------------------------------------------------
+# 기록에 줄만 쌓이면 지금 어디까지 갔는지 알기 어렵습니다.
+# 방마다 상태를 표로 보여 줍니다. 실패한 방은 까닭도 함께 적습니다.
+$script:progressRows = @{}
+$script:progressOrder = New-Object System.Collections.Generic.List[string]
+
+function Reset-SendProgress([string[]]$Rooms) {
+    $script:progressRows = @{}
+    $script:progressOrder = New-Object System.Collections.Generic.List[string]
+    foreach ($room in $Rooms) {
+        $name = [string]$room
+        if (-not $name -or $script:progressRows.ContainsKey($name)) { continue }
+        $script:progressRows[$name] = [pscustomobject]@{ Status = '대기'; Note = '' }
+        [void]$script:progressOrder.Add($name)
+    }
+    Update-ProgressView
+}
+
+function Set-SendProgress([string]$Room, [string]$Status, [string]$Note) {
+    $name = [string]$Room
+    if (-not $name) { return }
+    if (-not $script:progressRows.ContainsKey($name)) {
+        $script:progressRows[$name] = [pscustomobject]@{ Status = '대기'; Note = '' }
+        [void]$script:progressOrder.Add($name)
+    }
+    $script:progressRows[$name].Status = $Status
+    $script:progressRows[$name].Note = [string]$Note
+    Update-ProgressView
+}
+
+function Update-ProgressView {
+    if ($null -eq $script:lstProgress) { return }
+    $total = $script:progressOrder.Count
+    $done = 0; $failed = 0; $running = 0; $waiting = 0
+    try {
+        $script:lstProgress.BeginUpdate()
+        $script:lstProgress.Items.Clear()
+        foreach ($name in $script:progressOrder) {
+            $row = $script:progressRows[$name]
+            $status = [string]$row.Status
+            switch ($status) {
+                '완료' { $done++ }
+                '실패' { $failed++ }
+                '대기' { $waiting++ }
+                default  { $running++ }
+            }
+            $item = New-Object System.Windows.Forms.ListViewItem($name)
+            [void]$item.SubItems.Add((Get-RoomKindText $name))
+            [void]$item.SubItems.Add($status)
+            [void]$item.SubItems.Add([string]$row.Note)
+            if ($status -eq '완료') { $item.ForeColor = $Theme.Success }
+            elseif ($status -eq '실패') { $item.ForeColor = $Theme.Danger }
+            elseif ($status -eq '대기') { $item.ForeColor = $Theme.Muted }
+            else { $item.ForeColor = $Theme.Info }
+            [void]$script:lstProgress.Items.Add($item)
+        }
+    } finally { $script:lstProgress.EndUpdate() }
+    if ($null -ne $script:lblProgressCount) {
+        $script:lblProgressCount.Text = "전체 $total    완료 $done    진행중 $running    대기 $waiting    실패 $failed"
+    }
+    if ($null -ne $script:barProgress) {
+        $script:barProgress.Maximum = [Math]::Max(1, $total)
+        $script:barProgress.Value = [Math]::Min($script:barProgress.Maximum, ($done + $failed))
+    }
+    try { [System.Windows.Forms.Application]::DoEvents() } catch { }
+}
+
 function Invoke-RoomPreload([string[]]$Rooms) {
     $targets = @($Rooms | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
     if ($targets.Count -eq 0) { return $false }
@@ -3513,6 +3812,9 @@ function Invoke-Broadcast {
     $ready = Test-KakaoReady $true $false
     if (-not $ready.Ok) { throw $ready.Reason }
 
+    # 방마다 어디까지 갔는지 보여 줄 표를 채웁니다.
+    Reset-SendProgress $rooms
+
     # 어떤 환경인지 남겨 둡니다. PC 마다 결과가 다를 때 짚어 보기 위해서입니다.
     Write-EnvironmentLog $ready.Layout.Main
 
@@ -3596,6 +3898,11 @@ function Invoke-Broadcast {
         Write-RunLog "실제로 보내시려면 [3. 보내기] 화면에서 [실제 발송] 을 고르세요."
     } else {
         Write-RunLog ("작업 종료: 성공 {0} / 실패 {1} / 미처리 {2} (전체 {3})" -f $totalSent, $totalFailed, @($pending).Count, $rooms.Count)
+        # 오늘 보냈다고 적어 둡니다. 공휴일에서 옮겨 온 날에 두 번 가지 않게 합니다.
+        if ($totalSent -gt 0) {
+            Add-SentDay (Get-Date)
+            try { Save-Config $script:config } catch { }
+        }
     }
     return $totalSent
 }
@@ -3824,7 +4131,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'AutoCheckUpdate', 'TourDone', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'AutoCheckUpdate', 'TourDone', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -3881,6 +4188,38 @@ if ($SelfTest) {
     $probeWin = [pscustomobject]@{ Width = 325 }
     if ((Get-OcrScaleFor $probeWin) -ne 4) { throw '좁은 목록에서 확대 배율이 4배가 아닙니다' }
     $probeWide = [pscustomobject]@{ Width = 900 }
+    if ((Get-OcrScaleFor $probeWide) -lt 2) { throw '넓은 목록에서 확대 배율이 너무 작습니다' }
+    # 화면 배율 도우미가 제대로 곱하는지 봅니다.
+    $savedScale = $script:UiScale
+    try {
+        $script:UiScale = 1.5
+        if ((S 100) -ne 150) { throw '배율 계산이 틀립니다' }
+        $pt = New-UiPoint 24 40
+        if ($pt.X -ne 36 -or $pt.Y -ne 60) { throw '배율에 맞춘 위치 계산이 틀립니다' }
+    } finally { $script:UiScale = $savedScale }
+    # 방 종류는 창 제목에 적힌 것으로만 정합니다. 이름으로 짐작하지 않습니다.
+    if ((Get-RoomKindFromTitle '우리반 공지방 (24)' $script:RoomTypeNormal) -ne 'group') { throw '단체방을 못 알아봅니다' }
+    if ((Get-RoomKindFromTitle '택규형' $script:RoomTypeNormal) -ne 'unknown') { throw '알 수 없는 방을 억지로 나눕니다' }
+    if ((Get-RoomKindFromTitle '자유 홍보방' $script:RoomTypeOpen) -ne 'open') { throw '오픈채팅을 못 알아봅니다' }
+    # 공휴일 규칙이 저장되고 다시 읽히는지 봅니다.
+    $savedRules = @($script:config.HolidayRules)
+    $savedDays = @($script:config.SentDays)
+    try {
+        Set-ConfigValue 'HolidayRules' @()
+        Set-ConfigValue 'SentDays' @()
+        Set-HolidayRule '2026-09-24' '추석' 'move' '2026-09-25'
+        $probeRule = Get-HolidayRule ([datetime]'2026-09-24')
+        if ($null -eq $probeRule -or [string]$probeRule.MoveTo -ne '2026-09-25') { throw '공휴일 규칙이 저장되지 않습니다' }
+        if ($null -eq (Get-MovedFromHoliday ([datetime]'2026-09-25'))) { throw '옮겨 온 날을 못 알아봅니다' }
+        if ($null -ne (Get-SendBlockReason ([datetime]'2026-09-25 10:00'))) { throw '옮긴 날인데 막습니다' }
+        Add-SentDay ([datetime]'2026-09-25')
+        if ($null -eq (Get-SendBlockReason ([datetime]'2026-09-25 10:00'))) { throw '이미 보낸 날인데 또 보냅니다' }
+        Set-HolidayRule '2026-09-24' '추석' 'normal' ''
+        if (@($script:config.HolidayRules).Count -ne 0) { throw '그대로 보냄인데 규칙이 남습니다' }
+    } finally {
+        Set-ConfigValue 'HolidayRules' @($savedRules)
+        Set-ConfigValue 'SentDays' @($savedDays)
+    }
     if ((Get-OcrScaleFor $probeWide) -lt 2) { throw '넓은 목록에서 확대 배율이 너무 작습니다' }
     # 열린 창 제목으로 어느 방인지 다시 정하는 기능입니다.
     # 목록에서 읽은 이름은 잘리거나 틀릴 수 있지만 창 제목은 정확합니다.
@@ -4215,8 +4554,8 @@ function Write-Text($Graphics, [string]$Text, $Font, [System.Drawing.Color]$Colo
 # ---------------------------------------------------------------------------
 function New-Card([object]$Parent, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$Title, [string]$Subtitle = '') {
     $panel = New-Object System.Windows.Forms.Panel
-    $panel.Location = New-Object System.Drawing.Point($X, $Y)
-    $panel.Size = New-Object System.Drawing.Size($W, $H)
+    $panel.Location = (New-UiPoint $X $Y)
+    $panel.Size = (New-UiSize $W $H)
     $panel.BackColor = $Theme.Bg
     $panel.Add_Paint({
         param($sender, $e)
@@ -4236,8 +4575,8 @@ function New-Card([object]$Parent, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$
         $label.Font = $FontCard
         $label.ForeColor = $Theme.Ink
         $label.BackColor = $Theme.Card
-        $label.Location = New-Object System.Drawing.Point(24, 18)
-        $label.Size = New-Object System.Drawing.Size(($W - 48), 26)
+        $label.Location = (New-UiPoint 24 18)
+        $label.Size = (New-UiSize ($W - 48) 26)
         $panel.Controls.Add($label)
     }
     if ($Subtitle) {
@@ -4246,8 +4585,8 @@ function New-Card([object]$Parent, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$
         $sub.Font = $FontSmall
         $sub.ForeColor = $Theme.Muted
         $sub.BackColor = $Theme.Card
-        $sub.Location = New-Object System.Drawing.Point(24, 46)
-        $sub.Size = New-Object System.Drawing.Size(($W - 48), 22)
+        $sub.Location = (New-UiPoint 24 46)
+        $sub.Size = (New-UiSize ($W - 48) 22)
         $panel.Controls.Add($sub)
     }
     return $panel
@@ -4256,8 +4595,8 @@ function New-Card([object]$Parent, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$
 function New-CardLabel([object]$Parent, [string]$Text, [int]$X, [int]$Y, [int]$W, [int]$H = 24, [object]$Font = $null, [object]$Color = $null) {
     $label = New-Object System.Windows.Forms.Label
     $label.Text = $Text
-    $label.Location = New-Object System.Drawing.Point($X, $Y)
-    $label.Size = New-Object System.Drawing.Size($W, $H)
+    $label.Location = (New-UiPoint $X $Y)
+    $label.Size = (New-UiSize $W $H)
     $label.BackColor = $Theme.Card
     $label.Font = if ($Font) { $Font } else { $FontBase }
     $label.ForeColor = if ($Color) { $Color } else { $Theme.Ink }
@@ -4267,8 +4606,8 @@ function New-CardLabel([object]$Parent, [string]$Text, [int]$X, [int]$Y, [int]$W
 
 function New-FieldFrame([object]$Parent, [int]$X, [int]$Y, [int]$W, [int]$H) {
     $frame = New-Object System.Windows.Forms.Panel
-    $frame.Location = New-Object System.Drawing.Point($X, $Y)
-    $frame.Size = New-Object System.Drawing.Size($W, $H)
+    $frame.Location = (New-UiPoint $X $Y)
+    $frame.Size = (New-UiSize $W $H)
     $frame.BackColor = $Theme.Card
     $frame.Add_Paint({
         param($sender, $e)
@@ -4295,10 +4634,10 @@ function New-AppTextBox([object]$Parent, [int]$X, [int]$Y, [int]$W, [int]$H, [bo
     if ($Multiline) {
         $box.Multiline = $true
         $box.ScrollBars = 'Vertical'
-        $box.Location = New-Object System.Drawing.Point(14, 12)
-        $box.Size = New-Object System.Drawing.Size(($W - 30), ($H - 24))
+        $box.Location = (New-UiPoint 14 12)
+        $box.Size = New-UiSize ($W - 30) ($H - 24)
     } else {
-        $box.Location = New-Object System.Drawing.Point(14, 0)
+        $box.Location = (New-UiPoint 14 0)
         $box.Width = $W - 28
         $box.Top = [int](($H - $box.Height) / 2)
     }
@@ -4309,8 +4648,8 @@ function New-AppTextBox([object]$Parent, [int]$X, [int]$Y, [int]$W, [int]$H, [bo
 function New-AppButton([object]$Parent, [string]$Text, [int]$X, [int]$Y, [int]$W, [int]$H, [string]$Kind = 'default') {
     $button = New-Object System.Windows.Forms.Button
     $button.Text = $Text
-    $button.Location = New-Object System.Drawing.Point($X, $Y)
-    $button.Size = New-Object System.Drawing.Size($W, $H)
+    $button.Location = (New-UiPoint $X $Y)
+    $button.Size = (New-UiSize $W $H)
     $button.FlatStyle = 'Flat'
     $button.Font = $FontBase
     $button.Cursor = [System.Windows.Forms.Cursors]::Hand
@@ -4435,10 +4774,20 @@ function Set-StatusPill([string]$Text, [string]$Kind) {
 
 $script:form = New-Object System.Windows.Forms.Form
 $script:form.Text = "카카오 발송기  ·  v$($script:AppVersion)"
-$script:form.ClientSize = New-Object System.Drawing.Size(1060, 740)
+# 배율이 높으면 창이 화면보다 커질 수 있습니다.
+# 150% 에서는 1590x1110 이 되는데 세로 1032 짜리 화면에는 안 들어갑니다.
+# 그래서 화면 작업 영역을 넘지 않게 줄이고, 모자란 만큼은 스크롤로 봅니다.
+$script:UiFullWidth = S 1060
+$script:UiFullHeight = S 740
+$script:UiWorkArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$script:UiFormWidth = [Math]::Min($script:UiFullWidth, ($script:UiWorkArea.Width - (S 16)))
+$script:UiFormHeight = [Math]::Min($script:UiFullHeight, ($script:UiWorkArea.Height - (S 16)))
+$script:form.ClientSize = New-Object System.Drawing.Size($script:UiFormWidth, $script:UiFormHeight)
 $script:form.StartPosition = 'CenterScreen'
-$script:form.FormBorderStyle = 'FixedSingle'
-$script:form.MaximizeBox = $false
+# 배율이 높은 컴퓨터에서는 창을 늘려 볼 수 있어야 합니다.
+$script:form.FormBorderStyle = 'Sizable'
+$script:form.MinimumSize = New-Object System.Drawing.Size((S 720), (S 520))
+$script:form.MaximizeBox = $true
 $script:form.AutoScaleMode = 'None'
 $script:form.BackColor = $Theme.Bg
 # 창과 작업 표시줄에 쓸 아이콘입니다. 프로그램(.exe)에는 이미 박혀 있고,
@@ -4455,26 +4804,27 @@ $script:form.Font = $FontBase
 
 # ----- 사이드바 -----
 $sidebar = New-Object System.Windows.Forms.Panel
-$sidebar.Location = New-Object System.Drawing.Point(0, 0)
-$sidebar.Size = New-Object System.Drawing.Size(220, 740)
+$sidebar.Location = (New-UiPoint 0 0)
+$sidebar.Size = New-Object System.Drawing.Size((S 220), $script:UiFormHeight)
+$sidebar.Dock = 'Left'
 $sidebar.BackColor = $Theme.Sidebar
 $script:form.Controls.Add($sidebar)
 
 $logo = New-Object System.Windows.Forms.Panel
-$logo.Location = New-Object System.Drawing.Point(0, 0)
-$logo.Size = New-Object System.Drawing.Size(220, 104)
+$logo.Location = (New-UiPoint 0 0)
+$logo.Size = (New-UiSize 220 104)
 $logo.BackColor = $Theme.Sidebar
 $logo.Add_Paint({
     param($sender, $e)
     $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $mark = New-Object System.Drawing.Rectangle(26, 28, 44, 44)
+    $mark = New-UiRect 26 28 44 44
     $path = Get-RoundedPath $mark 13
     $brush = New-Object System.Drawing.SolidBrush ($Theme.Accent)
     $e.Graphics.FillPath($brush, $path)
     $brush.Dispose(); $path.Dispose()
     Write-Text $e.Graphics '톡' $FontLogoMark $Theme.AccentInk $mark $TextCenter
-    Write-Text $e.Graphics '카카오 발송기' $FontLogo $Theme.Ink (New-Object System.Drawing.Rectangle(82, 32, 130, 22)) $TextLeft
-    Write-Text $e.Graphics "v$($script:AppVersion)" $FontSmall $Theme.NavIdle (New-Object System.Drawing.Rectangle(82, 54, 130, 20)) $TextLeft
+    Write-Text $e.Graphics '카카오 발송기' $FontLogo $Theme.Ink (New-UiRect 82 32 130 22) $TextLeft
+    Write-Text $e.Graphics "v$($script:AppVersion)" $FontSmall $Theme.NavIdle (New-UiRect 82 54 130 20) $TextLeft
 })
 $sidebar.Controls.Add($logo)
 
@@ -4493,8 +4843,8 @@ foreach ($page in $script:NavPages) {
     if ($page.Group -eq 'bottom' -and $navY -lt $bottomY) { $navY = $bottomY }
     $script:navText[$page.Key] = $page.Text
     $item = New-Object System.Windows.Forms.Panel
-    $item.Location = New-Object System.Drawing.Point(0, $navY)
-    $item.Size = New-Object System.Drawing.Size(220, 48)
+    $item.Location = (New-UiPoint 0 $navY)
+    $item.Size = (New-UiSize 220 48)
     $item.BackColor = $Theme.Sidebar
     $item.Cursor = [System.Windows.Forms.Cursors]::Hand
     $item.Tag = $page.Key
@@ -4506,7 +4856,7 @@ foreach ($page in $script:NavPages) {
         $isHover = ($script:hoverNav -eq $key)
         # 고른 항목은 둥근 회색 면으로만 알립니다. 색 막대까지 두면 시끄럽습니다.
         if ($isActive -or $isHover) {
-            $inner = New-Object System.Drawing.Rectangle(14, 4, ($sender.Width - 28), ($sender.Height - 8))
+            $inner = New-Object System.Drawing.Rectangle((S 14), (S 4), ($sender.Width - (S 28)), ($sender.Height - (S 8)))
             $shape = Get-RoundedPath $inner 10
             $fill = New-Object System.Drawing.SolidBrush ($Theme.SidebarHi)
             $e.Graphics.FillPath($fill, $shape)
@@ -4514,7 +4864,7 @@ foreach ($page in $script:NavPages) {
         }
         $color = if ($isActive) { $Theme.Ink } else { $Theme.NavIdle }
         $font = if ($isActive) { $FontStrong } else { $FontBase }
-        Write-Text $e.Graphics $script:navText[$key] $font $color (New-Object System.Drawing.Rectangle(32, 0, 174, $sender.Height)) $TextLeft
+        Write-Text $e.Graphics $script:navText[$key] $font $color (New-Object System.Drawing.Rectangle((S 32), 0, (S 174), $sender.Height)) $TextLeft
     })
     $item.Add_Click({ Show-AppPage ([string]$this.Tag) })
     $item.Add_MouseEnter({ $script:hoverNav = [string]$this.Tag; $this.Invalidate() })
@@ -4526,14 +4876,14 @@ foreach ($page in $script:NavPages) {
 
 # 위쪽 작업 묶음과 아래쪽 보조 메뉴를 구분하는 선
 $navDivider = New-Object System.Windows.Forms.Panel
-$navDivider.Location = New-Object System.Drawing.Point(28, ($bottomY - 18))
-$navDivider.Size = New-Object System.Drawing.Size(164, 1)
+$navDivider.Location = New-UiPoint 28 ($bottomY - 18)
+$navDivider.Size = (New-UiSize 164 1)
 $navDivider.BackColor = $Theme.Border
 $sidebar.Controls.Add($navDivider)
 
 $script:pnlUpdate = New-Object System.Windows.Forms.Panel
-$script:pnlUpdate.Location = New-Object System.Drawing.Point(18, 626)
-$script:pnlUpdate.Size = New-Object System.Drawing.Size(184, 46)
+$script:pnlUpdate.Location = (New-UiPoint 18 626)
+$script:pnlUpdate.Size = (New-UiSize 184 46)
 $script:pnlUpdate.BackColor = $Theme.Sidebar
 $script:pnlUpdate.Cursor = [System.Windows.Forms.Cursors]::Hand
 $script:pnlUpdate.Visible = $false
@@ -4553,8 +4903,8 @@ $sidebar.Controls.Add($script:pnlUpdate)
 
 $lblHint = New-Object System.Windows.Forms.Label
 $lblHint.Text = "수신에 동의한 채팅방에서만 사용하세요."
-$lblHint.Location = New-Object System.Drawing.Point(26, 684)
-$lblHint.Size = New-Object System.Drawing.Size(176, 40)
+$lblHint.Location = (New-UiPoint 26 684)
+$lblHint.Size = (New-UiSize 176 40)
 $lblHint.BackColor = $Theme.Sidebar
 $lblHint.ForeColor = $Theme.Muted
 $lblHint.Font = $FontSmall
@@ -4563,16 +4913,17 @@ $sidebar.Controls.Add($lblHint)
 
 # 사이드바와 본문을 나누는 얇은 선입니다. 밝은 바탕끼리는 이 선 하나면 충분합니다.
 $sideEdge = New-Object System.Windows.Forms.Panel
-$sideEdge.Location = New-Object System.Drawing.Point(219, 0)
-$sideEdge.Size = New-Object System.Drawing.Size(1, 740)
+$sideEdge.Location = (New-UiPoint 219 0)
+$sideEdge.Size = (New-UiSize 1 740)
 $sideEdge.BackColor = $Theme.Border
 $script:form.Controls.Add($sideEdge)
 $sideEdge.BringToFront()
 
 # ----- 헤더 -----
 $header = New-Object System.Windows.Forms.Panel
-$header.Location = New-Object System.Drawing.Point(220, 0)
-$header.Size = New-Object System.Drawing.Size(840, 96)
+$header.Location = (New-UiPoint 220 0)
+$header.Size = New-Object System.Drawing.Size(($script:UiFormWidth - (S 220)), (S 96))
+$header.Anchor = 'Top,Left,Right'
 $header.BackColor = $Theme.Bg
 $script:form.Controls.Add($header)
 
@@ -4581,13 +4932,13 @@ $script:lblPageTitle.Text = '발송 준비'
 $script:lblPageTitle.Font = $FontPage
 $script:lblPageTitle.ForeColor = $Theme.Ink
 $script:lblPageTitle.BackColor = $Theme.Bg
-$script:lblPageTitle.Location = New-Object System.Drawing.Point(28, 12)
-$script:lblPageTitle.Size = New-Object System.Drawing.Size(440, 32)
+$script:lblPageTitle.Location = (New-UiPoint 28 12)
+$script:lblPageTitle.Size = (New-UiSize 440 32)
 $header.Controls.Add($script:lblPageTitle)
 
 $script:pillStatus = New-Object System.Windows.Forms.Panel
-$script:pillStatus.Location = New-Object System.Drawing.Point(28, 50)
-$script:pillStatus.Size = New-Object System.Drawing.Size(184, 32)
+$script:pillStatus.Location = (New-UiPoint 28 50)
+$script:pillStatus.Size = (New-UiSize 184 32)
 $script:pillStatus.BackColor = $Theme.Bg
 $script:pillStatus.Add_Paint({
     param($sender, $e)
@@ -4605,9 +4956,9 @@ $script:pillStatus.Add_Paint({
     $e.Graphics.FillPath($brush, $path)
     $brush.Dispose(); $path.Dispose()
     $dot = New-Object System.Drawing.SolidBrush ($ink)
-    $e.Graphics.FillEllipse($dot, 17, ([int]($sender.Height / 2) - 4), 9, 9)
+    $e.Graphics.FillEllipse($dot, (S 17), ([int]($sender.Height / 2) - (S 4)), (S 9), (S 9))
     $dot.Dispose()
-    Write-Text $e.Graphics $script:statusText $FontBase $ink (New-Object System.Drawing.Rectangle(34, 0, ($sender.Width - 46), $sender.Height)) $TextLeft
+    Write-Text $e.Graphics $script:statusText $FontBase $ink (New-Object System.Drawing.Rectangle((S 34), 0, ($sender.Width - (S 46)), $sender.Height)) $TextLeft
 })
 $header.Controls.Add($script:pillStatus)
 
@@ -4616,8 +4967,8 @@ $script:lblHeaderPlan = New-Object System.Windows.Forms.Label
 $script:lblHeaderPlan.Font = $FontSmall
 $script:lblHeaderPlan.ForeColor = $Theme.Sub
 $script:lblHeaderPlan.BackColor = $Theme.Bg
-$script:lblHeaderPlan.Location = New-Object System.Drawing.Point(222, 40)
-$script:lblHeaderPlan.Size = New-Object System.Drawing.Size(374, 46)
+$script:lblHeaderPlan.Location = (New-UiPoint 222 40)
+$script:lblHeaderPlan.Size = (New-UiSize 374 46)
 $script:lblHeaderPlan.Cursor = [System.Windows.Forms.Cursors]::Hand
 $header.Controls.Add($script:lblHeaderPlan)
 
@@ -4637,16 +4988,19 @@ $tipHelp.SetToolTip($btnHeaderEdit, '보낼 문구와 첨부를 고칩니다')
 
 # ----- 페이지 컨테이너 -----
 $pageHost = New-Object System.Windows.Forms.Panel
-$pageHost.Location = New-Object System.Drawing.Point(220, 96)
-$pageHost.Size = New-Object System.Drawing.Size(840, 644)
+$pageHost.Location = (New-UiPoint 220 96)
+$pageHost.Size = New-Object System.Drawing.Size(($script:UiFormWidth - (S 220)), ($script:UiFormHeight - (S 96)))
+# 창을 늘리면 같이 늘어나고, 창이 작으면 스크롤로 볼 수 있습니다.
+$pageHost.Anchor = 'Top,Left,Bottom,Right'
+$pageHost.AutoScroll = $true
 $pageHost.BackColor = $Theme.Bg
 $script:form.Controls.Add($pageHost)
 
 $script:pages = @{}
 function New-Page([string]$Key) {
     $panel = New-Object System.Windows.Forms.Panel
-    $panel.Location = New-Object System.Drawing.Point(0, 0)
-    $panel.Size = New-Object System.Drawing.Size(840, 644)
+    $panel.Location = (New-UiPoint 0 0)
+    $panel.Size = (New-UiSize 840 644)
     $panel.BackColor = $Theme.Bg
     $panel.Visible = $false
     # 카드가 화면보다 길어지면 스크롤로 볼 수 있게 합니다.
@@ -4679,8 +5033,8 @@ $frameFiles = New-FieldFrame $cardFiles 24 78 576 212
 $script:lstFiles = New-Object System.Windows.Forms.ListBox
 $script:lstFiles.BorderStyle = 'None'
 $script:lstFiles.Font = $FontBase
-$script:lstFiles.Location = New-Object System.Drawing.Point(12, 12)
-$script:lstFiles.Size = New-Object System.Drawing.Size(552, 188)
+$script:lstFiles.Location = (New-UiPoint 12 12)
+$script:lstFiles.Size = (New-UiSize 552 188)
 $script:lstFiles.DisplayMember = 'Name'
 $script:lstFiles.ItemHeight = 24
 $frameFiles.Controls.Add($script:lstFiles)
@@ -4711,11 +5065,11 @@ $btnEditRoom   = New-AppButton $cardRooms '이름 수정' 448 80 84 38
 $script:txtRoomSearch = New-AppTextBox $cardRooms 62 128 236 36
 $btnSearchClear = New-AppButton $cardRooms '지우기' 306 128 74 36 'ghost'
 
-[void](New-CardLabel $cardRooms '보기' 396 134 34 26 $FontSmall $Theme.Muted)
-$btnFilterAll    = New-AppButton $cardRooms '전체' 428 128 58 36
-$btnFilterPerson = New-AppButton $cardRooms '개인' 492 128 58 36
-$btnFilterChat   = New-AppButton $cardRooms '그룹' 556 128 58 36
-$btnFilterOpen   = New-AppButton $cardRooms '오픈채팅' 620 128 84 36
+[void](New-CardLabel $cardRooms '보기' 392 134 40 26 $FontSmall $Theme.Muted)
+$btnFilterAll    = New-AppButton $cardRooms '전체' 436 128 58 36
+$btnFilterPerson = New-AppButton $cardRooms '개인' 500 128 58 36
+$btnFilterChat   = New-AppButton $cardRooms '그룹' 564 128 58 36
+$btnFilterOpen   = New-AppButton $cardRooms '오픈채팅' 628 128 84 36
 $script:lblRoomCount = New-CardLabel $cardRooms '선택 0 / 전체 0' 24 172 480 24 $FontStrong $Theme.Ink
 $script:lblSearchState = New-CardLabel $cardRooms '' 24 196 736 22 $FontSmall $Theme.Info
 
@@ -4727,8 +5081,8 @@ $script:lstRooms.FullRowSelect = $true
 $script:lstRooms.HideSelection = $false
 $script:lstRooms.BorderStyle = 'None'
 $script:lstRooms.Font = $FontBase
-$script:lstRooms.Location = New-Object System.Drawing.Point(12, 12)
-$script:lstRooms.Size = New-Object System.Drawing.Size(712, 300)
+$script:lstRooms.Location = (New-UiPoint 12 12)
+$script:lstRooms.Size = (New-UiSize 712 300)
 [void]$script:lstRooms.Columns.Add('채팅방 이름', 560)
 [void]$script:lstRooms.Columns.Add('종류', 130)
 $frameRooms.Controls.Add($script:lstRooms)
@@ -4741,8 +5095,8 @@ $script:numScanPages = New-Object System.Windows.Forms.NumericUpDown
 $script:numScanPages.Minimum = 1
 $script:numScanPages.Maximum = 60
 $script:numScanPages.Value = [Math]::Max(1, [Math]::Min(60, [int]$script:config.ScanPages))
-$script:numScanPages.Location = New-Object System.Drawing.Point(666, 562)
-$script:numScanPages.Size = New-Object System.Drawing.Size(94, 30)
+$script:numScanPages.Location = (New-UiPoint 666 562)
+$script:numScanPages.Size = (New-UiSize 94 30)
 $script:numScanPages.Font = $FontBase
 $script:numScanPages.BorderStyle = 'FixedSingle'
 $cardRooms.Controls.Add($script:numScanPages)
@@ -4752,8 +5106,8 @@ $cardRooms.Controls.Add($script:numScanPages)
 $script:cmbGroup = New-Object System.Windows.Forms.ComboBox
 $script:cmbGroup.DropDownStyle = 'DropDownList'
 $script:cmbGroup.Font = $FontBase
-$script:cmbGroup.Location = New-Object System.Drawing.Point(68, 604)
-$script:cmbGroup.Size = New-Object System.Drawing.Size(174, 30)
+$script:cmbGroup.Location = (New-UiPoint 68 604)
+$script:cmbGroup.Size = (New-UiSize 174 30)
 $cardRooms.Controls.Add($script:cmbGroup)
 $btnGroupCheck  = New-AppButton $cardRooms '이 그룹 체크' 250 602 116 32
 $btnGroupNew    = New-AppButton $cardRooms '새 그룹 만들기' 374 602 130 32
@@ -4770,16 +5124,16 @@ $pageRun = New-Page 'run'
 $cardMode = New-Card $pageRun 28 12 784 150 '발송 방식'
 $script:rdoLive = New-Object System.Windows.Forms.RadioButton
 $script:rdoLive.Text = '실제 발송 — 선택한 모든 방에 문구와 첨부를 실제로 보냅니다.'
-$script:rdoLive.Location = New-Object System.Drawing.Point(24, 58)
-$script:rdoLive.Size = New-Object System.Drawing.Size(730, 28)
+$script:rdoLive.Location = (New-UiPoint 24 58)
+$script:rdoLive.Size = (New-UiSize 730 28)
 $script:rdoLive.BackColor = $Theme.Card
 $script:rdoLive.Font = $FontBase
 $cardMode.Controls.Add($script:rdoLive)
 
 $script:rdoDry = New-Object System.Windows.Forms.RadioButton
 $script:rdoDry.Text = '확인 전용 — 방만 열어 보고 아무것도 보내지 않습니다. (연습용)'
-$script:rdoDry.Location = New-Object System.Drawing.Point(24, 92)
-$script:rdoDry.Size = New-Object System.Drawing.Size(730, 28)
+$script:rdoDry.Location = (New-UiPoint 24 92)
+$script:rdoDry.Size = (New-UiSize 730 28)
 $script:rdoDry.BackColor = $Theme.Card
 $script:rdoDry.Font = $FontBase
 $cardMode.Controls.Add($script:rdoDry)
@@ -4801,8 +5155,8 @@ $script:dtSchedule = New-Object System.Windows.Forms.DateTimePicker
 $script:dtSchedule.Format = 'Custom'
 $script:dtSchedule.CustomFormat = 'yyyy-MM-dd  HH:mm:ss'
 $script:dtSchedule.ShowUpDown = $true
-$script:dtSchedule.Location = New-Object System.Drawing.Point(24, 80)
-$script:dtSchedule.Size = New-Object System.Drawing.Size(222, 32)
+$script:dtSchedule.Location = (New-UiPoint 24 80)
+$script:dtSchedule.Size = (New-UiSize 222 32)
 $script:dtSchedule.Font = $FontBase
 try { $script:dtSchedule.Value = [datetime]::ParseExact([string]$script:config.ScheduledAt, 'yyyy-MM-dd HH:mm:ss', $null) }
 catch { $script:dtSchedule.Value = (Get-Date).Date.AddDays(1) }
@@ -4827,6 +5181,33 @@ $script:lblCountdown = New-CardLabel $cardSchedule '예약이 설정되지 않�
 
 # ===========================================================================
 # 페이지 4 — 설정
+# ----- 발송 진행 상황 -----
+# 기록에 줄만 쌓이면 지금 어디까지 갔는지 알기 어렵습니다.
+# 방마다 상태를 표로 보여 주고, 실패한 방은 까닭도 적습니다.
+$cardProgress = New-Card $pageRun 28 760 784 340 '발송 진행 상황' '보내는 동안 방마다 어디까지 갔는지 보여 줍니다.'
+$script:lblProgressCount = New-CardLabel $cardProgress '전체 0    완료 0    진행중 0    대기 0    실패 0' 24 74 736 26 $FontStrong $Theme.Ink
+$script:barProgress = New-Object System.Windows.Forms.ProgressBar
+$script:barProgress.Location = (New-UiPoint 24 106)
+$script:barProgress.Size = (New-UiSize 736 14)
+$script:barProgress.Minimum = 0
+$script:barProgress.Maximum = 1
+$script:barProgress.Value = 0
+$cardProgress.Controls.Add($script:barProgress)
+
+$script:lstProgress = New-Object System.Windows.Forms.ListView
+$script:lstProgress.View = 'Details'
+$script:lstProgress.FullRowSelect = $true
+$script:lstProgress.HideSelection = $false
+$script:lstProgress.BorderStyle = 'FixedSingle'
+$script:lstProgress.Font = $FontBase
+$script:lstProgress.Location = (New-UiPoint 24 134)
+$script:lstProgress.Size = (New-UiSize 736 186)
+[void]$script:lstProgress.Columns.Add('채팅방', (S 300))
+[void]$script:lstProgress.Columns.Add('유형', (S 90))
+[void]$script:lstProgress.Columns.Add('상태', (S 110))
+[void]$script:lstProgress.Columns.Add('비고', (S 210))
+$cardProgress.Controls.Add($script:lstProgress)
+
 # ===========================================================================
 $pageSettings = New-Page 'settings'
 
@@ -4846,8 +5227,8 @@ $btnClearLogFiles = New-AppButton $cardUpdate '로그 파일 모두 지우기' 3
 $script:chkAutoUpdate = New-Object System.Windows.Forms.CheckBox
 $script:chkAutoUpdate.Text = '시작할 때 자동 확인'
 $script:chkAutoUpdate.Checked = [bool]$script:config.AutoCheckUpdate
-$script:chkAutoUpdate.Location = New-Object System.Drawing.Point(24, 182)
-$script:chkAutoUpdate.Size = New-Object System.Drawing.Size(240, 28)
+$script:chkAutoUpdate.Location = (New-UiPoint 24 182)
+$script:chkAutoUpdate.Size = (New-UiSize 240 28)
 $script:chkAutoUpdate.BackColor = $Theme.Card
 $script:chkAutoUpdate.Font = $FontBase
 $cardUpdate.Controls.Add($script:chkAutoUpdate)
@@ -4855,8 +5236,8 @@ $cardUpdate.Controls.Add($script:chkAutoUpdate)
 $script:chkAutoDownload = New-Object System.Windows.Forms.CheckBox
 $script:chkAutoDownload.Text = '새 버전이 있으면 물어보고 바로 받기'
 $script:chkAutoDownload.Checked = [bool]$script:config.AutoDownloadUpdate
-$script:chkAutoDownload.Location = New-Object System.Drawing.Point(280, 182)
-$script:chkAutoDownload.Size = New-Object System.Drawing.Size(320, 28)
+$script:chkAutoDownload.Location = (New-UiPoint 280 182)
+$script:chkAutoDownload.Size = (New-UiSize 320 28)
 $script:chkAutoDownload.BackColor = $Theme.Card
 $script:chkAutoDownload.Font = $FontBase
 $cardUpdate.Controls.Add($script:chkAutoDownload)
@@ -4881,8 +5262,8 @@ $script:numInterval = New-Object System.Windows.Forms.NumericUpDown
 $script:numInterval.Minimum = 0
 $script:numInterval.Maximum = 300
 $script:numInterval.Value = [Math]::Max(0, [Math]::Min(300, [int]$script:config.IntervalSeconds))
-$script:numInterval.Location = New-Object System.Drawing.Point(144, 78)
-$script:numInterval.Size = New-Object System.Drawing.Size(80, 30)
+$script:numInterval.Location = (New-UiPoint 144 78)
+$script:numInterval.Size = (New-UiSize 80 30)
 $script:numInterval.Font = $FontBase
 $script:numInterval.BorderStyle = 'FixedSingle'
 $cardPace.Controls.Add($script:numInterval)
@@ -4893,8 +5274,8 @@ $script:numOpenTimeout = New-Object System.Windows.Forms.NumericUpDown
 $script:numOpenTimeout.Minimum = 3
 $script:numOpenTimeout.Maximum = 60
 $script:numOpenTimeout.Value = [Math]::Max(3, [Math]::Min(60, [int]([Math]::Round([int]$script:config.OpenTimeoutMs / 1000))))
-$script:numOpenTimeout.Location = New-Object System.Drawing.Point(144, 120)
-$script:numOpenTimeout.Size = New-Object System.Drawing.Size(80, 30)
+$script:numOpenTimeout.Location = (New-UiPoint 144 120)
+$script:numOpenTimeout.Size = (New-UiSize 80 30)
 $script:numOpenTimeout.Font = $FontBase
 $script:numOpenTimeout.BorderStyle = 'FixedSingle'
 $cardPace.Controls.Add($script:numOpenTimeout)
@@ -4905,8 +5286,8 @@ $script:numSettle = New-Object System.Windows.Forms.NumericUpDown
 $script:numSettle.Minimum = 0
 $script:numSettle.Maximum = 30
 $script:numSettle.Value = [Math]::Max(0, [Math]::Min(30, [int]([Math]::Round([int]$script:config.SettleMs / 1000))))
-$script:numSettle.Location = New-Object System.Drawing.Point(144, 162)
-$script:numSettle.Size = New-Object System.Drawing.Size(80, 30)
+$script:numSettle.Location = (New-UiPoint 144 162)
+$script:numSettle.Size = (New-UiSize 80 30)
 $script:numSettle.Font = $FontBase
 $script:numSettle.BorderStyle = 'FixedSingle'
 $cardPace.Controls.Add($script:numSettle)
@@ -4915,8 +5296,8 @@ $cardPace.Controls.Add($script:numSettle)
 $script:chkPreload = New-Object System.Windows.Forms.CheckBox
 $script:chkPreload.Text = '처음 보내기 전에 대상 채팅방을 모두 한 번씩 열어 둡니다'
 $script:chkPreload.Checked = [bool]$script:config.PreloadRooms
-$script:chkPreload.Location = New-Object System.Drawing.Point(24, 208)
-$script:chkPreload.Size = New-Object System.Drawing.Size(500, 28)
+$script:chkPreload.Location = (New-UiPoint 24 208)
+$script:chkPreload.Size = (New-UiSize 500 28)
 $script:chkPreload.BackColor = $Theme.Card
 $script:chkPreload.Font = $FontBase
 $cardPace.Controls.Add($script:chkPreload)
@@ -4925,8 +5306,8 @@ $btnPreloadNow = New-AppButton $cardPace '지금 미리 열기' 576 204 184 36
 $script:chkRepeat = New-Object System.Windows.Forms.CheckBox
 $script:chkRepeat.Text = '다 보낸 뒤 일정 시간마다 다시 보내기'
 $script:chkRepeat.Checked = [bool]$script:config.RepeatEnabled
-$script:chkRepeat.Location = New-Object System.Drawing.Point(24, 250)
-$script:chkRepeat.Size = New-Object System.Drawing.Size(330, 28)
+$script:chkRepeat.Location = (New-UiPoint 24 250)
+$script:chkRepeat.Size = (New-UiSize 330 28)
 $script:chkRepeat.BackColor = $Theme.Card
 $script:chkRepeat.Font = $FontBase
 $cardPace.Controls.Add($script:chkRepeat)
@@ -4935,8 +5316,8 @@ $script:numRepeatMinutes = New-Object System.Windows.Forms.NumericUpDown
 $script:numRepeatMinutes.Minimum = 1
 $script:numRepeatMinutes.Maximum = 1440
 $script:numRepeatMinutes.Value = [Math]::Max(1, [Math]::Min(1440, [int]$script:config.RepeatMinutes))
-$script:numRepeatMinutes.Location = New-Object System.Drawing.Point(364, 248)
-$script:numRepeatMinutes.Size = New-Object System.Drawing.Size(80, 30)
+$script:numRepeatMinutes.Location = (New-UiPoint 364 248)
+$script:numRepeatMinutes.Size = (New-UiSize 80 30)
 $script:numRepeatMinutes.Font = $FontBase
 $script:numRepeatMinutes.BorderStyle = 'FixedSingle'
 $cardPace.Controls.Add($script:numRepeatMinutes)
@@ -4946,8 +5327,8 @@ $script:numRepeatCount = New-Object System.Windows.Forms.NumericUpDown
 $script:numRepeatCount.Minimum = 0
 $script:numRepeatCount.Maximum = 999
 $script:numRepeatCount.Value = [Math]::Max(0, [Math]::Min(999, [int]$script:config.RepeatCount))
-$script:numRepeatCount.Location = New-Object System.Drawing.Point(552, 248)
-$script:numRepeatCount.Size = New-Object System.Drawing.Size(74, 30)
+$script:numRepeatCount.Location = (New-UiPoint 552 248)
+$script:numRepeatCount.Size = (New-UiSize 74 30)
 $script:numRepeatCount.Font = $FontBase
 $script:numRepeatCount.BorderStyle = 'FixedSingle'
 $cardPace.Controls.Add($script:numRepeatCount)
@@ -4959,8 +5340,8 @@ $cardLimit = New-Card $pageSettings 28 1036 784 306 '발송 제한 및 묶음 �
 $script:chkQuiet = New-Object System.Windows.Forms.CheckBox
 $script:chkQuiet.Text = '방해금지 시간대에는 보내지 않기'
 $script:chkQuiet.Checked = [bool]$script:config.QuietEnabled
-$script:chkQuiet.Location = New-Object System.Drawing.Point(24, 78)
-$script:chkQuiet.Size = New-Object System.Drawing.Size(280, 26)
+$script:chkQuiet.Location = (New-UiPoint 24 78)
+$script:chkQuiet.Size = (New-UiSize 280 26)
 $script:chkQuiet.BackColor = $Theme.Card
 $script:chkQuiet.Font = $FontBase
 $cardLimit.Controls.Add($script:chkQuiet)
@@ -4975,8 +5356,8 @@ $script:txtQuietEnd.Text = [string]$script:config.QuietEnd
 $script:chkSkipWeekend = New-Object System.Windows.Forms.CheckBox
 $script:chkSkipWeekend.Text = '주말(토·일)에는 보내지 않기'
 $script:chkSkipWeekend.Checked = [bool]$script:config.SkipWeekend
-$script:chkSkipWeekend.Location = New-Object System.Drawing.Point(24, 116)
-$script:chkSkipWeekend.Size = New-Object System.Drawing.Size(280, 26)
+$script:chkSkipWeekend.Location = (New-UiPoint 24 116)
+$script:chkSkipWeekend.Size = (New-UiSize 280 26)
 $script:chkSkipWeekend.BackColor = $Theme.Card
 $script:chkSkipWeekend.Font = $FontBase
 $cardLimit.Controls.Add($script:chkSkipWeekend)
@@ -4985,8 +5366,8 @@ $cardLimit.Controls.Add($script:chkSkipWeekend)
 $script:cmbHoliday = New-Object System.Windows.Forms.ComboBox
 $script:cmbHoliday.DropDownStyle = 'DropDownList'
 $script:cmbHoliday.Font = $FontBase
-$script:cmbHoliday.Location = New-Object System.Drawing.Point(116, 154)
-$script:cmbHoliday.Size = New-Object System.Drawing.Size(190, 30)
+$script:cmbHoliday.Location = (New-UiPoint 116 154)
+$script:cmbHoliday.Size = (New-UiSize 190 30)
 [void]$script:cmbHoliday.Items.AddRange(@('평소대로', '보내지 않음', '간격 늘리기'))
 $holidayMode = [string]$script:config.HolidayMode
 if ($script:cmbHoliday.Items.IndexOf($holidayMode) -ge 0) { $script:cmbHoliday.SelectedItem = $holidayMode }
@@ -4998,20 +5379,20 @@ $script:numHolidayMultiplier = New-Object System.Windows.Forms.NumericUpDown
 $script:numHolidayMultiplier.Minimum = 1
 $script:numHolidayMultiplier.Maximum = 20
 $script:numHolidayMultiplier.Value = [Math]::Max(1, [Math]::Min(20, [int]$script:config.HolidayIntervalMultiplier))
-$script:numHolidayMultiplier.Location = New-Object System.Drawing.Point(452, 154)
-$script:numHolidayMultiplier.Size = New-Object System.Drawing.Size(78, 30)
+$script:numHolidayMultiplier.Location = (New-UiPoint 452 154)
+$script:numHolidayMultiplier.Size = (New-UiSize 78 30)
 $script:numHolidayMultiplier.Font = $FontBase
 $script:numHolidayMultiplier.BorderStyle = 'FixedSingle'
 $cardLimit.Controls.Add($script:numHolidayMultiplier)
-$btnShowHolidays = New-AppButton $cardLimit '올해 공휴일 보기' 548 152 150 34
+$btnShowHolidays = New-AppButton $cardLimit '공휴일 설정' 548 152 150 34
 
 [void](New-CardLabel $cardLimit '묶음 발송' 24 200 80 24 $FontSmall $Theme.Muted)
 $script:numBatchSize = New-Object System.Windows.Forms.NumericUpDown
 $script:numBatchSize.Minimum = 0
 $script:numBatchSize.Maximum = 500
 $script:numBatchSize.Value = [Math]::Max(0, [Math]::Min(500, [int]$script:config.BatchSize))
-$script:numBatchSize.Location = New-Object System.Drawing.Point(108, 196)
-$script:numBatchSize.Size = New-Object System.Drawing.Size(84, 30)
+$script:numBatchSize.Location = (New-UiPoint 108 196)
+$script:numBatchSize.Size = (New-UiSize 84 30)
 $script:numBatchSize.Font = $FontBase
 $script:numBatchSize.BorderStyle = 'FixedSingle'
 $cardLimit.Controls.Add($script:numBatchSize)
@@ -5020,8 +5401,8 @@ $script:numBatchRest = New-Object System.Windows.Forms.NumericUpDown
 $script:numBatchRest.Minimum = 1
 $script:numBatchRest.Maximum = 240
 $script:numBatchRest.Value = [Math]::Max(1, [Math]::Min(240, [int]$script:config.BatchRestMinutes))
-$script:numBatchRest.Location = New-Object System.Drawing.Point(286, 196)
-$script:numBatchRest.Size = New-Object System.Drawing.Size(84, 30)
+$script:numBatchRest.Location = (New-UiPoint 286 196)
+$script:numBatchRest.Size = (New-UiSize 84 30)
 $script:numBatchRest.Font = $FontBase
 $script:numBatchRest.BorderStyle = 'FixedSingle'
 $cardLimit.Controls.Add($script:numBatchRest)
@@ -5041,8 +5422,8 @@ $script:txtLog.ScrollBars = 'Vertical'
 $script:txtLog.BorderStyle = 'None'
 $script:txtLog.BackColor = [System.Drawing.Color]::White
 $script:txtLog.Font = $FontBase
-$script:txtLog.Location = New-Object System.Drawing.Point(14, 12)
-$script:txtLog.Size = New-Object System.Drawing.Size(708, 446)
+$script:txtLog.Location = (New-UiPoint 14 12)
+$script:txtLog.Size = (New-UiSize 708 446)
 $frameLog.Controls.Add($script:txtLog)
 $btnOpenLogDir = New-AppButton $cardLog '로그 폴더 열기' 24 566 170 40
 $btnClearLog   = New-AppButton $cardLog '화면 지우기' 204 566 140 40 'ghost'
@@ -5162,7 +5543,7 @@ function Get-SelectedGroupName {
 function Show-RoomPicker([string]$Title) {
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text = $Title
-    $dialog.ClientSize = New-Object System.Drawing.Size(520, 520)
+    $dialog.ClientSize = (New-UiSize 520 520)
     $dialog.StartPosition = 'CenterParent'
     $dialog.FormBorderStyle = 'FixedDialog'
     $dialog.MaximizeBox = $false
@@ -5172,8 +5553,8 @@ function Show-RoomPicker([string]$Title) {
 
     $lblFind = New-Object System.Windows.Forms.Label
     $lblFind.Text = '찾기'
-    $lblFind.Location = New-Object System.Drawing.Point(20, 22)
-    $lblFind.Size = New-Object System.Drawing.Size(40, 24)
+    $lblFind.Location = (New-UiPoint 20 22)
+    $lblFind.Size = (New-UiSize 40 24)
     $lblFind.BackColor = $Theme.Card
     $dialog.Controls.Add($lblFind)
 
@@ -5184,8 +5565,8 @@ function Show-RoomPicker([string]$Title) {
     $list.FullRowSelect = $true
     $list.MultiSelect = $false
     $list.Font = $FontBase
-    $list.Location = New-Object System.Drawing.Point(20, 62)
-    $list.Size = New-Object System.Drawing.Size(480, 388)
+    $list.Location = (New-UiPoint 20 62)
+    $list.Size = (New-UiSize 480 388)
     [void]$list.Columns.Add('채팅방 이름', 330)
     [void]$list.Columns.Add('종류', 120)
     $dialog.Controls.Add($list)
@@ -5405,17 +5786,122 @@ $btnPickSchedule.Add_Click({
     if ($null -ne $picked) { $script:dtSchedule.Value = $picked; Sync-ConfigFromForm }
 })
 
-$btnShowHolidays.Add_Click({
+# 공휴일마다 어떻게 할지 하나씩 정하는 화면입니다.
+# 예전에는 공휴일 전체를 한꺼번에 처리해서 날짜별로 다르게 할 수 없었습니다.
+function Show-HolidayManager {
     $year = (Get-Date).Year
-    $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($entry in (Get-KoreanHolidays $year).GetEnumerator() | Sort-Object -Property Name) {
-        $date = [datetime]::ParseExact($entry.Key, 'yyyy-MM-dd', $null)
-        $lines.Add("$($entry.Key) ($(('일','월','화','수','목','금','토')[[int]$date.DayOfWeek]))  $($entry.Value)")
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "$($year)년 공휴일 설정"
+    $dialog.ClientSize = (New-UiSize 640 520)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.BackColor = $Theme.Bg
+    $dialog.Font = $FontBase
+
+    [void](New-CardLabel $dialog '공휴일마다 어떻게 할지 정합니다. 정하지 않은 날은 그대로 보냅니다.' 24 18 592 24 $FontBase $Theme.Sub)
+    [void](New-CardLabel $dialog '날짜를 옮기면 그날 이미 보냈는지 확인해 두 번 가지 않게 합니다.' 24 42 592 22 $FontSmall $Theme.Muted)
+
+    $list = New-Object System.Windows.Forms.ListView
+    $list.View = 'Details'
+    $list.FullRowSelect = $true
+    $list.HideSelection = $false
+    $list.BorderStyle = 'FixedSingle'
+    $list.Font = $FontBase
+    $list.Location = (New-UiPoint 24 76)
+    $list.Size = (New-UiSize 592 300)
+    [void]$list.Columns.Add('날짜', (S 110))
+    [void]$list.Columns.Add('공휴일', (S 160))
+    [void]$list.Columns.Add('처리 방식', (S 150))
+    [void]$list.Columns.Add('대체 발송일', (S 150))
+    $dialog.Controls.Add($list)
+
+    $script:holidayRows = @()
+    function Refresh-HolidayList {
+        $list.BeginUpdate()
+        $list.Items.Clear()
+        $script:holidayRows = @()
+        $days = @((Get-KoreanHolidays $year).GetEnumerator() | Sort-Object -Property Name)
+        foreach ($entry in $days) {
+            $date = [datetime]::ParseExact($entry.Key, 'yyyy-MM-dd', $null)
+            $dow = ('일','월','화','수','목','금','토')[[int]$date.DayOfWeek]
+            $rule = Get-HolidayRule $date
+            $action = 'normal'
+            $moveTo = ''
+            if ($null -ne $rule) { $action = [string]$rule.Action; $moveTo = [string]$rule.MoveTo }
+            $actionText = switch ($action) {
+                'skip' { '보내지 않음' }
+                'move' { '날짜 옮김' }
+                default  { '그대로 보냄' }
+            }
+            $item = New-Object System.Windows.Forms.ListViewItem("$($entry.Key) ($dow)")
+            [void]$item.SubItems.Add([string]$entry.Value)
+            [void]$item.SubItems.Add($actionText)
+            [void]$item.SubItems.Add($(if ($action -eq 'move') { $moveTo } else { '-' }))
+            if ($action -eq 'skip') { $item.ForeColor = $Theme.Danger }
+            elseif ($action -eq 'move') { $item.ForeColor = $Theme.Info }
+            [void]$list.Items.Add($item)
+            $script:holidayRows += [pscustomobject]@{ Date = [string]$entry.Key; Name = [string]$entry.Value }
+        }
+        $list.EndUpdate()
     }
-    [System.Windows.Forms.MessageBox]::Show(
-        "$($year)년 공휴일 ($($lines.Count)일)`r`n`r`n$($lines -join [Environment]::NewLine)`r`n`r`n음력 명절은 Windows 음력 달력으로 계산합니다. 임시공휴일은 포함되지 않습니다.",
-        "$($year)년 공휴일") | Out-Null
-})
+    Refresh-HolidayList
+
+    [void](New-CardLabel $dialog '고른 날을' 24 396 80 26 $FontBase $Theme.Ink)
+    $cmbAction = New-Object System.Windows.Forms.ComboBox
+    $cmbAction.DropDownStyle = 'DropDownList'
+    $cmbAction.Location = (New-UiPoint 108 392)
+    $cmbAction.Size = (New-UiSize 150 30)
+    $cmbAction.Font = $FontBase
+    [void]$cmbAction.Items.AddRange(@('그대로 보냄', '보내지 않음', '날짜 옮김'))
+    $cmbAction.SelectedIndex = 0
+    $dialog.Controls.Add($cmbAction)
+
+    [void](New-CardLabel $dialog '옮길 날짜' 274 396 80 26 $FontBase $Theme.Ink)
+    $dtMove = New-Object System.Windows.Forms.DateTimePicker
+    $dtMove.Format = 'Custom'
+    $dtMove.CustomFormat = 'yyyy-MM-dd'
+    $dtMove.Location = (New-UiPoint 356 392)
+    $dtMove.Size = (New-UiSize 140 30)
+    $dtMove.Font = $FontBase
+    $dtMove.Enabled = $false
+    $dialog.Controls.Add($dtMove)
+    $cmbAction.Add_SelectedIndexChanged({ $dtMove.Enabled = ($cmbAction.SelectedIndex -eq 2) })
+
+    $btnApply = New-AppButton $dialog '이 날에 적용' 508 390 108 36 'strong'
+    $btnApply.Add_Click({
+        if ($list.SelectedIndices.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('위 목록에서 날짜를 먼저 골라 주세요.', '공휴일 설정') | Out-Null
+            return
+        }
+        $index = $list.SelectedIndices[0]
+        $row = $script:holidayRows[$index]
+        $action = switch ($cmbAction.SelectedIndex) { 1 { 'skip' } 2 { 'move' } default { 'normal' } }
+        $moveTo = ''
+        if ($action -eq 'move') {
+            $moveTo = $dtMove.Value.ToString('yyyy-MM-dd')
+            if ($moveTo -eq $row.Date) {
+                [System.Windows.Forms.MessageBox]::Show('같은 날로는 옮길 수 없습니다.', '공휴일 설정') | Out-Null
+                return
+            }
+        }
+        Set-HolidayRule $row.Date $row.Name $action $moveTo
+        try { Save-Config $script:config } catch { }
+        Write-RunLog "공휴일 설정: $($row.Date) $($row.Name) -> $action $moveTo"
+        Refresh-HolidayList
+        try { Update-LimitStateLabel } catch { }
+    })
+
+    [void](New-CardLabel $dialog '음력 명절은 Windows 음력 달력으로 계산합니다. 임시공휴일은 들어 있지 않습니다.' 24 440 500 22 $FontSmall $Theme.Muted)
+    $btnClose = New-AppButton $dialog '닫기' 508 436 108 36
+    $btnClose.Add_Click({ $dialog.Close() })
+
+    [void]$dialog.ShowDialog($script:form)
+    $dialog.Dispose()
+}
+
+$btnShowHolidays.Add_Click({ Show-HolidayManager })
 
 $btnTestMyChat.Add_Click({ $script:txtTestRoom.Text = '나와의 채팅'; Sync-ConfigFromForm })
 $btnPickTestRoom.Add_Click({
@@ -5863,7 +6349,7 @@ $btnVerifyRoom.Add_Click({
 function Show-SchedulePicker([datetime]$Current) {
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text = '예약 시각 고르기'
-    $dialog.ClientSize = New-Object System.Drawing.Size(560, 470)
+    $dialog.ClientSize = (New-UiSize 560 470)
     $dialog.StartPosition = 'CenterParent'
     $dialog.FormBorderStyle = 'FixedDialog'
     $dialog.MaximizeBox = $false
@@ -5876,12 +6362,12 @@ function Show-SchedulePicker([datetime]$Current) {
     $title.Font = $FontTourTitle
     $title.ForeColor = $Theme.Ink
     $title.BackColor = $Theme.Card
-    $title.Location = New-Object System.Drawing.Point(26, 22)
-    $title.Size = New-Object System.Drawing.Size(508, 32)
+    $title.Location = (New-UiPoint 26 22)
+    $title.Size = (New-UiSize 508 32)
     $dialog.Controls.Add($title)
 
     $calendar = New-Object System.Windows.Forms.MonthCalendar
-    $calendar.Location = New-Object System.Drawing.Point(26, 62)
+    $calendar.Location = (New-UiPoint 26 62)
     $calendar.MaxSelectionCount = 1
     $calendar.MinDate = (Get-Date).Date
     $calendar.SetDate($Current.Date)
@@ -5890,16 +6376,16 @@ function Show-SchedulePicker([datetime]$Current) {
     [void](New-CardLabel $dialog '시' 300 80 24 26 $FontSmall $Theme.Muted)
     $numHour = New-Object System.Windows.Forms.NumericUpDown
     $numHour.Minimum = 0; $numHour.Maximum = 23; $numHour.Value = $Current.Hour
-    $numHour.Location = New-Object System.Drawing.Point(326, 76)
-    $numHour.Size = New-Object System.Drawing.Size(66, 30)
+    $numHour.Location = (New-UiPoint 326 76)
+    $numHour.Size = (New-UiSize 66 30)
     $numHour.Font = $FontBase; $numHour.BorderStyle = 'FixedSingle'
     $dialog.Controls.Add($numHour)
 
     [void](New-CardLabel $dialog '분' 400 80 24 26 $FontSmall $Theme.Muted)
     $numMinute = New-Object System.Windows.Forms.NumericUpDown
     $numMinute.Minimum = 0; $numMinute.Maximum = 59; $numMinute.Value = $Current.Minute
-    $numMinute.Location = New-Object System.Drawing.Point(426, 76)
-    $numMinute.Size = New-Object System.Drawing.Size(66, 30)
+    $numMinute.Location = (New-UiPoint 426 76)
+    $numMinute.Size = (New-UiSize 66 30)
     $numMinute.Font = $FontBase; $numMinute.BorderStyle = 'FixedSingle'
     $dialog.Controls.Add($numMinute)
 
@@ -5957,7 +6443,7 @@ function Show-SendConfirm([string]$Action) {
     $rooms = @($script:roomEntries | Where-Object { $_.Checked })
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text = $Action
-    $dialog.ClientSize = New-Object System.Drawing.Size(600, 620)
+    $dialog.ClientSize = (New-UiSize 600 620)
     $dialog.StartPosition = 'CenterParent'
     $dialog.FormBorderStyle = 'FixedDialog'
     $dialog.MaximizeBox = $false
@@ -5970,8 +6456,8 @@ function Show-SendConfirm([string]$Action) {
     $title.Font = $FontTourTitle
     $title.ForeColor = $Theme.Ink
     $title.BackColor = $Theme.Card
-    $title.Location = New-Object System.Drawing.Point(28, 24)
-    $title.Size = New-Object System.Drawing.Size(544, 34)
+    $title.Location = (New-UiPoint 28 24)
+    $title.Size = (New-UiSize 544 34)
     $dialog.Controls.Add($title)
 
     $dryRun = [bool]$script:config.DryRun
@@ -5980,8 +6466,8 @@ function Show-SendConfirm([string]$Action) {
     $summary.Font = $FontBase
     $summary.ForeColor = if ($dryRun) { $Theme.Sub } else { $Theme.Danger }
     $summary.BackColor = $Theme.Card
-    $summary.Location = New-Object System.Drawing.Point(28, 62)
-    $summary.Size = New-Object System.Drawing.Size(544, 46)
+    $summary.Location = (New-UiPoint 28 62)
+    $summary.Size = (New-UiSize 544 46)
     $summary.Text = "$mode`r`n$(Get-EstimatedRunText)"
     $dialog.Controls.Add($summary)
 
@@ -5990,8 +6476,8 @@ function Show-SendConfirm([string]$Action) {
     $lblTo.Font = $FontStrong
     $lblTo.ForeColor = $Theme.Ink
     $lblTo.BackColor = $Theme.Card
-    $lblTo.Location = New-Object System.Drawing.Point(28, 116)
-    $lblTo.Size = New-Object System.Drawing.Size(544, 24)
+    $lblTo.Location = (New-UiPoint 28 116)
+    $lblTo.Size = (New-UiSize 544 24)
     $dialog.Controls.Add($lblTo)
 
     $listFrame = New-FieldFrame $dialog 28 144 544 224
@@ -6000,8 +6486,8 @@ function Show-SendConfirm([string]$Action) {
     $list.FullRowSelect = $true
     $list.BorderStyle = 'None'
     $list.Font = $FontBase
-    $list.Location = New-Object System.Drawing.Point(12, 12)
-    $list.Size = New-Object System.Drawing.Size(520, 200)
+    $list.Location = (New-UiPoint 12 12)
+    $list.Size = (New-UiSize 520 200)
     [void]$list.Columns.Add('채팅방 이름', 380)
     [void]$list.Columns.Add('종류', 120)
     # 보내기 전 확인 목록도 종류로 묶지 않고 이름 순서로 보여 줍니다.
@@ -6017,8 +6503,8 @@ function Show-SendConfirm([string]$Action) {
     $lblMsg.Font = $FontStrong
     $lblMsg.ForeColor = $Theme.Ink
     $lblMsg.BackColor = $Theme.Card
-    $lblMsg.Location = New-Object System.Drawing.Point(28, 380)
-    $lblMsg.Size = New-Object System.Drawing.Size(544, 24)
+    $lblMsg.Location = (New-UiPoint 28 380)
+    $lblMsg.Size = (New-UiSize 544 24)
     $dialog.Controls.Add($lblMsg)
 
     $msgFrame = New-FieldFrame $dialog 28 408 544 104
@@ -6029,8 +6515,8 @@ function Show-SendConfirm([string]$Action) {
     $preview.BorderStyle = 'None'
     $preview.BackColor = [System.Drawing.Color]::White
     $preview.Font = $FontBase
-    $preview.Location = New-Object System.Drawing.Point(12, 10)
-    $preview.Size = New-Object System.Drawing.Size(518, 82)
+    $preview.Location = (New-UiPoint 12 10)
+    $preview.Size = (New-UiSize 518 82)
     $preview.Text = if ([string]::IsNullOrWhiteSpace($script:config.Message)) { '(문구 없음)' } else { [string]$script:config.Message }
     $msgFrame.Controls.Add($preview)
 
@@ -6039,16 +6525,16 @@ function Show-SendConfirm([string]$Action) {
     $lblFiles.Font = $FontSmall
     $lblFiles.ForeColor = $Theme.Muted
     $lblFiles.BackColor = $Theme.Card
-    $lblFiles.Location = New-Object System.Drawing.Point(28, 518)
-    $lblFiles.Size = New-Object System.Drawing.Size(300, 22)
+    $lblFiles.Location = (New-UiPoint 28 518)
+    $lblFiles.Size = (New-UiSize 300 22)
     $dialog.Controls.Add($lblFiles)
 
     $chkSkip = New-Object System.Windows.Forms.CheckBox
     $chkSkip.Text = '다음부터 이 확인 창 보지 않기'
     $chkSkip.Font = $FontSmall
     $chkSkip.BackColor = $Theme.Card
-    $chkSkip.Location = New-Object System.Drawing.Point(28, 548)
-    $chkSkip.Size = New-Object System.Drawing.Size(280, 26)
+    $chkSkip.Location = (New-UiPoint 28 548)
+    $chkSkip.Size = (New-UiSize 280 26)
     $dialog.Controls.Add($chkSkip)
 
     $script:sendConfirmResult = $false
@@ -6453,15 +6939,16 @@ function Show-GuideTour([string]$CaptureDir = '') {
 
     $tour = New-Object System.Windows.Forms.Form
     $tour.FormBorderStyle = 'None'
-    $tour.Size = New-Object System.Drawing.Size(600, 440)
+    $tour.Size = (New-UiSize 600 440)
     $tour.StartPosition = 'Manual'
     $tour.BackColor = $Theme.Card
     $tour.Font = $FontBase
     $tour.ShowInTaskbar = $false
     $tour.KeyPreview = $true
+    # 창 위치는 실제 좌표라 그대로 쓰고, 떨어뜨릴 거리만 배율에 맞춥니다.
     $tour.Location = New-Object System.Drawing.Point(
-        ($script:form.Left + 320),
-        ($script:form.Top + 160))
+        ($script:form.Left + (S 320)),
+        ($script:form.Top + (S 160)))
     $tour.Add_Paint({
         param($sender, $e)
         $pen = New-Object System.Drawing.Pen ($Theme.Border)
@@ -6473,32 +6960,32 @@ function Show-GuideTour([string]$CaptureDir = '') {
     })
 
     $lblStep = New-Object System.Windows.Forms.Label
-    $lblStep.Location = New-Object System.Drawing.Point(38, 34)
-    $lblStep.Size = New-Object System.Drawing.Size(200, 22)
+    $lblStep.Location = (New-UiPoint 38 34)
+    $lblStep.Size = (New-UiSize 200 22)
     $lblStep.Font = $FontStrong
     $lblStep.ForeColor = $Theme.Muted
     $lblStep.BackColor = $Theme.Card
     $tour.Controls.Add($lblStep)
 
     $lblTitle = New-Object System.Windows.Forms.Label
-    $lblTitle.Location = New-Object System.Drawing.Point(36, 60)
-    $lblTitle.Size = New-Object System.Drawing.Size(528, 36)
+    $lblTitle.Location = (New-UiPoint 36 60)
+    $lblTitle.Size = (New-UiSize 528 36)
     $lblTitle.Font = $FontTourTitle
     $lblTitle.ForeColor = $Theme.Ink
     $lblTitle.BackColor = $Theme.Card
     $tour.Controls.Add($lblTitle)
 
     $lblBody = New-Object System.Windows.Forms.Label
-    $lblBody.Location = New-Object System.Drawing.Point(38, 106)
-    $lblBody.Size = New-Object System.Drawing.Size(526, 246)
+    $lblBody.Location = (New-UiPoint 38 106)
+    $lblBody.Size = (New-UiSize 526 246)
     $lblBody.Font = $FontTourBody
     $lblBody.ForeColor = $Theme.Sub
     $lblBody.BackColor = $Theme.Card
     $tour.Controls.Add($lblBody)
 
     $dots = New-Object System.Windows.Forms.Panel
-    $dots.Location = New-Object System.Drawing.Point(38, 376)
-    $dots.Size = New-Object System.Drawing.Size(170, 26)
+    $dots.Location = (New-UiPoint 38 376)
+    $dots.Size = (New-UiSize 170 26)
     $dots.BackColor = $Theme.Card
     $dots.Add_Paint({
         param($sender, $e)
@@ -6654,7 +7141,7 @@ function Show-SplashScreen {
     $splash = New-Object System.Windows.Forms.Form
     $splash.FormBorderStyle = 'None'
     $splash.StartPosition = 'CenterScreen'
-    $splash.Size = New-Object System.Drawing.Size(560, 420)
+    $splash.Size = (New-UiSize 560 420)
     $splash.BackColor = $Theme.Card
     $splash.Font = $FontBase
     $splash.TopMost = $true
@@ -6668,14 +7155,14 @@ function Show-SplashScreen {
         $accent = New-Object System.Drawing.SolidBrush ($Theme.Accent)
         $e.Graphics.FillRectangle($accent, 0, 0, $sender.Width, 6)
         $accent.Dispose()
-        $mark = New-Object System.Drawing.Rectangle(40, 40, 52, 52)
+        $mark = New-UiRect 40 40 52 52
         $path = Get-RoundedPath $mark 15
         $brush = New-Object System.Drawing.SolidBrush ($Theme.Accent)
         $e.Graphics.FillPath($brush, $path)
         $brush.Dispose(); $path.Dispose()
         Write-Text $e.Graphics '톡' $FontTourTitle $Theme.AccentInk $mark $TextCenter
-        Write-Text $e.Graphics '카카오 발송기' $FontTourTitle $Theme.Ink (New-Object System.Drawing.Rectangle(108, 42, 300, 30)) $TextLeft
-        Write-Text $e.Graphics "버전 $($script:AppVersion)" $FontSmall $Theme.Muted (New-Object System.Drawing.Rectangle(110, 70, 300, 22)) $TextLeft
+        Write-Text $e.Graphics '카카오 발송기' $FontTourTitle $Theme.Ink (New-UiRect 108 42 300 30) $TextLeft
+        Write-Text $e.Graphics "버전 $($script:AppVersion)" $FontSmall $Theme.Muted (New-UiRect 110 70 300 22) $TextLeft
     })
 
     $steps = @(
@@ -6692,8 +7179,8 @@ function Show-SplashScreen {
     $y = 120
     foreach ($step in $steps) {
         $row = New-Object System.Windows.Forms.Label
-        $row.Location = New-Object System.Drawing.Point(42, $y)
-        $row.Size = New-Object System.Drawing.Size(478, 44)
+        $row.Location = (New-UiPoint 42 $y)
+        $row.Size = (New-UiSize 478 44)
         $row.Font = $FontBase
         $row.ForeColor = $Theme.Muted
         $row.BackColor = $Theme.Card
@@ -6860,7 +7347,7 @@ if ($ScreenshotDir) {
     $script:lblKakaoState.Text = "[정상] 카카오톡 연결됨 — 지금 보고 있는 화면: ChatRoomListView`r`n[정상] 채팅 목록과 검색창을 찾았습니다. 좌표 설정은 필요 없습니다.`r`n[정상] 한국어 문자 인식 사용 가능`r`n[선택] 채팅 탭 위치: 기억함`r`n[선택] 오픈채팅 탭 위치: 기억 안 함 (직접 탭을 눌러 두면 됩니다)"
     Set-StatusPill '준비됨' 'idle'
     $script:form.StartPosition = 'Manual'
-    $script:form.Location = New-Object System.Drawing.Point(-4000, -4000)
+    $script:form.Location = (New-UiPoint -4000 -4000)
     $script:form.Show()
     [System.Windows.Forms.Application]::DoEvents()
     foreach ($page in $script:NavPages) {
