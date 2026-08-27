@@ -2060,6 +2060,43 @@ function Test-RowAnchorText([string]$Text) {
 
 
 # OCR 로 읽은 줄에서 방 이름만 골라냅니다. 순수 함수라 자체 점검으로 검증합니다.
+# 화면에서 읽은 시각 표기를 보기 좋게 되돌립니다.
+#   오전 10•20 -> 오전 10:20
+#   오전 1051  -> 오전 10:51
+# 판단에는 쓰지 않고 기록에만 씁니다. 원래 글자를 억지로 바꾸지 않기 위해서입니다.
+function ConvertTo-ReadableTime([string]$Text) {
+    $t = ([string]$Text).Trim()
+    if (-not $t) { return '' }
+    $m = [regex]::Match($t, '^(오전|오후)?\s*(\d{1,2})\s*[^\d가-힣A-Za-z]{0,3}\s*(\d{2})$')
+    if ($m.Success) {
+        $ampm = $m.Groups[1].Value
+        $hh = $m.Groups[2].Value
+        $mm = $m.Groups[3].Value
+        if ($ampm) { return "$ampm $($hh):$mm" }
+        return "$($hh):$mm"
+    }
+    # 오전 1051 처럼 붙어 나온 경우
+    $m2 = [regex]::Match($t, '^(오전|오후)\s*(\d{3,4})$')
+    if ($m2.Success) {
+        $digits = $m2.Groups[2].Value
+        $mm = $digits.Substring($digits.Length - 2)
+        $hh = $digits.Substring(0, $digits.Length - 2)
+        return "$($m2.Groups[1].Value) $($hh):$mm"
+    }
+    return $t
+}
+
+# 시각·날짜·안읽음 숫자처럼 제목이 아닌 것을 걸러 냅니다.
+# 화면 글자 인식이 이런 것을 이름 구간 안쪽으로 잘못 잡는 경우가 있습니다.
+function Test-NotTitleToken([string]$Text) {
+    $t = ([string]$Text).Trim()
+    if (-not $t) { return $true }
+    if (Test-RowAnchorText $t) { return $true }
+    # 숫자만 있는 짧은 조각은 안 읽은 개수입니다.
+    if ($t -match '^[@()\[\]]?\s*\d{1,4}\s*[@()\[\]]?$') { return $true }
+    return $false
+}
+
 # 채팅 목록 한 줄의 생김새입니다.
 #
 #   [사진]  방 이름            시각      <- 이름과 시각은 같은 높이
@@ -2078,12 +2115,24 @@ function Get-ChatRoomRowsFromOcr([object[]]$Lines, [int]$Width) {
     # 이름이 있는 가로 구간과, 시각이 있는 가로 구간을 나눕니다.
     # 가로 위치는 목록 폭에 견주어 정하므로 화면 배율이 달라도 같습니다.
     $nameLeft = $Width * 0.13
-    $nameRight = $Width * 0.46
-    $timeLeft = $Width * 0.60
+    # 오른쪽 끝을 46% 로 좁게 잡으면 긴 제목의 뒷부분이 잘려 나갑니다.
+    # 실제 화면에서 시각은 75% 언저리, 안 읽은 개수는 85% 언저리에 있으므로
+    # 72% 까지는 넓혀도 그것들이 섞이지 않습니다.
+    # 혹시 섞이더라도 Test-NotTitleToken 이 한 번 더 걸러 냅니다.
+    $nameRight = $Width * 0.72
+    $timeLeft = $Width * 0.72
 
     $nameZone = @($all | Where-Object { $_.Left -ge $nameLeft -and $_.Left -le $nameRight } | Sort-Object Top)
     $anchors = @($all | Where-Object { $_.Left -ge $timeLeft -and (Test-RowAnchorText $_.Text) } | Sort-Object Top)
-    if ($anchors.Count -eq 0) { return @() }
+    if ($anchors.Count -eq 0) {
+        # 시각을 하나도 못 읽었습니다.
+        # 여기서 다른 글자를 제목으로 추측하면 대화내용이 이름으로 들어갑니다.
+        # 예전에 그렇게 해서 문제가 생겼습니다. 이제 추측하지 않습니다.
+        $script:lastAnchorMissing = $true
+        if ($script:debugTitleRead) { Write-RunLog '  TITLE_ANCHOR_NOT_FOUND — 시각을 하나도 못 읽어 제목을 정하지 않았습니다.' }
+        return @()
+    }
+    $script:lastAnchorMissing = $false
 
     # 같은 줄로 볼 세로 오차입니다.
     # 글자 높이를 기준으로 잡으므로 화면 배율이 100% 든 150% 든 알아서 맞습니다.
@@ -2095,7 +2144,7 @@ function Get-ChatRoomRowsFromOcr([object[]]$Lines, [int]$Width) {
         if ($h -gt 0) { $heights += $h }
     }
     if ($heights.Count -gt 0) {
-        $band = [int][Math]::Max(8, [Math]::Round((($heights | Measure-Object -Average).Average) * 0.9))
+        $band = [int][Math]::Max(8, [Math]::Round((($heights | Measure-Object -Average).Average) * 1.0))
     }
 
     for ($i = 0; $i -lt $anchors.Count; $i++) {
@@ -2103,31 +2152,50 @@ function Get-ChatRoomRowsFromOcr([object[]]$Lines, [int]$Width) {
         $rowTop = $anchor.Top - $band
         $rowEnd = if ($i + 1 -lt $anchors.Count) { $anchors[$i + 1].Top - $band } else { [int]::MaxValue }
 
-        # 제목은 시각과 같은 높이에 있는 글자뿐입니다.
-        $title = $null
-        $titleDelta = [int]::MaxValue
+        # 제목은 시각과 같은 높이이거나 살짝 위에 있습니다.
+        # 실제로 재 보니 제목은 시각보다 0~7px 위였고,
+        # 미리보기 대화내용은 시각보다 12px 넘게 아래였습니다.
+        # 그래서 위아래 방향까지 봅니다. 이러면 여유가 훨씬 넉넉해집니다.
+        $titleParts = @()
         foreach ($line in $nameZone) {
-            $delta = [Math]::Abs($line.Top - $anchor.Top)
-            if ($delta -le $band -and $delta -lt $titleDelta) { $titleDelta = $delta; $title = $line }
+            $offset = $anchor.Top - $line.Top
+            if ($offset -lt -2 -or $offset -gt $band) { continue }
+            # 시각·날짜·안읽음 숫자가 이름 구간에 잘못 잡히면 제목에서 뺍니다.
+            if (Test-NotTitleToken $line.Text) { continue }
+            $titleParts = @($titleParts) + $line
+        }
+        # 한 제목이 여러 조각으로 읽힐 수 있습니다.
+        # 화면에 보이는 순서(왼쪽부터)로 이어 붙입니다. 인식 결과 순서는 믿지 않습니다.
+        $titleRaw = ''
+        if ($titleParts.Count -gt 0) {
+            $sorted = @($titleParts | Sort-Object Left)
+            $titleRaw = (@($sorted | ForEach-Object { ([string]$_.Text).Trim() }) -join ' ').Trim()
         }
 
         # 그 아래부터 다음 줄 전까지가 마지막 대화내용입니다.
         $messageParts = @()
         foreach ($line in $nameZone) {
-            if ($line.Top -le ($anchor.Top + $band)) { continue }
+            if (($anchor.Top - $line.Top) -ge -2) { continue }
             if ($line.Top -ge $rowEnd) { continue }
             $messageParts = @($messageParts) + [string]$line.Text
         }
 
         $titleText = ''
-        if ($null -ne $title) { $titleText = ConvertTo-RoomCandidate $title.Text }
+        if ($titleRaw) { $titleText = ConvertTo-RoomCandidate $titleRaw }
+        # 확실한 제목인지 봅니다.
+        #   시각이 있고, 그 높이에 이름 후보가 있고, 이름 구간 안이고,
+        #   대화내용보다 위쪽이면 확실합니다.
+        $confidence = 'low'
+        if ($titleText -and $titleParts.Count -ge 1) { $confidence = 'high' }
         $rows = @($rows) + ([pscustomobject]@{
             Title = $titleText
-            RawTitle = $(if ($null -ne $title) { [string]$title.Text } else { '' })
+            RawTitle = $titleRaw
             LastMessage = ($messageParts -join ' ')
             Time = [string]$anchor.Text
+            TimeReadable = ConvertTo-ReadableTime $anchor.Text
             Top = $rowTop
-            Ok = [bool]$titleText
+            Confidence = $confidence
+            Ok = ($confidence -eq 'high')
         })
     }
     return @($rows)
@@ -2143,12 +2211,15 @@ function Get-RoomNamesFromOcrLines([object[]]$Lines, [int]$Width) {
             $failed++
             # 못 읽었다고 아래 대화내용을 대신 쓰지 않습니다.
             if ($script:debugTitleRead) {
-                Write-RunLog "  [제목 인식 실패] 시각=$($row.Time) / 그 줄의 대화내용='$($row.LastMessage)' (이름으로 쓰지 않았습니다)"
+                Write-RunLog "  [줄] 시각=$($row.TimeReadable) / 제목=미확정 / 결과=TITLE_READ_FAILED"
+                Write-RunLog "       그 줄의 대화내용='$($row.LastMessage)' (제목으로 쓰지 않았습니다)"
             }
             continue
         }
         if ($script:debugTitleRead) {
-            Write-RunLog "  [제목] '$($row.Title)' / 시각=$($row.Time) / 대화내용='$($row.LastMessage)'"
+            Write-RunLog "  [줄] 시각=$($row.Time) -> $($row.TimeReadable)"
+            Write-RunLog "       제목='$($row.Title)' (읽힌 그대로: '$($row.RawTitle)') / 확실함=$($row.Confidence)"
+            Write-RunLog "       대화내용='$($row.LastMessage)'"
         }
         if (@($result) -notcontains [string]$row.Title) { $result = @($result) + [string]$row.Title }
     }
@@ -2321,6 +2392,9 @@ function Get-KakaoRoomNames([int]$MaxPages = 30) {
     $names = New-Object System.Collections.Generic.List[string]
     $pages = 0
     $noChange = 0
+    # 같은 이름이 몇 번 나왔는지 세어 둡니다.
+    # 이름이 같은 방이 여럿이면 이름만으로는 서로를 가릴 수 없어 알려 드려야 합니다.
+    $seenCount = @{}
     # 제목을 못 읽은 줄이 몇 개인지 모아 둡니다.
     # 못 읽은 줄은 이름 목록에 넣지 않습니다. 엉뚱한 대화내용을 넣느니 빼는 것이 낫습니다.
     $titleFailures = 0
@@ -2332,7 +2406,10 @@ function Get-KakaoRoomNames([int]$MaxPages = 30) {
         $found = @(Get-RoomNamesFromOcrLines (Get-OcrLines $list (Get-OcrScaleFor $list)) $list.Width)
         $titleFailures += [int]$script:lastTitleReadFailures
         foreach ($name in $found) {
-            if (-not $names.Contains([string]$name)) { $names.Add([string]$name) }
+            $key = [string]$name
+            if ($seenCount.ContainsKey($key)) { $seenCount[$key] = $seenCount[$key] + 1 }
+            else { $seenCount[$key] = 1 }
+            if (-not $names.Contains($key)) { $names.Add($key) }
         }
         $pages++
 
@@ -2363,6 +2440,16 @@ function Get-KakaoRoomNames([int]$MaxPages = 30) {
 
     if ($titleFailures -gt 0) {
         Write-RunLog "제목을 읽지 못한 줄 $($titleFailures)개는 목록에 넣지 않았습니다. (대화내용을 이름으로 쓰지 않습니다)"
+    }
+    # 같은 이름이 여러 화면에서 나오는 것은 겹쳐 읽힌 것일 수 있지만,
+    # 한 화면 안에서 여러 번 나오면 정말로 이름이 같은 방이 여럿인 것입니다.
+    $dupNames = @()
+    foreach ($entry in $seenCount.GetEnumerator()) {
+        if ($entry.Value -gt $pages) { $dupNames += [string]$entry.Key }
+    }
+    if ($dupNames.Count -gt 0) {
+        Write-RunLog "이름이 같은 방이 있습니다: $(($dupNames | Select-Object -First 5) -join ', ')"
+        Write-RunLog "  이름만으로는 서로를 가릴 수 없어 하나로 다룹니다. 카카오톡에서 이름을 다르게 해 주시면 정확해집니다."
     }
     return [pscustomobject]@{
         Names = @($names | Sort-Object -Unique)
@@ -3334,6 +3421,7 @@ $script:toolbarClickNeedsMouse = $false
 # 제목을 어떻게 골랐는지 기록에 남길지 정합니다. 문제 분석용입니다.
 $script:debugTitleRead = $false
 $script:lastTitleReadFailures = 0
+$script:lastAnchorMissing = $false
 $script:lstProgress = $null
 $script:lblProgressCount = $null
 $script:barProgress = $null
@@ -4319,6 +4407,50 @@ if ($SelfTest) {
     if ($probeRows2[0].Ok) { throw '제목이 없는데 정상이라고 합니다' }
     if ($probeRows2[0].Title -eq '대표님 확인했습니다') { throw '제목 대신 대화내용을 넣었습니다' }
     if (@(Get-RoomNamesFromOcrLines $probeNoTitle 325).Count -ne 0) { throw '제목을 못 읽었는데 이름 목록에 넣었습니다' }
+    # 시각을 하나도 못 읽으면 아무 제목도 정하지 않습니다.
+    $probeNoAnchor = @(
+        [pscustomobject]@{ Text = '투투';             Left = 60; Top = 20; Height = 14 },
+        [pscustomobject]@{ Text = '오늘 확인했습니다'; Left = 60; Top = 40; Height = 13 }
+    )
+    if (@(Get-RoomNamesFromOcrLines $probeNoAnchor 325).Count -ne 0) { throw '시각이 없는데 제목을 추측했습니다' }
+    if (-not $script:lastAnchorMissing) { throw '시각을 못 찾은 것을 기록하지 않았습니다' }
+    # 제목이 여러 조각으로 읽혀도 화면 순서대로 이어 붙여야 합니다.
+    $probeSplit = @(
+        [pscustomobject]@{ Text = '쇼핑';       Left = 110; Top = 20; Height = 14 },
+        [pscustomobject]@{ Text = '네이버';     Left = 60;  Top = 20; Height = 14 },
+        [pscustomobject]@{ Text = '광고방';     Left = 150; Top = 21; Height = 14 },
+        [pscustomobject]@{ Text = '오전 11:32'; Left = 250; Top = 20; Height = 12 },
+        [pscustomobject]@{ Text = '감사합니다'; Left = 60;  Top = 40; Height = 13 }
+    )
+    $probeMerged = @(Get-RoomNamesFromOcrLines $probeSplit 325)
+    if ($probeMerged.Count -ne 1 -or $probeMerged[0] -ne '네이버 쇼핑 광고방') {
+        throw "조각난 제목을 화면 순서대로 못 붙입니다: $($probeMerged -join ', ')"
+    }
+    # 안 읽은 개수나 시각이 제목에 섞이면 안 됩니다.
+    $probeBadge = @(
+        [pscustomobject]@{ Text = '투투';       Left = 60;  Top = 20; Height = 14 },
+        [pscustomobject]@{ Text = '3';          Left = 140; Top = 21; Height = 10 },
+        [pscustomobject]@{ Text = '오전 11:32'; Left = 250; Top = 20; Height = 12 }
+    )
+    $probeBadgeNames = @(Get-RoomNamesFromOcrLines $probeBadge 325)
+    if ($probeBadgeNames.Count -ne 1 -or $probeBadgeNames[0] -ne '투투') {
+        throw "안 읽은 개수가 제목에 섞였습니다: $($probeBadgeNames -join ', ')"
+    }
+    # 시각 표기를 보기 좋게 되돌리는지 봅니다.
+    if ((ConvertTo-ReadableTime '오전 10•20') -ne '오전 10:20') { throw '시각 되돌리기 실패 (가운뎃점)' }
+    if ((ConvertTo-ReadableTime '오전 1051') -ne '오전 10:51') { throw '시각 되돌리기 실패 (붙은 숫자)' }
+    if ((ConvertTo-ReadableTime '오후 148') -ne '오후 1:48') { throw '시각 되돌리기 실패 (세 자리)' }
+    # 긴 제목도 그대로 읽어야 합니다.
+    foreach ($probeLong in @('네이버 쇼핑 광고 운영방', '5K 마케팅 운영팀', '광고문의_1', '서든어택 Andrew 운영진')) {
+        $probeRow = @(
+            [pscustomobject]@{ Text = $probeLong; Left = 60; Top = 20; Height = 14 },
+            [pscustomobject]@{ Text = '오전 11:32'; Left = 250; Top = 20; Height = 12 }
+        )
+        $probeGot = @(Get-RoomNamesFromOcrLines $probeRow 325)
+        if ($probeGot.Count -ne 1 -or $probeGot[0] -ne $probeLong) {
+            throw "긴 제목을 그대로 못 읽습니다: $probeLong -> $($probeGot -join ', ')"
+        }
+    }
     # 화면 글자 인식이 놓친 시각 표기도 알아봐야 합니다.
     foreach ($probeTime in @('오전 10•20', '오전 1148', '11:32', '2026•05-18', '어제')) {
         if (-not (Test-RowAnchorText $probeTime)) { throw "시각을 못 알아봅니다: $probeTime" }
@@ -6389,9 +6521,12 @@ $btnScanRooms.Add_Click({
         $titleFailed = 0
         try { $titleFailed = [int]$scan.TitleFailures } catch { }
         if ($titleFailed -gt 0) {
-            $result += "`r`n`r`n제목을 읽지 못한 줄이 $($titleFailed)개 있어 목록에 넣지 않았습니다."
-            $result += "`r`n대화내용을 이름으로 쓰면 엉뚱한 방에 갈 수 있어 일부러 뺐습니다."
-            $result += "`r`n카카오톡 창을 조금 크게 하고 다시 읽으면 대개 잡힙니다."
+            $result = "채팅방 $($readCount + $titleFailed)개 중 $($readCount)개를 정상적으로 읽었습니다. (새로 추가 $($added)개)"
+            $result += "`r`n`r`n$($titleFailed)개 채팅방은 제목을 정확하게 확인할 수 없어"
+            $result += "`r`n발송 대상에서 제외했습니다."
+            $result += "`r`n`r`n대화내용을 이름으로 쓰면 엉뚱한 방에 갈 수 있어 일부러 뺐습니다."
+            $result += "`r`n`r`n카카오톡 창을 조금 크게 한 뒤"
+            $result += "`r`n[카카오톡에서 읽기]를 다시 눌러 주세요."
         }
         # 카카오톡에 방이 많이 쌓여 있으면 처음에 목록이 제대로 안 그려지는 일이 있습니다.
         # 예전에 알던 개수보다 크게 적으면 그 상황일 수 있어 알려 드립니다.
