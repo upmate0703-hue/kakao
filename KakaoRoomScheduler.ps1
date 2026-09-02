@@ -625,6 +625,7 @@ $script:navText = @{}
 $script:latestRelease = $null
 $script:statusText = '준비됨'
 $script:overlapNoted = $false
+$script:unattended = $false
 $script:lastPaintAt = [datetime]::MinValue
 $script:runClock = $null
 $script:statusKind = 'idle'
@@ -5612,9 +5613,15 @@ function Invoke-Broadcast([string[]]$Targets = $null, [bool]$Resume = $false) {
             if (@($check.Good).Count -eq 0 -and [string]::IsNullOrWhiteSpace([string]$content.Message)) {
                 throw ($ask + "`r`n`r`n보낼 것이 하나도 남지 않아 시작하지 않았습니다.")
             }
-            $ask += "`r`n`r`n[예] 문제 있는 파일만 빼고 보냅니다." + "`r`n" + "[아니오] 시작하지 않습니다."
-            if ([System.Windows.Forms.MessageBox]::Show($ask, '첨부 파일 확인', 'YesNo', 'Warning') -ne 'Yes') {
-                throw '첨부 파일에 문제가 있어 시작하지 않았습니다.'
+            if ($script:unattended) {
+                # 예약이 스스로 돌린 것이면 묻지 않습니다.
+                # 물어보는 창 때문에 발송이 멈추면 안 됩니다.
+                Write-RunLog '예약 발송이라 묻지 않고 문제 있는 파일만 빼고 진행합니다.'
+            } else {
+                $ask += "`r`n`r`n[예] 문제 있는 파일만 빼고 보냅니다." + "`r`n" + "[아니오] 시작하지 않습니다."
+                if ([System.Windows.Forms.MessageBox]::Show($ask, '첨부 파일 확인', 'YesNo', 'Warning') -ne 'Yes') {
+                    throw '첨부 파일에 문제가 있어 시작하지 않았습니다.'
+                }
             }
             $content.Attachments = @($check.Good)
             Write-RunLog "문제 있는 첨부 $(@($check.Bad).Count)개를 빼고 $(@($check.Good).Count)개만 보냅니다."
@@ -10453,9 +10460,13 @@ function Start-RepeatIfNeeded {
     Set-StatusPill "반복 대기 — $($next.ToString('HH:mm')) 에 다시" 'wait'
 }
 
-function Start-BroadcastAsync([string[]]$Targets = $null, [bool]$Resume = $false) {
+# 발송을 시작합니다.
+# Unattended 가 참이면 예약이 스스로 돌린 것입니다. 그때는 물어보는 창을 띄우지 않습니다.
+# 사람이 없는데 창이 떠 있으면 그 창 때문에 다음 회차가 통째로 밀립니다.
+function Start-BroadcastAsync([string[]]$Targets = $null, [bool]$Resume = $false, [bool]$Unattended = $false) {
     if ($script:running) { return }
     $script:running = $true
+    $script:unattended = $Unattended
     $script:armed = $false
     $btnArm.Enabled = $true
     $btnCancelArm.Enabled = $false
@@ -10466,43 +10477,128 @@ function Start-BroadcastAsync([string[]]$Targets = $null, [bool]$Resume = $false
     $sidebar.Enabled = $false
     $btnHeaderEdit.Enabled = $false
     Update-RunButtons
+    $ok = $false
+    $failText = ''
     try {
         $count = Invoke-Broadcast $Targets $Resume
-        Set-StatusPill "작업 완료 · 성공 $($count)개" 'done'
-        Show-RunResult
-        Start-RepeatIfNeeded
+        $ok = $true
+        $r = $script:lastRunResult
+        if ($null -ne $r -and ($r.Failed -gt 0 -or $r.Missing -ne 0)) {
+            Set-StatusPill "완료 · 성공 $($r.Sent) · 실패 $($r.Failed)" 'error'
+        } else {
+            Set-StatusPill "완료 · 성공 $($count)개" 'done'
+        }
     } catch {
-        Write-RunLog "작업 중단: $($_.Exception.Message)"
+        $failText = [string]$_.Exception.Message
+        Write-RunLog "작업 중단: $failText"
         Set-StatusPill '오류로 중단' 'error'
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '작업 중단') | Out-Null
     } finally {
         $pageHost.Enabled = $true
         $sidebar.Enabled = $true
         $btnHeaderEdit.Enabled = $true
+        # 여기서 먼저 풀어 줍니다.
+        # 결과 창을 띄우기 전에 풀어야 다음 예약 회차가 밀리지 않습니다.
         $script:running = $false
         $script:pauseRequested = $false
+        $script:unattended = $false
         Update-RunButtons
         Update-ResumeButtons
-        $script:form.Activate()
     }
+    # 반복 예약을 먼저 걸어 둡니다. 창 때문에 반복이 늦어지면 안 됩니다.
+    if ($ok) { try { Start-RepeatIfNeeded } catch { } }
+    # 이제 알립니다. 잘 끝났으면 아무 창도 뜨지 않습니다.
+    if ($ok) {
+        try { Show-RunResult } catch { }
+    } elseif (-not $Unattended -and $failText) {
+        Show-AutoCloseInfo $failText '작업 중단' 30
+    }
+    try { $script:form.Activate() } catch { }
+}
+# 잠시 뒤 저절로 닫히는 알림창입니다.
+# 보통 알림창은 누를 때까지 그대로 서 있습니다.
+# 자리를 비운 사이에 그 창이 떠 있으면 다음 예약 발송이 계속 밀립니다.
+# 그래서 정해진 시간이 지나면 스스로 닫히게 합니다.
+function Show-AutoCloseInfo([string]$Text, [string]$Title, [int]$Seconds = 30) {
+    $dialog = New-Object System.Windows.Forms.Form
+    try { if ($null -ne $script:appIcon) { $dialog.Icon = $script:appIcon } } catch { }
+    $dialog.Text = $Title
+    $dialog.ClientSize = (New-UiSize 520 400)
+    $dialog.StartPosition = 'CenterParent'
+    $dialog.FormBorderStyle = 'Sizable'
+    $dialog.MinimizeBox = $false
+    $dialog.MaximizeBox = $false
+    $dialog.BackColor = $Theme.Bg
+    $dialog.Font = $FontBase
+    $dialog.TopMost = $false
+    $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    if ($dialog.Height -gt ($work.Height - (S 40))) { $dialog.Height = $work.Height - (S 40) }
+
+    $foot = New-Object System.Windows.Forms.Panel
+    $foot.Dock = 'Bottom'
+    $foot.Height = (S 60)
+    $foot.BackColor = $Theme.Bg
+    $dialog.Controls.Add($foot)
+
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Multiline = $true
+    $box.ReadOnly = $true
+    $box.ScrollBars = 'Vertical'
+    $box.BorderStyle = 'None'
+    $box.BackColor = $Theme.Bg
+    $box.ForeColor = $Theme.Ink
+    $box.Font = $FontBase
+    $box.Dock = 'Fill'
+    $box.Text = $Text
+    $dialog.Controls.Add($box)
+    $box.BringToFront()
+
+    $btnClose = New-AppButton $foot '닫기' 396 10 108 38 'primary'
+    $lblLeft = New-CardLabel $foot '' 20 18 360 24 $FontSmall $Theme.Muted
+    $lblLeft.BackColor = $Theme.Bg
+
+    $script:autoCloseLeft = [Math]::Max(5, $Seconds)
+    $tick = New-Object System.Windows.Forms.Timer
+    $tick.Interval = 1000
+    $tick.Add_Tick({
+        $script:autoCloseLeft--
+        if ($script:autoCloseLeft -le 0) {
+            $tick.Stop()
+            $dialog.Close()
+            return
+        }
+        $lblLeft.Text = "$($script:autoCloseLeft)초 뒤 저절로 닫힙니다."
+    })
+    $lblLeft.Text = "$($script:autoCloseLeft)초 뒤 저절로 닫힙니다."
+    # 사용자가 창을 만지면 저절로 닫히지 않게 합니다. 읽는 중에 닫히면 곤란합니다.
+    $stop = { $tick.Stop(); $lblLeft.Text = '' }
+    $box.Add_Click($stop)
+    $dialog.Add_MouseDown($stop)
+    $btnClose.Add_Click({ $tick.Stop(); $dialog.Close() })
+    $dialog.Add_Shown({ $tick.Start() })
+    $dialog.Add_FormClosed({ $tick.Stop(); $tick.Dispose() })
+    [void]$dialog.ShowDialog()
+    $dialog.Dispose()
 }
 
-# 끝난 뒤 결과를 한눈에 보여 줍니다. 숫자가 맞는지 여기서 바로 확인하실 수 있습니다.
+# 끝난 뒤 결과를 보여 줍니다.
+# 잘 끝났으면 창을 띄우지 않습니다. 상태줄과 실행 기록에 이미 다 있습니다.
+# 실패했거나 처리하지 못한 방이 있을 때만 알려 드립니다.
 function Show-RunResult {
     $r = $script:lastRunResult
     if ($null -eq $r) { return }
+    $needAttention = ($r.Failed -gt 0 -or $r.Missing -ne 0)
+    if (-not $needAttention) { return }
+
     $lines = @()
     $lines += "전체 대상: $($r.Total)개"
     $lines += "성공:      $($r.Sent)개"
     $lines += "실패:      $($r.Failed)개"
-    $lines += "누락:      $($r.Missing)개"
+    if ($r.Missing -ne 0) { $lines += "처리 못함: $($r.Missing)개" }
     $lines += ''
     if ($r.DryRun) {
         $lines += '확인 전용이라 실제로 보낸 것은 없습니다.'
     } else {
-        $lines += "발송 사진: $($r.Photos)장"
-        $lines += "발송 파일: $($r.Files)개"
-        $lines += "메시지:    $($r.Messages)건"
+        $lines += "발송 사진: $($r.Photos)장   ·   파일 $($r.Files)개   ·   메시지 $($r.Messages)건"
     }
     if ($r.Missing -ne 0) {
         $lines += ''
@@ -10511,15 +10607,17 @@ function Show-RunResult {
     if (@($r.FailedRooms).Count -gt 0) {
         $lines += ''
         $lines += "[실패한 채팅방 $(@($r.FailedRooms).Count)개]"
-        $lines += ((@($r.FailedRooms) | Select-Object -First 15) -join "`r`n")
-        if (@($r.FailedRooms).Count -gt 15) { $lines += "… 외 $((@($r.FailedRooms).Count) - 15)개" }
+        foreach ($name in @($r.FailedRooms)) {
+            $why = ''
+            try { $why = [string]$script:progressRows[$name].Note } catch { }
+            if ($why.Length -gt 60) { $why = $why.Substring(0, 60) + '…' }
+            $lines += ("· {0}{1}" -f (Get-RoomDisplayName $name), $(if ($why) { "  —  $why" } else { '' }))
+        }
         $lines += ''
         $lines += '[보내기] 화면의 [실패한 방만 다시 보내기] 로 이 방들만 다시 보낼 수 있습니다.'
     }
-    $title = if ($r.Missing -eq 0) { '발송 완료' } else { '발송 완료 — 확인 필요' }
-    [System.Windows.Forms.MessageBox]::Show(($lines -join "`r`n"), $title) | Out-Null
+    Show-AutoCloseInfo ($lines -join [Environment]::NewLine) '발송 결과 — 확인이 필요합니다' 40
 }
-
 # 이어서 발송 · 실패한 방만 다시 보내기 단추를 켜고 끕니다.
 function Update-ResumeButtons {
     try {
@@ -11127,7 +11225,7 @@ $timer.Add_Tick({
             return
         }
         $script:lblCountdown.Text = '예약 시각이 되어 실행합니다.'
-        Start-BroadcastAsync
+        Start-BroadcastAsync $null $false $true
     } else {
         $text = "예약까지 " + $remaining.ToString('dd\일\ hh\:mm\:ss')
         $script:lblCountdown.Text = $text
