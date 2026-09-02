@@ -1,4 +1,4 @@
-﻿; 카카오 발송기 설치 프로그램
+; 카카오 발송기 설치 프로그램
 ;
 ; 이 프로그램은 설정과 실행 기록을 자기 폴더 안에 만듭니다.
 ; 그래서 Program Files 에 넣으면 권한 때문에 쓰지 못합니다.
@@ -65,4 +65,5 @@ Filename: "{app}\{#AppExe}"; Description: "지금 실행하기"; WorkingDir: "{a
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\backup"
 Type: files; Name: "{app}\config.json"
+Type: files; Name: "{app}\progress.json"
 Type: dirifempty; Name: "{app}"

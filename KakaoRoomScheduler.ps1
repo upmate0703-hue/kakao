@@ -77,6 +77,20 @@ public static class NativeKakao {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
+    // 이 창이 놓인 화면의 배율을 알아냅니다.
+    // 모니터마다 배율이 다를 수 있어, 창 기준으로 물어야 정확합니다.
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hWnd);
+    public static int WindowDpi(IntPtr hWnd) {
+        try { uint d = GetDpiForWindow(hWnd); if (d >= 72 && d <= 480) { return (int)d; } } catch { }
+        return 96;
+    }
+    // 창이 응답하지 않는 상태인지 봅니다. 카카오톡이 잠깐 먹통일 때 바로 실패로 몰지 않기 위해서입니다.
+    [DllImport("user32.dll")] static extern bool IsHungAppWindow(IntPtr hWnd);
+    public static bool IsWindowHung(IntPtr hWnd) { try { return IsHungAppWindow(hWnd); } catch { return false; } }
+    // 작업 표시줄이 이 프로그램을 별개의 프로그램으로 보게 합니다.
+    // 이것을 안 하면 스크립트로 실행할 때 파워셸 아이콘으로 묶여 버립니다.
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SetCurrentProcessExplicitAppUserModelID(string appID);
+    public static void SetAppId(string appID) { try { SetCurrentProcessExplicitAppUserModelID(appID); } catch { } }
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int virtualKey);
@@ -3039,6 +3053,142 @@ function Invoke-AttachmentCheck([string]$Room, [string]$Path) {
 
 
 
+# 도중에 잘못됐을 때 화면을 안전한 상태로 되돌립니다.
+# 미리보기 창이나 팝업이 떠 있는 채로 다음 일을 하면 엉뚱한 곳에 입력됩니다.
+#   1) 열려 있는 미리보기 창을 닫습니다
+#   2) 열려 있는 파일 선택창을 닫습니다
+#   3) 채팅창의 팝업을 걷어냅니다
+#   4) 입력칸에 남은 첨부 초안을 치웁니다
+# 되돌리지 못하면 거짓을 돌려줍니다. 그때는 이 방을 실패로 둡니다.
+function Reset-ChatAfterFailure([object]$Chat, [object]$InputBox) {
+    $ok = $true
+    # 1) 미리보기 창
+    try {
+        foreach ($process in (Get-KakaoProcesses)) {
+            foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
+                if (-not $window.Visible) { continue }
+                if (-not [string]::IsNullOrWhiteSpace($window.Title)) { continue }
+                if ($window.Width -lt 220 -or $window.Height -lt 220) { continue }
+                if ($window.Width -gt 1200 -or $window.Height -gt 1200) { continue }
+                Write-RunLog '  복구: 남아 있던 미리보기 창을 닫습니다.'
+                if (-not (Close-KakaoPreview $window)) { $ok = $false }
+            }
+        }
+    } catch { $ok = $false }
+    # 2) 파일 선택창
+    try {
+        foreach ($process in (Get-KakaoProcesses)) {
+            foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
+                if (-not $window.Visible) { continue }
+                if ($window.ClassName -ne '#32770') { continue }
+                if ($window.Width -lt 200 -or $window.Height -lt 150) { continue }
+                Write-RunLog '  복구: 남아 있던 파일 선택창을 닫습니다.'
+                Close-FileDialog $window
+            }
+        }
+    } catch { }
+    # 3) 채팅창 팝업과 4) 남은 첨부 초안
+    try {
+        if ($null -ne $Chat -and $null -ne $InputBox) {
+            Hide-ChatPopup $Chat $InputBox
+            [void](Clear-ChatAttachmentDraft $Chat $InputBox)
+        }
+    } catch { $ok = $false }
+    return $ok
+}
+# 클립보드에 우리가 넣은 파일이 정말 들어갔는지 확인합니다.
+# 다른 프로그램이 그 사이에 클립보드를 바꿔치기하면 엉뚱한 것이 붙습니다.
+# 앞 채팅방에 쓰던 사진이 다음 방에 붙는 일도 이 확인으로 막습니다.
+function Test-ClipboardHasFiles([string[]]$Paths) {
+    try {
+        $want = @()
+        foreach ($path in @($Paths)) {
+            try { $want += (Resolve-Path -LiteralPath ([string]$path)).Path } catch { $want += [string]$path }
+        }
+        $have = @([System.Windows.Forms.Clipboard]::GetFileDropList())
+        if ($have.Count -ne $want.Count) { return $false }
+        for ($i = 0; $i -lt $want.Count; $i++) {
+            if ([string]$have[$i] -ne [string]$want[$i]) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
+# 카카오톡이 잠깐 먹통일 수 있습니다. 바로 실패로 몰지 않고 돌아오기를 기다립니다.
+# 끝까지 안 돌아오면 그때 알려 줍니다.
+function Wait-KakaoResponsive([object]$Window, [int]$TimeoutMs = 20000) {
+    if ($null -eq $Window) { return $true }
+    $handle = $Window.Handle
+    if (-not [NativeKakao]::IsWindowHung($handle)) { return $true }
+    Write-RunLog '카카오톡이 잠깐 응답하지 않습니다. 돌아오기를 기다립니다.'
+    $deadline = (Get-Date).AddMilliseconds([Math]::Max(2000, $TimeoutMs))
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 300
+        if (-not [NativeKakao]::IsWindowHung($handle)) {
+            Write-RunLog '카카오톡이 다시 응답합니다. 이어서 진행합니다.'
+            return $true
+        }
+        if (Test-RunInterrupted) { return $false }
+    }
+    Write-RunLog 'KAKAO_NOT_RESPONDING — 카카오톡이 계속 응답하지 않습니다.'
+    return $false
+}
+
+# 첨부를 보낸 뒤 대화창에 정말 올라왔는지 봅니다.
+# 미리보기 창이 닫힌 것만으로는 보냈다고 할 수 없습니다.
+# 취소를 눌러도 창은 닫히기 때문입니다.
+function Test-AttachmentLanded([object]$Chat, [string]$Before, [int]$TimeoutMs) {
+    if ([string]::IsNullOrEmpty($Before)) { return $true }
+    $list = Get-ChatListControl $Chat
+    if ($null -eq $list) { return $true }
+    return (Test-ChatMessageLanded $list $Before $TimeoutMs)
+}
+
+# 첨부할 파일이 실제로 쓸 수 있는 상태인지 미리 봅니다.
+# 없는 파일, 열리지 않는 파일, 빈 파일을 발송 도중에 만나면 거기서 막힙니다.
+function Test-AttachmentFile([string]$Path) {
+    $path = [string]$Path
+    if (-not $path) { return [pscustomobject]@{ Ok = $false; Reason = '경로가 비어 있습니다' } }
+    $name = $path
+    try { $name = [System.IO.Path]::GetFileName($path) } catch { }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return [pscustomobject]@{ Ok = $false; Reason = "$name - 파일을 찾을 수 없습니다" }
+    }
+    $info = $null
+    try { $info = Get-Item -LiteralPath $path -ErrorAction Stop } catch {
+        return [pscustomobject]@{ Ok = $false; Reason = "$name - 파일 정보를 읽지 못했습니다" }
+    }
+    if ($info.Length -le 0) {
+        return [pscustomobject]@{ Ok = $false; Reason = "$name - 파일이 비어 있습니다 (0 바이트)" }
+    }
+    # 300MB 가 넘으면 카카오톡이 받지 않습니다.
+    if ($info.Length -gt 314572800) {
+        return [pscustomobject]@{ Ok = $false; Reason = "$name - 파일이 너무 큽니다 ($([Math]::Round($info.Length/1MB))MB)" }
+    }
+    # 실제로 열리는지 봅니다. 다른 프로그램이 붙잡고 있으면 여기서 걸립니다.
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($info.FullName, 'Open', 'Read', 'ReadWrite')
+        $head = New-Object byte[] 8
+        [void]$stream.Read($head, 0, 8)
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Reason = "$name - 다른 프로그램이 쓰고 있어 열 수 없습니다" }
+    } finally {
+        if ($null -ne $stream) { try { $stream.Dispose() } catch { } }
+    }
+    return [pscustomobject]@{ Ok = $true; Reason = '' }
+}
+
+# 첨부 목록 전체를 미리 훑어 봅니다. 문제가 있으면 파일마다 까닭을 알려 줍니다.
+function Test-AttachmentList([string[]]$Paths) {
+    $good = @()
+    $bad = @()
+    foreach ($path in @($Paths)) {
+        $check = Test-AttachmentFile ([string]$path)
+        if ($check.Ok) { $good += [string]$path } else { $bad += $check.Reason }
+    }
+    return [pscustomobject]@{ Good = @($good); Bad = @($bad) }
+}
 # 방 하나가 어디까지 갔는지 적어 둡니다.
 # 첨부가 실패해서 다시 할 때, 이미 보낸 문구를 또 보내면 안 되기 때문입니다.
 #   { MessageSent = $false; SentFiles = @{} }
@@ -3058,8 +3208,9 @@ function Get-DeliveryState([string]$Room) {
 }
 
 # 이미 열린 채팅창에 보냅니다. 제목이 목표 방과 맞을 때만 전송합니다.
-# 차례는 이렇습니다.  확인 -> 첨부 -> 첨부 전송 -> 문구 입력 -> 문구 전송 -> 확인 -> 닫기
-# 하나라도 실패하면 이 방은 실패입니다. 보내지 못한 것을 완료라고 하지 않습니다.
+# 차례는 이렇습니다.
+#   채팅방 확인 -> 파일 첨부 -> 첨부 확인 -> 첨부 전송 -> 메시지 입력 -> 메시지 전송 -> 전송 확인 -> 닫기
+# 한 단계라도 확인이 안 되면 그 방은 실패입니다. 보내지 못한 것을 완료라고 하지 않습니다.
 #
 # CloseWhenDone 이 거짓이면 창을 닫지 않습니다.
 # 사용자가 직접 열어 둔 창은 사용자 것입니다. 우리가 마음대로 닫지 않습니다.
@@ -3069,17 +3220,25 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
     # 엉뚱한 방에 보내거나, 보내지도 않고 보낸 것으로 착각합니다.
     # 그래서 방이 완전히 열릴 때까지 기다린 뒤에만 손을 댑니다.
     Set-SendProgress $Room '채팅방 확인' ''
+    Write-StepLog $Room '채팅방 확인 시작'
+    if (-not (Wait-KakaoResponsive $Chat 20000)) {
+        $script:lastSendProblem = 'KAKAO_NOT_RESPONDING — 카카오톡이 응답하지 않습니다.'
+        Write-StepLog $Room $script:lastSendProblem
+        if ($CloseWhenDone) { Close-ChatWindow $Chat }
+        return $false
+    }
     $ready = Wait-ChatWindowReady $Chat $Room ([int]$Content.OpenTimeoutMs)
     if ($null -eq $ready) {
         $script:lastSendProblem = 'ROOM_OPEN_FAILED — 방이 다 열리지 않았거나 창 제목이 이 방과 달랐습니다.'
-        Write-RunLog "건너뜀: '$Room' — $($script:lastSendProblem)"
+        Write-StepLog $Room ('채팅방 확인 실패 — ' + $script:lastSendProblem)
         if ($CloseWhenDone) { Close-ChatWindow $Chat }
         return $false
     }
     $chat = $ready.Window
+    Write-StepLog $Room '채팅방 확인 성공'
 
     if ([bool]$Content.DryRun) {
-        Write-RunLog "확인만 함: '$Room' — 방은 열렸습니다. 아무것도 보내지 않았습니다."
+        Write-StepLog $Room '확인만 함 — 아무것도 보내지 않았습니다'
         if ($CloseWhenDone) { Close-ChatWindow $chat }
         return $true
     }
@@ -3099,9 +3258,10 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
         foreach ($path in $files) {
             $p = [string]$path
             if ($state.SentFiles.ContainsKey($p)) { continue }
-            if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
-                $problems += "ATTACH_MISSING 파일이 없습니다: $p"
-                Write-RunLog "첨부 실패: 파일 없음 — $p"
+            $check = Test-AttachmentFile $p
+            if (-not $check.Ok) {
+                $problems += ('ATTACH_FILE_BAD ' + $check.Reason)
+                Write-StepLog $Room ('첨부 실패 — ' + $check.Reason)
                 continue
             }
             $left += $p
@@ -3115,39 +3275,51 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
                 try { $n = [System.IO.Path]::GetFileName([string]$_) } catch { }
                 [string]$n
             })
-            $label = if (@($batch).Count -gt 1) { "$(@($batch).Count)장 묶음" } else { $names[0] }
-            if ($batches.Count -gt 1) {
-                Set-SendProgress $Room '파일 첨부 중' "$($batchNo)/$($batches.Count) — $label"
-            }
+            $count = @($batch).Count
+            $label = if ($count -gt 1) { "$($count)장 묶음" } else { $names[0] }
+            $mark = "$($batchNo)/$($batches.Count)"
+            Set-SendProgress $Room '파일 첨부 중' "묶음 $mark — $label"
+            Write-StepLog $Room "첨부 묶음 $mark 붙여넣기 ($label)"
             $outcome = $null
             try { $outcome = Send-ChatAttachments $chat $inputBox $batch $waitMs $true } catch { $outcome = $null }
             if ($null -eq $outcome) {
-                $problems += "ATTACH_FAILED '$label' 을(를) 보내지 못했습니다."
-                Write-RunLog "첨부 실패: '$label' — 알 수 없는 문제가 생겨 보내지 않았습니다."
+                $problems += "ATTACH_FAILED 묶음 $mark '$label' 을(를) 보내지 못했습니다."
+                Write-StepLog $Room "첨부 묶음 $mark 실패 — 알 수 없는 문제"
             } elseif ($outcome.Sent) {
                 foreach ($path in @($batch)) { $state.SentFiles[[string]$path] = $true }
-                Write-RunLog "첨부 보냄: $($names -join ', ')  [$($outcome.Method) / $($outcome.SendWay)]"
+                $images = 0
+                foreach ($path in @($batch)) { if (Test-IsImageFile ([string]$path)) { $images++ } }
+                $script:runStats.Photos += $images
+                $script:runStats.Files += ($count - $images)
+                Write-StepLog $Room "첨부 묶음 $mark 전송 성공 — $($names -join ', ')  [$($outcome.Method) / $($outcome.SendWay)]"
+                # 묶음 하나가 나갈 때마다 적어 둡니다. 중간에 꺼져도 여기까지는 남습니다.
+                Save-RunProgress $Content
             } else {
-                $problems += "ATTACH_FAILED '$label' — $($outcome.Reason)"
-                Write-RunLog "첨부 실패: '$label' — $($outcome.Reason) (보내지 않았습니다)"
+                $problems += "ATTACH_FAILED 묶음 $mark '$label' — $($outcome.Reason)"
+                Write-StepLog $Room "첨부 묶음 $mark 실패 — $($outcome.Reason)"
             }
         }
     }
+
     # ----- 2) 문구 -----
     $message = [string]$Content.Message
     if ((-not [string]::IsNullOrWhiteSpace($message)) -and (-not $state.MessageSent)) {
         Set-SendProgress $Room '메시지 전송 중' ''
+        Write-StepLog $Room '메시지 입력'
         $how = Send-ChatText $chat $inputBox $message ([int]$Content.SettleMs)
         if (-not $how) {
             $why = $script:lastSendProblem
             if (-not $why) { $why = 'SEND_FAILED 까닭을 알 수 없습니다.' }
-            Write-RunLog "실패: '$Room' — $why 입력칸을 비우고 넘어갑니다."
+            Write-StepLog $Room ('메시지 전송 실패 — ' + $why)
             Clear-ChatInput $inputBox
+            [void](Reset-ChatAfterFailure $chat $inputBox)
             if ($CloseWhenDone) { Close-ChatWindow $chat }
             $script:lastSendProblem = $why
             return $false
         }
         $state.MessageSent = $true
+        $script:runStats.Messages++
+        Write-StepLog $Room "메시지 전송 성공 ($how)"
         if ($script:sendMethodLogged -ne $how) {
             $script:sendMethodLogged = $how
             Write-RunLog "전송 방식: $how"
@@ -3156,13 +3328,20 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
 
     if ($CloseWhenDone) { Close-ChatWindow $chat }
     if ($problems.Count -gt 0) {
-        $script:lastSendProblem = ($problems -join ' / ')
-        Write-RunLog "실패: '$Room' — 첨부를 다 보내지 못했습니다. $($script:lastSendProblem)"
+        # 문구는 갔는데 파일만 못 갔다면 그렇게 적어 둡니다.
+        # 아무것도 못 간 것과 구별돼야 어디를 다시 해야 할지 압니다.
+        $head = if ($state.MessageSent -and @($state.SentFiles.Keys).Count -gt 0) { '일부 파일 전송 실패' }
+                elseif ($state.MessageSent) { '파일 전송 실패 (문구는 보냄)' }
+                else { '전송 실패' }
+        $script:lastSendProblem = $head + ' — ' + ($problems -join ' / ')
+        Write-StepLog $Room $script:lastSendProblem
         return $false
     }
-    Write-RunLog "발송 완료: '$Room'"
+    Write-StepLog $Room '발송 완료'
     return $true
 }
+# 채팅창을 앞으로 가져오고 입력칸에 포커스를 줍니다.
+
 # 채팅창을 앞으로 가져오고 입력칸에 포커스를 줍니다.
 # 카카오톡은 창 메시지로 넣은 글자를 '사용자 입력'으로 인정하지 않아
 # 전송 버튼이 회색으로 남습니다. 그래서 전송할 때만 실제 키보드 입력을 씁니다.
@@ -3517,27 +3696,47 @@ function Close-KakaoPreview([object]$Preview) {
 # 미리보기 창의 [전송] 을 누릅니다. 창 아래 가운데에 넓게 있는 단추입니다.
 # 한 가지 방법만 쓰면 컴퓨터에 따라 안 눌립니다.
 # 창 메시지 클릭 → 실제 마우스 클릭 → Enter 순서로 해 보고, 창이 닫히면 성공입니다.
+# 미리보기 창의 [전송] 을 누릅니다.
+# 전송 단추는 창 아래쪽에 있는데, 그 자리는 화면 배율에 따라 달라집니다.
+# 100% 에서 아래로 24픽셀인 자리가 150% 에서는 36픽셀입니다.
+# 그래서 이 창이 놓인 화면의 배율을 물어 그만큼 늘려 잡고, 몇 군데를 차례로 눌러 봅니다.
+# 좌표를 못 맞혀도 Enter 가 남아 있습니다.
 function Submit-KakaoPreview([object]$Preview, [int]$TimeoutMs) {
     $window = [NativeKakao]::GetWindow($Preview.Handle)
     if ($null -eq $window -or $window.Width -le 0) { return '미리보기 창이 사라짐' }
-    $x = $window.Rect.Left + [int]($window.Width / 2)
-    $y = $window.Rect.Bottom - 24
-    $each = [Math]::Max(1200, [int]($TimeoutMs / 3))
+    $scale = 1.0
+    try { $scale = [double]([NativeKakao]::WindowDpi($window.Handle)) / 96.0 } catch { $scale = 1.0 }
+    if ($scale -lt 0.5 -or $scale -gt 5.0) { $scale = 1.0 }
+    $midX = $window.Rect.Left + [int]($window.Width / 2)
+    $rightX = $window.Rect.Right - [int](60 * $scale)
+    # 아래에서 얼마나 떨어진 자리를 누를지, 배율만큼 늘려 잡습니다.
+    $spots = @()
+    foreach ($up in @(24, 34, 18, 46)) {
+        $spots += ,@($midX, ($window.Rect.Bottom - [int]($up * $scale)))
+    }
+    $spots += ,@($rightX, ($window.Rect.Bottom - [int](24 * $scale)))
+    $each = [Math]::Max(1200, [int]($TimeoutMs / ($spots.Count + 2)))
     $lastReason = '전송을 눌렀지만 미리보기 창이 닫히지 않음'
 
-    $ways = @(
-        [pscustomobject]@{ Name = '창 메시지 클릭'; Act = {
-            [NativeKakao]::ClickControl($window.Handle, $x, $y, $false) } },
-        [pscustomobject]@{ Name = '실제 마우스 클릭'; Act = {
-            if ([NativeKakao]::ForceForeground($window.Handle)) {
-                Start-Sleep -Milliseconds 250
-                if ([NativeKakao]::GetForegroundWindow() -eq $window.Handle) { Invoke-PointClick $x $y $false }
-            } } },
-        [pscustomobject]@{ Name = 'Enter'; Act = {
-            [NativeKakao]::PressKey($window.Handle, 0x0D) } }
-    )
+    $ways = @()
+    foreach ($spot in $spots) {
+        $sx = $spot[0]; $sy = $spot[1]
+        $ways += [pscustomobject]@{ Name = "창 메시지 클릭 ($sx,$sy)"; Act = ([scriptblock]::Create(
+            "[NativeKakao]::ClickControl([IntPtr]$($window.Handle), $sx, $sy, `$false)")) }
+    }
+    $ways += [pscustomobject]@{ Name = 'Enter'; Act = {
+        [NativeKakao]::PressKey($window.Handle, 0x0D) } }
+    $ways += [pscustomobject]@{ Name = '실제 마우스 클릭'; Act = {
+        if ([NativeKakao]::ForceForeground($window.Handle)) {
+            Start-Sleep -Milliseconds 250
+            if ([NativeKakao]::GetForegroundWindow() -eq $window.Handle) {
+                Invoke-PointClick ($window.Rect.Left + [int]($window.Width / 2)) ($window.Rect.Bottom - [int](24 * $scale)) $false
+            }
+        } } }
+
     foreach ($way in $ways) {
         try { & $way.Act } catch { $lastReason = $way.Name + ' 도중 문제: ' + $_.Exception.Message; continue }
+        # 눌렀으면 창이 닫히기를 기다립니다. 시간만 재고 넘어가지 않습니다.
         $deadline = (Get-Date).AddMilliseconds($each)
         while ((Get-Date) -lt $deadline) {
             $still = [NativeKakao]::GetWindow($Preview.Handle)
@@ -3548,8 +3747,6 @@ function Submit-KakaoPreview([object]$Preview, [int]$TimeoutMs) {
     }
     return $lastReason
 }
-
-# 입력칸 아래 아이콘 줄의 위치입니다. (창 안에서의 좌표)
 function Get-ChatToolbarBand([object]$Chat, [object]$InputBox) {
     if ($null -eq $Chat -or $null -eq $InputBox) { return $null }
     $top = $InputBox.Rect.Bottom - $Chat.Rect.Top
@@ -3733,12 +3930,27 @@ function Add-AttachmentByClipboard([object]$Chat, [object]$InputBox, [string[]]$
     foreach ($method in $methods) {
         $ready = $false
         try {
-            if ($method -eq 'image') { $ready = Set-ClipboardImageSafe $list[0] }
-            else { Set-ClipboardFilesSafe $list; $ready = $true }
-        } catch { $ready = $false }
-        if (-not $ready) { $lastReason = '클립보드에 넣지 못함'; continue }
+            if ($method -eq 'image') {
+                $ready = Set-ClipboardImageSafe $list[0]
+                if (-not $ready) { $lastReason = '클립보드에 그림을 넣지 못함' }
+            } else {
+                # 넣은 뒤 그 파일이 그대로 있는지 다시 봅니다.
+                # 다른 프로그램이 클립보드를 바꿔치기하면 엉뚱한 것이 붙습니다.
+                # 앞 채팅방에 쓰던 사진이 다음 방에 붙는 일도 이 확인으로 막습니다.
+                for ($check = 0; $check -lt 5; $check++) {
+                    Set-ClipboardFilesSafe $list
+                    Start-Sleep -Milliseconds 120
+                    if (Test-ClipboardHasFiles $list) { $ready = $true; break }
+                }
+                if (-not $ready) { $lastReason = '클립보드에 넣은 파일이 그대로 있지 않음' }
+            }
+        } catch { $ready = $false; $lastReason = '클립보드에 넣지 못함' }
+        if (-not $ready) { continue }
+
         $before = Get-VisibleWindowHandles
         if (-not (Enter-ChatForeground $Chat $InputBox)) { return (New-AttachStage '채팅창을 앞으로 가져오지 못함' $null) }
+        # 붙여넣기 직전에 카카오톡이 살아 있는지 봅니다. 먹통이면 돌아오기를 기다립니다.
+        if (-not (Wait-KakaoResponsive $Chat 20000)) { return (New-AttachStage '카카오톡이 응답하지 않음' $null) }
         [NativeKakao]::PressCtrlKey(0x56)
         # 사진은 미리보기 창이 뜹니다. 파일은 채팅창에 바로 붙기도 합니다.
         # 여러 장이면 미리보기가 뜨기까지 조금 더 걸립니다.
@@ -3746,6 +3958,7 @@ function Add-AttachmentByClipboard([object]$Chat, [object]$InputBox, [string[]]$
         $preview = Wait-KakaoPreviewWindow $before ([Math]::Max(2500, $WaitMs + 1200 + $extra))
         if ($null -ne $preview) { return (New-AttachStage '' $preview) }
         if ((Test-ChatSendReady $Chat $InputBox) -eq 'yes') { return (New-AttachStage '' $null) }
+        $lastReason = '붙여넣었지만 미리보기도 전송 버튼도 확인되지 않음'
     }
     return (New-AttachStage $lastReason $null)
 }
@@ -3846,10 +4059,21 @@ function Group-AttachmentBatches([string[]]$Paths, [bool]$GroupPhotos, [int]$Bat
 }
 
 # 묶음 하나를 붙여서 보냅니다. 한 장이든 열 장이든 같은 길을 씁니다.
+# 성공이라고 말하기 전에 대화창에 정말 올라왔는지 확인합니다.
+# 미리보기 창이 닫힌 것만으로는 보냈다고 할 수 없습니다. 취소를 눌러도 창은 닫힙니다.
 function Send-ChatAttachments([object]$Chat, [object]$InputBox, [string[]]$Paths, [int]$WaitMs, [bool]$SendIt = $true) {
     $list = @(@($Paths) | ForEach-Object { [string]$_ } | Where-Object { $_ })
     $result = [pscustomobject]@{ Ok = $false; Sent = $false; Method = ''; SendWay = ''; Reason = ''; Count = $list.Count }
     if ($list.Count -eq 0) { $result.Reason = '보낼 파일이 없습니다'; return $result }
+
+    # 붙이기 전에 파일이 쓸 수 있는 상태인지 다시 봅니다.
+    # 목록에 넣은 뒤 지워졌거나 다른 프로그램이 붙잡고 있을 수 있습니다.
+    $check = Test-AttachmentList $list
+    if (@($check.Bad).Count -gt 0) {
+        $result.Reason = 'ATTACH_FILE_BAD ' + (@($check.Bad) -join ' / ')
+        return $result
+    }
+
     $reasons = @()
     # 사진은 클립보드가 확실하고, 문서는 파일 선택창이 확실합니다.
     $allImages = $true
@@ -3862,12 +4086,22 @@ function Send-ChatAttachments([object]$Chat, [object]$InputBox, [string[]]$Paths
         $ways += [pscustomobject]@{ Name = '파일 선택창'; Act = { Add-AttachmentByDialog $Chat $InputBox $list $WaitMs } }
         $ways += [pscustomobject]@{ Name = '붙여넣기'; Act = { Add-AttachmentByClipboard $Chat $InputBox $list $WaitMs } }
     }
+
+    # 보내기 전 대화창 모습을 적어 둡니다. 보낸 뒤 이 모습이 바뀌어야 진짜로 간 것입니다.
+    $before = ''
+    try { $before = Get-ChatTailSignature (Get-ChatListControl $Chat) } catch { $before = '' }
+
     $preview = $null
     foreach ($way in $ways) {
         $stage = $null
         try { $stage = & $way.Act } catch { $stage = New-AttachStage $_.Exception.Message $null }
         if ($null -eq $stage) { $reasons += ($way.Name + ': 알 수 없는 문제'); continue }
-        if ($stage.Problem) { $reasons += ($way.Name + ': ' + $stage.Problem); continue }
+        if ($stage.Problem) {
+            $reasons += ($way.Name + ': ' + $stage.Problem)
+            # 다음 방법을 해 보기 전에 화면을 원래대로 되돌립니다.
+            [void](Reset-ChatAfterFailure $Chat $InputBox)
+            continue
+        }
         $preview = $stage.Preview
         $result.Ok = $true
         if ($null -ne $preview) { $result.Method = $way.Name + ' (미리보기 창 확인)' }
@@ -3886,29 +4120,42 @@ function Send-ChatAttachments([object]$Chat, [object]$InputBox, [string[]]$Paths
 
     # 여러 장이면 미리보기에서 보내는 데 시간이 더 걸립니다.
     $extra = [Math]::Min(8000, 600 * $list.Count)
+    $landWait = [Math]::Max(4000, $WaitMs + 2000 + $extra)
     if ($null -ne $preview) {
         $problem = Submit-KakaoPreview $preview ([Math]::Max(4000, $WaitMs + 2500 + $extra))
         if ($problem) {
             $result.Reason = $problem
             [void](Close-KakaoPreview $preview)
-        } else {
-            $result.Sent = $true
-            $result.SendWay = '미리보기 창의 전송 누름'
+            [void](Reset-ChatAfterFailure $Chat $InputBox)
+            return $result
         }
+        # 미리보기는 닫혔습니다. 이제 대화창에 정말 올라왔는지 봅니다.
+        if (-not (Test-AttachmentLanded $Chat $before $landWait)) {
+            $result.Reason = 'ATTACH_NOT_LANDED — 미리보기는 닫혔지만 대화창에 올라온 것을 확인하지 못했습니다'
+            [void](Reset-ChatAfterFailure $Chat $InputBox)
+            return $result
+        }
+        $result.Sent = $true
+        $result.SendWay = '미리보기 창의 전송 누름'
         return $result
     }
 
     $how = Invoke-ChatSendAttachment $Chat $InputBox ($WaitMs + $extra)
-    if ($how) {
-        $result.Sent = $true
-        $result.SendWay = $how
-    } else {
+    if (-not $how) {
         $result.Reason = '붙이기는 됐지만 전송이 확인되지 않아 치웠습니다'
         [void](Clear-ChatAttachmentDraft $Chat $InputBox)
+        [void](Reset-ChatAfterFailure $Chat $InputBox)
+        return $result
     }
+    if (-not (Test-AttachmentLanded $Chat $before $landWait)) {
+        $result.Reason = 'ATTACH_NOT_LANDED — 전송은 눌렀지만 대화창에 올라온 것을 확인하지 못했습니다'
+        [void](Reset-ChatAfterFailure $Chat $InputBox)
+        return $result
+    }
+    $result.Sent = $true
+    $result.SendWay = $how
     return $result
 }
-
 # 한 개만 보낼 때 쓰는 짧은 이름입니다. (첨부 시험 등)
 function Send-ChatAttachment([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs, [bool]$SendIt = $true) {
     return (Send-ChatAttachments $Chat $InputBox @($Path) $WaitMs $SendIt)
@@ -4112,6 +4359,127 @@ function Test-RowLooksLike([object]$Row, [string]$Name, [string]$ListText) {
     return $false
 }
 
+# ---------------------------------------------------------------------------
+# 발송 진행 상태를 파일에 적어 둡니다
+# ---------------------------------------------------------------------------
+# 발송 도중 프로그램이 꺼지거나 PC 가 재부팅될 수 있습니다.
+# 그때 어디까지 갔는지 모르면 처음부터 다시 보내게 되고, 받은 사람은 두 번 받습니다.
+# 그래서 한 방이 끝날 때마다, 그리고 사진 묶음 하나가 나갈 때마다 적어 둡니다.
+#
+# 적어 두는 것:
+#   방마다  상태 · 까닭 · 문구를 보냈는지 · 어느 파일까지 보냈는지
+# 다시 켰을 때 이 파일을 보고 [이어서 발송] 을 드립니다.
+$script:ProgressPath = Join-Path $AppDir 'progress.json'
+$script:runStats = @{ Photos = 0; Files = 0; Messages = 0 }
+$script:lastRunResult = $null
+
+function Get-MessageFingerprint([string]$Text) {
+    # 문구가 바뀌었는데 이어서 보내면 앞뒤가 다른 글이 나갑니다. 그래서 표시를 남깁니다.
+    $body = [string]$Text
+    if (-not $body) { return '' }
+    try {
+        $sha = [System.Security.Cryptography.SHA1]::Create()
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $hash = $sha.ComputeHash($bytes)
+        $sha.Dispose()
+        return ([BitConverter]::ToString($hash) -replace '-', '').Substring(0, 16)
+    } catch { return ([string]$body.Length) }
+}
+
+function Save-RunProgress([object]$Content) {
+    try {
+        $rooms = @()
+        foreach ($name in $script:progressOrder) {
+            $row = $script:progressRows[$name]
+            $state = $null
+            if ($script:deliveryState.ContainsKey($name)) { $state = $script:deliveryState[$name] }
+            $sentFiles = @()
+            if ($null -ne $state) { $sentFiles = @($state.SentFiles.Keys) }
+            $rooms += [pscustomobject]@{
+                Name = $name
+                Status = [string]$row.Status
+                Note = [string]$row.Note
+                MessageSent = $(if ($null -ne $state) { [bool]$state.MessageSent } else { $false })
+                SentFiles = @($sentFiles)
+            }
+        }
+        $data = [pscustomobject]@{
+            Version = 1
+            StartedAt = [string]$script:runStartedAt
+            UpdatedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            DryRun = [bool]$Content.DryRun
+            MessageMark = (Get-MessageFingerprint ([string]$Content.Message))
+            Attachments = @($Content.Attachments)
+            Stats = [pscustomobject]@{
+                Photos = [int]$script:runStats.Photos
+                Files = [int]$script:runStats.Files
+                Messages = [int]$script:runStats.Messages
+            }
+            Total = $script:progressOrder.Count
+            Rooms = @($rooms)
+        }
+        $json = $data | ConvertTo-Json -Depth 6
+        $temp = "$($script:ProgressPath).tmp"
+        Set-Content -LiteralPath $temp -Value $json -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $temp -Destination $script:ProgressPath -Force -ErrorAction Stop
+    } catch { }
+}
+
+function Import-RunProgress {
+    if (-not (Test-Path -LiteralPath $script:ProgressPath)) { return $null }
+    try { return (Get-Content -LiteralPath $script:ProgressPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    catch { return $null }
+}
+
+function Clear-RunProgress {
+    try { if (Test-Path -LiteralPath $script:ProgressPath) { Remove-Item -LiteralPath $script:ProgressPath -Force } } catch { }
+}
+
+# 이어서 할 것이 남아 있는지 봅니다.
+# 아직 완료도 실패도 아닌 방이 있거나, 실패한 방이 있으면 이어서 할 수 있습니다.
+function Get-ResumableRooms([object]$Saved) {
+    if ($null -eq $Saved) { return @() }
+    $left = @()
+    foreach ($room in @($Saved.Rooms)) {
+        if ($null -eq $room) { continue }
+        if ([string]$room.Status -eq '발송 완료') { continue }
+        $name = ConvertTo-ExactKey ([string]$room.Name)
+        if ($name) { $left += $name }
+    }
+    return @($left)
+}
+
+# 저장해 둔 상태를 지금 실행에 다시 얹습니다.
+# 이미 보낸 문구와 파일은 다시 보내지 않도록 그대로 살립니다.
+function Restore-RunProgress([object]$Saved) {
+    if ($null -eq $Saved) { return }
+    Reset-DeliveryState
+    $script:progressRows = @{}
+    $script:progressOrder = New-Object System.Collections.Generic.List[string]
+    foreach ($room in @($Saved.Rooms)) {
+        if ($null -eq $room) { continue }
+        $name = ConvertTo-ExactKey ([string]$room.Name)
+        if (-not $name) { continue }
+        if (-not $script:progressRows.ContainsKey($name)) {
+            $script:progressRows[$name] = [pscustomobject]@{ Status = [string]$room.Status; Note = [string]$room.Note }
+            [void]$script:progressOrder.Add($name)
+        }
+        $state = [pscustomobject]@{ MessageSent = [bool]$room.MessageSent; SentFiles = @{} }
+        foreach ($file in @($room.SentFiles)) { $state.SentFiles[[string]$file] = $true }
+        $script:deliveryState[$name] = $state
+    }
+    try {
+        $script:runStats.Photos = [int]$Saved.Stats.Photos
+        $script:runStats.Files = [int]$Saved.Stats.Files
+        $script:runStats.Messages = [int]$Saved.Stats.Messages
+    } catch { }
+    Update-ProgressView
+}
+
+# 방 이름 앞에 붙여 기록을 남깁니다. 나중에 어디서 막혔는지 이 줄만 보고 알 수 있어야 합니다.
+function Write-StepLog([string]$Room, [string]$Text) {
+    Write-RunLog ("[{0}] {1}" -f $Room, $Text)
+}
 # 발송 결과를 표로 남깁니다. 시간 / 채팅방 / 문구 / 첨부 / 결과 / 사유
 function Add-SendLogRow([string]$Room, [object]$Content, [bool]$Ok, [string]$Reason) {
     try {
@@ -4253,7 +4621,8 @@ function Invoke-ListPass([object]$Pending, [object]$Content, [int]$MaxPages,
                 $Reasons[$openedKey] = $why
                 Set-SendProgress $openedName '재시도' $why
             }
-
+            # 한 방이 끝날 때마다 적어 둡니다. 중간에 꺼져도 여기까지는 남습니다.
+            Save-RunProgress $Content
             # 방 사이 간격
             if ($Pending.Count -gt 0) {
                 if ($BatchSize -gt 0 -and $BatchRestMinutes -gt 0 -and $sent -gt 0 -and ($sent % $BatchSize) -eq 0) {
@@ -4332,7 +4701,8 @@ function Invoke-OpenWindowPass([object]$Pending, [object]$Content, [int]$Interva
             $Reasons[$name] = $why
             Set-SendProgress $name '재시도' $why
         }
-
+        # 한 방이 끝날 때마다 적어 둡니다. 중간에 꺼져도 여기까지는 남습니다.
+        Save-RunProgress $Content
         if ($Pending.Count -gt 0) {
             if ($BatchSize -gt 0 -and $BatchRestMinutes -gt 0 -and $sent -gt 0 -and ($sent % $BatchSize) -eq 0) {
                 Write-RunLog "묶음 $($BatchSize)개를 처리했습니다. $($BatchRestMinutes)분 쉽니다."
@@ -4771,18 +5141,41 @@ function Get-TabLabelForType([string]$Type) {
 # PC 카카오톡의 [채팅] 목록에는 일반 채팅방과 오픈채팅방이 함께 들어 있습니다.
 # 그래서 종류로 나누지 않고 한 목록을 훑습니다. 보낼 때도 종류를 가리지 않습니다.
 # 시작한 뒤에는 사용자가 다시 누를 것이 없습니다. 끝까지 알아서 갑니다.
-function Invoke-Broadcast {
-    $rooms = @($script:config.Rooms | ForEach-Object { ConvertTo-ExactKey ([string]$_) } | Where-Object { $_ } | Select-Object -Unique)
+#
+# Targets 를 주면 그 방들만 보냅니다. (실패한 방만 다시 보내기 · 이어서 발송)
+# Resume 이 참이면 저장해 둔 진행 상태를 그대로 이어받습니다.
+function Invoke-Broadcast([string[]]$Targets = $null, [bool]$Resume = $false) {
+    $rooms = @()
+    if ($null -ne $Targets -and @($Targets).Count -gt 0) {
+        $rooms = @(@($Targets) | ForEach-Object { ConvertTo-ExactKey ([string]$_) } | Where-Object { $_ } | Select-Object -Unique)
+    } else {
+        $rooms = @($script:config.Rooms | ForEach-Object { ConvertTo-ExactKey ([string]$_) } | Where-Object { $_ } | Select-Object -Unique)
+    }
     if ($rooms.Count -eq 0) { throw '보낼 채팅방을 한 개 이상 골라 주세요.' }
     if ($rooms.Count -gt 500) { throw '안전을 위해 한 번에 최대 500개 방까지만 처리합니다.' }
     $dryRun = [bool]$script:config.DryRun
+
+    $content = New-SendContent $dryRun
+    # 첨부 파일을 미리 훑어 봅니다. 발송 도중에 없는 파일을 만나면 거기서 막힙니다.
     if (-not $dryRun) {
-        foreach ($attachment in @($script:config.Attachments)) {
-            if (-not (Test-Path -LiteralPath ([string]$attachment) -PathType Leaf)) { throw "첨부 파일을 찾을 수 없습니다: $attachment" }
+        $check = Test-AttachmentList @($content.Attachments)
+        if (@($check.Bad).Count -gt 0) {
+            foreach ($why in @($check.Bad)) { Write-RunLog "첨부 확인: $why" }
+            $ask = "첨부 파일 $(@($check.Bad).Count)개에 문제가 있습니다." + "`r`n`r`n" +
+                   ((@($check.Bad) | Select-Object -First 8) -join "`r`n")
+            if (@($check.Bad).Count -gt 8) { $ask += "`r`n… 외 $((@($check.Bad).Count) - 8)개" }
+            if (@($check.Good).Count -eq 0 -and [string]::IsNullOrWhiteSpace([string]$content.Message)) {
+                throw ($ask + "`r`n`r`n보낼 것이 하나도 남지 않아 시작하지 않았습니다.")
+            }
+            $ask += "`r`n`r`n[예] 문제 있는 파일만 빼고 보냅니다." + "`r`n" + "[아니오] 시작하지 않습니다."
+            if ([System.Windows.Forms.MessageBox]::Show($ask, '첨부 파일 확인', 'YesNo', 'Warning') -ne 'Yes') {
+                throw '첨부 파일에 문제가 있어 시작하지 않았습니다.'
+            }
+            $content.Attachments = @($check.Good)
+            Write-RunLog "문제 있는 첨부 $(@($check.Bad).Count)개를 빼고 $(@($check.Good).Count)개만 보냅니다."
         }
     }
 
-    $content = New-SendContent $dryRun
     $mode = if ($dryRun) { '확인 전용' } else { '실제 발송' }
     $interval = Get-EffectiveInterval (Get-Date)
     $retry = [Math]::Max(0, [Math]::Min(5, [int]$script:config.RetryCount))
@@ -4793,9 +5186,11 @@ function Invoke-Broadcast {
     if ($batchSize -gt 0 -and $batchRest -gt 0) {
         Write-RunLog "묶음 발송: $($batchSize)개마다 $($batchRest)분 쉽니다."
     }
+    Write-RunLog '─────────────────────────────'
     Write-RunLog ("작업 시작: 방 {0}개 / 모드={1} / 간격 {2}초 / 재시도 {3}회" -f $rooms.Count, $mode, $interval, $retry)
     if (-not $dryRun) {
-        Write-RunLog ("보낼 문구 {0}자 / 첨부 {1}개" -f ([string]$script:config.Message).Length, @($script:config.Attachments).Count)
+        $groupText = if ([bool]$content.GroupPhotos) { "$([int]$content.PhotoBatchSize)장씩" } else { '쓰지 않음' }
+        Write-RunLog ("보낼 문구 {0}자 / 첨부 {1}개 / 사진 묶음 {2}" -f ([string]$content.Message).Length, @($content.Attachments).Count, $groupText)
     }
 
     # 고른 방이 모두 창으로 열려 있는지 봅니다.
@@ -4810,17 +5205,6 @@ function Invoke-Broadcast {
         Write-RunLog "창으로 열려 있는 방 $($rooms.Count - $notOpen.Count)개 / 목록에서 찾아야 할 방 $($notOpen.Count)개"
     }
 
-    # 저장된 목록에 없는 방이 섞여 있으면 미리 알려 드립니다.
-    $unknown = @()
-    foreach ($room in $rooms) {
-        if ($openNames.ContainsKey($room)) { continue }
-        if ($null -eq (Find-RosterEntry $room)) { $unknown += $room }
-    }
-    if ($unknown.Count -gt 0) {
-        Write-RunLog "저장된 목록에도 없고 창으로도 열려 있지 않은 방 $($unknown.Count)개: $(($unknown | Select-Object -First 5) -join ', ')"
-        Write-RunLog '  그 방들을 카카오톡에서 창으로 열어 두시면 확실합니다.'
-    }
-
     # 목록에서 찾아야 할 방이 있을 때만 카카오톡 메인 창이 필요합니다.
     $mainWindow = $null
     $ready = $null
@@ -4833,44 +5217,72 @@ function Invoke-Broadcast {
     }
 
     # 방마다 어디까지 갔는지 보여 줄 표를 채웁니다. 고른 방이 모두 여기 들어갑니다.
-    Reset-SendProgress $rooms
-    Reset-DeliveryState
+    if ($Resume) {
+        Write-RunLog '이어서 발송입니다. 이미 보낸 방과 파일은 건너뜁니다.'
+    } else {
+        Reset-SendProgress $rooms
+        Reset-DeliveryState
+        $script:runStats = @{ Photos = 0; Files = 0; Messages = 0 }
+        $script:runStartedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    }
     $script:trackDelivery = $true
+    Save-RunProgress $content
 
     # 어떤 환경인지 남겨 둡니다. PC 마다 결과가 다를 때 짚어 보기 위해서입니다.
     Write-EnvironmentLog $mainWindow
-    # 글을 붙여넣으려면 클립보드를 써야 합니다.
+
+    # 글과 사진을 붙여넣으려면 클립보드를 써야 합니다.
     # 사용자가 복사해 두었던 것이 날아가지 않도록 챙겨 두었다가 끝나면 되돌립니다.
     $script:savedClipboard = $null
+    $script:savedClipboardFiles = $null
     try { $script:savedClipboard = [string][System.Windows.Forms.Clipboard]::GetText() } catch { }
+    try { $script:savedClipboardFiles = @([System.Windows.Forms.Clipboard]::GetFileDropList()) } catch { }
 
     $result = $null
     try {
         $result = Invoke-RosterSend $rooms $content ([int]$script:config.ScanPages) $interval $batchSize $batchRest $retry
     } finally {
         $script:trackDelivery = $false
-        if ($null -ne $script:savedClipboard -and $script:savedClipboard -ne '') {
-            try {
-                if (-not (Test-ClipboardHasText $script:savedClipboard)) {
-                    [System.Windows.Forms.Clipboard]::SetText($script:savedClipboard)
-                }
-            } catch { }
-        }
+        Restore-SavedClipboard
     }
 
     if ($null -eq $result) { return 0 }
+    Save-RunProgress $content
+
+    # 실패한 방을 따로 모아 둡니다. [실패한 방만 다시 보내기] 에 씁니다.
+    $failedRooms = @()
+    foreach ($name in $script:progressOrder) {
+        if ([string]$script:progressRows[$name].Status -eq '실패') { $failedRooms += [string]$name }
+    }
     $handled = $result.Sent + $result.Failed
+    $script:lastRunResult = [pscustomobject]@{
+        Total = $result.Total
+        Sent = $result.Sent
+        Failed = $result.Failed
+        Missing = ($result.Total - $handled)
+        Photos = [int]$script:runStats.Photos
+        Files = [int]$script:runStats.Files
+        Messages = [int]$script:runStats.Messages
+        FailedRooms = @($failedRooms)
+        DryRun = $dryRun
+        FinishedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    }
+
     Write-RunLog '─────────────────────────────'
-    Write-RunLog ("전체 발송 대상: {0}개" -f $result.Total)
-    Write-RunLog ("발송 성공: {0}개" -f $result.Sent)
-    Write-RunLog ("발송 실패: {0}개" -f $result.Failed)
-    Write-RunLog ("총 처리:   {0}개" -f $handled)
-    if ($handled -eq $result.Total) {
+    Write-RunLog ("전체 대상: {0}개" -f $result.Total)
+    Write-RunLog ("성공:      {0}개" -f $result.Sent)
+    Write-RunLog ("실패:      {0}개" -f $result.Failed)
+    Write-RunLog ("누락:      {0}개" -f $script:lastRunResult.Missing)
+    Write-RunLog ("발송 사진: {0}장 / 파일 {1}개 / 메시지 {2}건" -f $script:runStats.Photos, $script:runStats.Files, $script:runStats.Messages)
+    if ($script:lastRunResult.Missing -eq 0) {
         Write-RunLog '숫자가 맞습니다. 빠진 방은 없습니다.'
     } else {
         Write-RunLog "숫자가 맞지 않습니다. 고른 $($result.Total)개 중 $handled 개만 처리했습니다."
     }
-    Write-RunLog "자세한 결과는 logs 폴더의 발송기록 파일에 표로 남았습니다."
+    if ($failedRooms.Count -gt 0) {
+        Write-RunLog "실패한 방: $((@($failedRooms) | Select-Object -First 10) -join ', ')"
+    }
+    Write-RunLog '자세한 결과는 logs 폴더의 발송기록 파일에 표로 남았습니다.'
 
     if ($dryRun) {
         # 확인 전용은 아무것도 보내지 않습니다. 완료라고 하면 보낸 줄 알게 됩니다.
@@ -4881,7 +5293,31 @@ function Invoke-Broadcast {
         Add-SentDay (Get-Date)
         try { Save-Config $script:config } catch { }
     }
+    # 남김없이 끝났으면 이어서 할 것이 없습니다.
+    if ($result.Failed -eq 0 -and $script:lastRunResult.Missing -eq 0) { Clear-RunProgress }
     return $result.Sent
+}
+
+# 챙겨 두었던 클립보드를 되돌립니다. 글이든 파일이든 원래대로 돌려놓습니다.
+function Restore-SavedClipboard {
+    try {
+        if ($null -ne $script:savedClipboardFiles -and @($script:savedClipboardFiles).Count -gt 0) {
+            $files = New-Object System.Collections.Specialized.StringCollection
+            foreach ($path in @($script:savedClipboardFiles)) { [void]$files.Add([string]$path) }
+            [System.Windows.Forms.Clipboard]::SetFileDropList($files)
+            return
+        }
+    } catch { }
+    try {
+        if ($null -ne $script:savedClipboard -and $script:savedClipboard -ne '') {
+            if (-not (Test-ClipboardHasText $script:savedClipboard)) {
+                [System.Windows.Forms.Clipboard]::SetText($script:savedClipboard)
+            }
+            return
+        }
+    } catch { }
+    # 원래 비어 있었다면, 우리가 넣어 둔 파일 목록을 그대로 두면 안 됩니다.
+    try { [System.Windows.Forms.Clipboard]::Clear() } catch { }
 }
 
 function Invoke-TestSend([bool]$DryRun) {
@@ -5376,6 +5812,59 @@ if ($SelfTest) {
 
 
 
+
+
+    # ----- 화면 배율 -----
+    # 모니터마다 배율이 다를 수 있습니다. 창 기준으로 물어야 정확합니다.
+    # 값을 못 얻으면 96(100%) 으로 돌려주어야 합니다. 0 이 나오면 좌표 계산이 다 틀어집니다.
+    $probeDpi = [NativeKakao]::WindowDpi([IntPtr]::Zero)
+    if ($probeDpi -lt 72 -or $probeDpi -gt 480) { throw "화면 배율 값이 이상합니다: $probeDpi" }
+    $probeDeskDpi = [NativeKakao]::WindowDpi([NativeKakao]::GetForegroundWindow())
+    if ($probeDeskDpi -lt 72 -or $probeDeskDpi -gt 480) { throw "창 배율 값이 이상합니다: $probeDeskDpi" }
+    # 미리보기 전송 자리 계산이 배율만큼 늘어나는지 봅니다.
+    foreach ($probePair in @(@(96, 24), @(120, 30), @(144, 36))) {
+        $probeScale = [double]$probePair[0] / 96.0
+        $probeUp = [int](24 * $probeScale)
+        if ($probeUp -ne $probePair[1]) { throw "배율 $($probePair[0]) 에서 누를 자리가 $probeUp 입니다 ($($probePair[1]) 이어야 합니다)" }
+    }
+    # ----- 첨부 파일 미리 검사 -----
+    # 없는 파일이나 빈 파일을 발송 도중에 만나면 거기서 막힙니다. 미리 걸러야 합니다.
+    $probeDir = Join-Path ([System.IO.Path]::GetTempPath()) ('kakao-check-' + [System.Diagnostics.Process]::GetCurrentProcess().Id)
+    New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+    try {
+        $probeGood = Join-Path $probeDir '사진.jpg'
+        [System.IO.File]::WriteAllBytes($probeGood, [byte[]](0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4))
+        $probeEmpty = Join-Path $probeDir '빈파일.jpg'
+        [System.IO.File]::WriteAllBytes($probeEmpty, (New-Object byte[] 0))
+        $probeGone = Join-Path $probeDir '없는파일.jpg'
+
+        if (-not (Test-AttachmentFile $probeGood).Ok) { throw '멀쩡한 파일을 문제 있다고 합니다' }
+        $probeMissing = Test-AttachmentFile $probeGone
+        if ($probeMissing.Ok) { throw '없는 파일을 괜찮다고 합니다' }
+        if ($probeMissing.Reason -notmatch '찾을 수 없습니다') { throw "없는 파일 까닭이 이상합니다: $($probeMissing.Reason)" }
+        if ($probeMissing.Reason -notmatch '없는파일\.jpg') { throw '까닭에 파일 이름이 없습니다' }
+        $probeZero = Test-AttachmentFile $probeEmpty
+        if ($probeZero.Ok) { throw '빈 파일을 괜찮다고 합니다' }
+        if ($probeZero.Reason -notmatch '비어 있습니다') { throw "빈 파일 까닭이 이상합니다: $($probeZero.Reason)" }
+        if ((Test-AttachmentFile '').Ok) { throw '빈 경로를 괜찮다고 합니다' }
+
+        # 목록으로 보면 좋은 것과 나쁜 것이 갈라져야 합니다.
+        $probeSplit = Test-AttachmentList @($probeGood, $probeGone, $probeEmpty)
+        if (@($probeSplit.Good).Count -ne 1) { throw "쓸 수 있는 파일이 1개가 아닙니다: $(@($probeSplit.Good).Count)" }
+        if (@($probeSplit.Bad).Count -ne 2) { throw "문제 있는 파일이 2개가 아닙니다: $(@($probeSplit.Bad).Count)" }
+
+        # 다른 프로그램이 붙잡고 있으면 못 연다고 해야 합니다.
+        $probeLocked = Join-Path $probeDir '잠긴파일.jpg'
+        [System.IO.File]::WriteAllBytes($probeLocked, [byte[]](1, 2, 3, 4))
+        $probeHold = [System.IO.File]::Open($probeLocked, 'Open', 'Read', 'None')
+        try {
+            $probeBusy = Test-AttachmentFile $probeLocked
+            if ($probeBusy.Ok) { throw '다른 프로그램이 잡고 있는 파일을 괜찮다고 합니다' }
+        } finally { $probeHold.Dispose() }
+        if (-not (Test-AttachmentFile $probeLocked).Ok) { throw '놓아 준 파일을 여전히 문제라고 합니다' }
+    } finally {
+        try { Remove-Item -LiteralPath $probeDir -Recurse -Force } catch { }
+    }
     # ----- 사진 묶어 보내기 -----
     # 사진은 여러 장을 한 번에 보내야 잘 갑니다.
     # 문서는 카카오톡이 하나씩만 보내므로 따로 나가야 합니다.
@@ -5442,6 +5931,107 @@ if ($SelfTest) {
         if (@(Get-Templates).Count -ne 1) { throw '지운 뒤 개수가 맞지 않습니다' }
     } finally {
         Set-ConfigValue 'Templates' @($savedTemplates)
+    }
+
+    # ----- 이어서 발송 · 같은 사진을 두 번 보내지 않기 -----
+    # 사진 4장을 2장씩 묶어 보내다가 두 번째 묶음에서 실패하는 상황을 만듭니다.
+    # 그다음 이어서 발송을 하면 실패한 묶음만 나가야 합니다.
+    # 이미 나간 첫 번째 묶음이 또 나가면 받는 사람이 같은 사진을 두 번 받습니다.
+    & {
+    $script:pileAttempts = @()
+    $script:pileRoom = ''
+    $script:pileFail = @{ '나방|2' = 1 }
+
+    function Wait-ChatWindowReady([object]$Chat, [string]$Room, [int]$TimeoutMs = 8000) {
+        return [pscustomobject]@{ Window = $Chat; InputBox = ([pscustomobject]@{ Handle = [IntPtr]7 }) }
+    }
+    function Wait-KakaoResponsive([object]$Window, [int]$TimeoutMs = 20000) { return $true }
+    function Test-AttachmentFile([string]$Path) { return [pscustomobject]@{ Ok = $true; Reason = '' } }
+    function Close-ChatWindow([object]$Window) { }
+    function Clear-ChatInput([object]$InputBox) { }
+    function Reset-ChatAfterFailure([object]$Chat, [object]$InputBox) { return $true }
+    function Write-RunLog([string]$Text) { }
+    function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]$SettleMs = 4000) { return '모의' }
+    function Send-ChatAttachments([object]$Chat, [object]$InputBox, [string[]]$Paths, [int]$WaitMs, [bool]$SendIt = $true) {
+        $list = @(@($Paths) | ForEach-Object { [string]$_ })
+        $script:pileAttempts = @($script:pileAttempts) + ,@($list)
+        $script:pileBatchNo[$script:pileRoom] = [int]$script:pileBatchNo[$script:pileRoom] + 1
+        $key = $script:pileRoom + '|' + [string]$script:pileBatchNo[$script:pileRoom]
+        if ($script:pileFail.ContainsKey($key) -and $script:pileFail[$key] -gt 0) {
+            $script:pileFail[$key] = $script:pileFail[$key] - 1
+            return [pscustomobject]@{ Ok = $true; Sent = $false; Method = '모의'; SendWay = ''; Reason = 'ATTACH_NOT_LANDED — 모의 실패'; Count = $list.Count }
+        }
+        return [pscustomobject]@{ Ok = $true; Sent = $true; Method = '모의'; SendWay = '모의'; Reason = ''; Count = $list.Count }
+    }
+
+    $pileContent = [pscustomobject]@{
+        Message = '문구'; TemplateName = ''
+        Attachments = @('p1.jpg', 'p2.jpg', 'p3.jpg', 'p4.jpg')
+        GroupPhotos = $true; PhotoBatchSize = 2
+        AttachmentWaitMs = 100; OpenTimeoutMs = 100; SettleMs = 0; DryRun = $false
+    }
+    $pileChat = [pscustomobject]@{ Handle = [IntPtr]77; Title = '모의'; Visible = $true }
+    $pileSavedProgress = $null
+    if (Test-Path -LiteralPath $script:ProgressPath) { $pileSavedProgress = Get-Content -LiteralPath $script:ProgressPath -Raw -Encoding UTF8 }
+    try {
+        Clear-RunProgress
+        Reset-SendProgress @('가방', '나방')
+        Reset-DeliveryState
+        $script:trackDelivery = $true
+        $script:runStats = @{ Photos = 0; Files = 0; Messages = 0 }
+        $script:runStartedAt = '2026-01-01 00:00:00'
+        $script:pileBatchNo = @{ '가방' = 0; '나방' = 0 }
+
+        $script:pileRoom = '가방'
+        $pileOk1 = Send-ToChatWindow $pileChat '가방' $pileContent $true
+        Set-SendProgress '가방' $(if ($pileOk1) { '발송 완료' } else { '실패' }) ''
+        $script:pileRoom = '나방'
+        $pileOk2 = Send-ToChatWindow $pileChat '나방' $pileContent $true
+        Set-SendProgress '나방' $(if ($pileOk2) { '발송 완료' } else { '실패' }) '모의 실패'
+        Save-RunProgress $pileContent
+
+        if (-not $pileOk1) { throw '다 성공해야 하는 방이 실패했습니다' }
+        if ($pileOk2) { throw '묶음이 실패했는데 그 방을 완료라고 합니다' }
+        if (@($script:pileAttempts).Count -ne 4) { throw "붙인 묶음이 4번이 아닙니다: $(@($script:pileAttempts).Count)" }
+        if ($script:runStats.Photos -ne 6) { throw "보낸 사진이 6장이 아닙니다: $($script:runStats.Photos)" }
+        $pileState = $script:deliveryState['나방']
+        if (@($pileState.SentFiles.Keys).Count -ne 2) { throw "실패한 방에 보낸 파일이 2개가 아닙니다: $(@($pileState.SentFiles.Keys).Count)" }
+        if (-not $pileState.SentFiles.ContainsKey('p1.jpg')) { throw '첫 묶음이 보낸 것으로 남지 않았습니다' }
+        if ($pileState.SentFiles.ContainsKey('p3.jpg')) { throw '실패한 묶음이 보낸 것으로 남았습니다' }
+
+        # 프로그램이 꺼졌다가 다시 켜진 상황입니다. 파일에서 상태를 되살립니다.
+        Reset-DeliveryState
+        $script:progressRows = @{}
+        $script:progressOrder = New-Object System.Collections.Generic.List[string]
+        $pileSaved = Import-RunProgress
+        if ($null -eq $pileSaved) { throw '진행 상태 파일을 읽지 못했습니다' }
+        $pileLeft = @(Get-ResumableRooms $pileSaved)
+        if ($pileLeft.Count -ne 1 -or $pileLeft[0] -ne '나방') { throw "이어서 할 방이 나방 하나가 아닙니다: $($pileLeft -join ',')" }
+        Restore-RunProgress $pileSaved
+        if (@($script:deliveryState['나방'].SentFiles.Keys).Count -ne 2) { throw '되살린 뒤 보낸 파일 기록이 사라졌습니다' }
+        if (-not [bool]$script:deliveryState['나방'].MessageSent) { throw '되살린 뒤 문구를 보낸 기록이 사라졌습니다' }
+
+        # 이어서 보냅니다. 실패했던 묶음만 나가야 합니다.
+        $script:pileAttempts = @()
+        $script:pileBatchNo = @{ '나방' = 1 }
+        $script:pileRoom = '나방'
+        $pileOk3 = Send-ToChatWindow $pileChat '나방' $pileContent $true
+        if (-not $pileOk3) { throw '이어서 보냈는데도 실패했습니다' }
+        if (@($script:pileAttempts).Count -ne 1) { throw "이어서 보낼 때 묶음이 1번이 아닙니다: $(@($script:pileAttempts).Count)" }
+        $pileAgain = @($script:pileAttempts[0])
+        if ($pileAgain.Count -ne 2 -or $pileAgain[0] -ne 'p3.jpg' -or $pileAgain[1] -ne 'p4.jpg') {
+            throw "이어서 보낸 파일이 p3·p4 가 아닙니다: $($pileAgain -join ',')"
+        }
+        if ($script:runStats.Photos -ne 8) { throw "이어서 보낸 뒤 사진이 8장이 아닙니다: $($script:runStats.Photos)" }
+        if ($script:runStats.Messages -ne 2) { throw "문구가 두 번만 나가야 합니다: $($script:runStats.Messages)" }
+    } finally {
+        $script:trackDelivery = $false
+        Clear-RunProgress
+        if ($null -ne $pileSavedProgress) { Set-Content -LiteralPath $script:ProgressPath -Value $pileSavedProgress -Encoding UTF8 }
+        Reset-SendProgress @()
+        Reset-DeliveryState
+        $script:runStats = @{ Photos = 0; Files = 0; Messages = 0 }
+    }
     }
     # ----- 발송 전체 흐름 모의 시험 -----
     # 카카오톡 없이 가짜 채팅 목록을 만들어 발송 흐름을 그대로 돌려 봅니다.
@@ -6299,15 +6889,644 @@ $script:form.MinimumSize = New-Object System.Drawing.Size((S 720), (S 520))
 $script:form.MaximizeBox = $true
 $script:form.AutoScaleMode = 'None'
 $script:form.BackColor = $Theme.Bg
-# 창과 작업 표시줄에 쓸 아이콘입니다. 프로그램(.exe)에는 이미 박혀 있고,
-# 스크립트로 실행할 때는 옆에 있는 파일을 씁니다.
+# ----- 프로그램 아이콘 -----
+# 창 왼쪽 위, 작업 표시줄, Alt+Tab 이 모두 이 아이콘을 씁니다.
+# 크기가 여럿 든 아이콘이라야 배율이 높은 화면에서도 흐려지지 않습니다.
+# 여기에는 16 · 24 · 32 · 48 · 64 크기가 담겨 있습니다.
+# 옆에 app.ico 가 있으면 그것을 먼저 씁니다. 256 까지 들어 있어 더 선명합니다.
+$script:AppIconBase64 = @'
+AAABAAUAEBAAAAEAIABoBAAAVgAAABgYAAABACAAiAkAAL4EAAAgIAAAAQAgAKgQAABGDgAAMDAA
+AAEAIACoJQAA7h4AAEBAAAABACAAKEIAAJZEAAAoAAAAEAAAACAAAAABACAAAAAAAEAEAAAAAAAA
+AAAAAAAAAAAAAAAAAAQF2wKBmuwCy/HsAtH+7ALP/uwCzfzsAs387ALO/OwCzfzsAs797ALN/OwC
+zf3sAs/97ALM8uwAgZzsAAQF2wJ7l/ID6///A9f//wPI+f8B1f//Atv//wPX//8C2///Adv//wPY
+//8D1v//Ad///wLf//8D1///A+r//wB7l/ICzPnsA9f//wHa//8Ki6v/E0JR/wSw2/8Cw/T/BanU
+/wWq1f8DxPX/AtH9/w55kf8NfZf/A834/wPY//8Cy/nsAtH+7ATV//8C1f//A8Hw/xoYG/8YIif/
+Fi84/xobH/8aFhn/GCQr/xBec/8UT1//FkJO/wev1P8C2///AtH+7ALQ/ewE1f//ANf//weVvP8a
+HiP/HBYX/xoeIf8cDg3/Fiow/xNEUP8aHiH/FUxZ/xFnfP8Cz/3/A9f//wLQ/ewC0P3sAtz//wSw
+3P8bICX/Hhka/x0WF/8RX3L/DHCI/warzf8Fwev/HBYX/xsgI/8ZKzP/BqjS/wLd//8C0f3sAtH9
+7ADf//8RYXn/IBAP/x4cH/8dFRf/GDM8/wuRsf8A6///Adj//xdFUv8fFBX/IA8O/xNWaf8B3v//
+AtH97ALS/uwC1P//GTtH/yEUFf8aLjX/CpCq/wW51/8VSlf/DI6q/wDs//8OhqH/IRER/yAbHf8a
+Mjv/A879/wLV/uwC0/7sAtL//xs4Qv8iERL/GEhV/we11P8A3f//AOL//wyIov8IqMj/BMTv/x4m
+K/8hGBr/HC83/wPM/P8C1f7sAtD97AHg//8WVWf/IhQV/yEbHv8hFxr/GztE/xF3jP8HuNj/Bbnd
+/wDj//8UZXn/JAcF/xhJV/8B3f//AtL+7ALQ/ewB4f//CqLG/yMVF/8iHyP/ISIm/yIaHf8jEhT/
+IRwg/xtFUP8Qg5b/EnaN/yQIBv8Mlrb/AeL//wLQ/ewC0P3sA9b//wHd//8Rfpb/JBQV/yQZG/8i
+Iib/IiMo/yIhJv8kGRz/JgoL/yUNDf8Sc4j/Adv//wPX//8C0f3sAtH+7APW//8D0///Ad3//w2b
+t/8dQUv/IyAj/yUYGv8lGBr/JB8i/x49Rv8Ok63/Adz//wPT//8D1v//AtL+7ALN+ewD2f//A9H+
+/wPR//8B3f//AtX//wmy1v8Nmrn/DZm4/wmv0/8C0v3/Ad7//wPS//8D0f7/A9n//wLN+ewAfJfy
+A+z//wPZ//8D1v//A9b//wPY//8B3///AeP//wHj//8C4P//A9n//wPW//8D1v//A9n//wPt//8C
+fJfyAAQF2wCBmuwCzfHsAtL97ALQ/ewC0P3sAtH97ALR/ewC0f3sAtH97ALQ/ewC0f3sAtL97ALN
+8uwCgZrsAAQF2wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAoAAAAGAAAADAAAAABACAAAAAAAGAJAAAAAAAAAAAAAAAAAAAAAAAA
+AAAA2wAGCOwAdozsAr7h7ALO+uwCzv3sAs387ALN/OwCzfzsAs397ALN/OwCzfzsAs387ALN/ewC
+zf3sAs387ALN/OwCzfzsAs797ALO+uwCvuPsAHeO7AAGCOwAAADbAAgK8gKhw/8D5v//A9j//wPU
+//8C1v//A9T//wPT//8C0///A9P//wPU//8D1P//AtP//wPU//8D1P//A9P//wPT//8D0///A9T/
+/wPU//8D2f//A+f//wKhw/8ACAryAnSM7APn//8Dz/7/A8/+/wPN/f8DwfH/AM///wHT//8Dzv7/
+A8/+/wPP/v8Cz///As///wPP/v8D0P7/A879/wPQ//8B2v//Adv//wPR//8Dzv3/A8/+/wPn//8A
+c4zsAr7o7APZ//8Dz/3/A9D+/wHX//8QXnL/EkZY/wWn0/8A1f//AdT//wDR//8Azf//Ac7//wHU
+//8B1///AtT//wPQ/v8Ng53/C4yq/wPM+v8C0/7/A8/9/wPZ//8CvujsAs/87ATW//8D0P3/A8/9
+/wHa//8Jlbf/HAQB/xgcH/8KfJz/CIqv/w5ddf8RTF7/EU1g/w9gef8Jiaz/Ar7u/xBof/8XNT3/
+GC82/w9yif8C0/7/A9D+/wPV//8CzvzsAs/+7ATW//8Dz/3/A8/9/wHR//8Bxvj/Fy01/xsTFP8b
+FBT/GxMU/xwQD/8cEhL/GxIT/x0IB/8cCQf/E0JP/xVEUv8PcIj/El5x/xVPXf8C2f7/A9D+/wPU
+//8C0P7sAs/97ATW//8Dz/3/A87+/wDS//8Fos7/GSQq/xsaHP8bHiH/Gxga/xwTFf8bHyP/GxET
+/xQvOf8XKS//Gh0g/xJdbv8YQUv/F0RQ/wmewP8B2f//A8/+/wPW//8C0P3sAtD97ATW//8D0P7/
+AdP//wSr2P8ZJy3/HRcY/xweIv8dGBr/FT5J/xFRYf8dBAL/FC41/wLO7P8Nf5j/HQsK/xofIv8U
+T1z/FEpX/wajzP8B1f//BND+/wPW//8C0P3sAtD97APW//8D0f//AMn6/xVDUv8fERD/HB8j/x0f
+I/8dFRf/FUdS/wWx2f8Kcoz/Bbbc/wDm//8Gtt3/Gx0g/xwcHv8dGBr/Hg4O/xc0Pv8Bw/L/AtL/
+/wPW//8C0P3sAtD97APW//8B1///CJO5/x8TE/8dHyL/HiAj/x0gJP8dFBb/GDI7/xZMWv8A4///
+Adz//wLQ//8B2f//FkdT/x8UFv8dICP/HR8j/x8PDv8LgaL/ANn//wPW//8C0f3sAtD97APW//8A
+1///El1z/yASEv8eISX/Hh8j/x4PD/8XKTD/DICT/xwaHf8UVWX/ANz//wLV//8A3///DYei/x8Q
+EP8eICT/HiAk/yAUFf8VTF3/ANP//wPX//8C0f3sAtD97APX//8Bz///GERR/yAXGP8fHyL/HSEl
+/xBkd/8Dw+j/AOP//wW21/8YMzr/FFRk/wHZ//8B2///BcHr/x0mKv8fHSD/HyEl/x8ZG/8ZND7/
+Asj5/wPZ//8C0f3sAtD97APX//8Bzv//Gj9L/yAYGv8gGhz/GjhB/wTB5/8A4f//AN7//wDh//8B
+1/7/EWh5/xJidf8C0vb/AOL//xVaa/8hExT/HyEl/yAaHf8bMTn/A8f2/wLZ//8C0P3sAtD97APX
+//8A1///F1Bg/yIWF/8gIib/IB0g/x8gJP8XTFn/DYuk/wXA5f8A4P//AO///wmkwv8MiaX/Adr3
+/wqev/8hFBX/HyAl/yAYGf8ZQEz/AtH+/wPY//8C0P3sAtD97APW//8A3f//D36a/yIREf8gIif/
+ICIm/yAfIv8hFRf/IhIT/x8nK/8XVmT/DJKt/wPO9v8C0fv/AdD9/wHW//8bNT7/IRse/yIREf8S
+aoH/AN3//wPW//8C0f3sAtD97APW//8C1v//BMHr/x8oLv8iHB//ISMn/yEiJ/8gIib/ICIm/yEe
+Iv8jFRf/IxQV/x8qMP8XXGz/DJSw/wLS8P8RdYz/IxAQ/yAcH/8Hstn/Adj//wPX//8C0f3sAtD9
+7APW//8D0P7/AN3//w6Mqv8kEhL/IiAk/yEjKP8hIyf/ISMo/yEiJ/8hIif/ISIn/yIeIv8jFhj/
+IxUW/x4wN/8dOUP/JAwL/xF5kf8A3v//A9H+/wPW//8C0P3sAtD97APW//8D0f3/A9L+/wDd//8R
+fJP/JBUX/yMaHf8iJCn/IiQp/yIjKP8iJCj/IiMo/yIjKP8iJCj/IiQp/yQXGf8lDAz/E2t//wHa
+//8C0/7/A9H9/wPX//8C0f3sAtD+7APW//8D0f3/A9H+/wPT//8A3v//DZu3/x43P/8lFBb/JRcZ
+/yQcIP8jHyP/JB8j/yQdIP8lGBr/JRQV/yAwNv8Ojqj/Ad3//wLU//8D0f7/A9H+/wPX//8C0f7s
+As/87APW//8D0f7/A9H+/wPR/v8D0f//Ad7//wPP9/8Okq3/GVxr/x4+R/8gMTn/IDE5/x48Rf8Z
+V2b/D4ul/wTJ8P8A3///A9L//wPR/v8D0f7/A9H+/wPX//8C0PzsAr/o7APb//8D0f7/A9H+/wPR
+/v8D0f7/A9H+/wLV//8B3v//Ad3//wPR/f8Fx/H/Bcfx/wPQ/P8B3P//AN///wLV//8D0P7/A9H+
+/wPR/v8D0f7/A9H+/wPb//8Cv+jsAHSM7APp//8D0f7/A9D9/wPR/v8D0f7/A9H+/wPR/f8D0f7/
+A9L+/wPT//8C1f//AtX//wPT//8D0v//A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPp//8C
+dIzsAAgK8gKhw/8D6P//A9r//wPX//8D1v//A9f//wPW//8D1v//A9f//wPX//8D1v//A9f//wPX
+//8D1///A9f//wPW//8D1///A9f//wPX//8D2///A+n//wKhw/8ACAryAAAA2wAFCOwAd4zsAr/j
+7ALP+uwC0f3sAtD97ALQ/ewC0f3sAtD97ALR/ewC0f3sAtH97ALR/ewC0f3sAtD97ALQ/ewC0f3s
+AtH97ALQ+uwCv+PsAniO7AAGCOwAAADbAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAKAAAACAAAABAAAAAAQAgAAAAAACAEAAAAAAAAAAAAAAAAAAAAAAAAAAAANsAAADsAAQG
+7ABneuwCr9DsAsjz7ALO/OwCzv3sAs387ALN/OwCzfzsAs387ALN/ewCzf3sAs387ALN/ewCzfzs
+As387ALN/ewCzf3sAs797ALN/OwCzf3sAs387ALN/OwCz/zsAsnz7AKw0ewAaHrsAAUI7AAAAOwA
+AADbAAAA8gAYHf8Crc3/A+T//wPb//8C1f//AtT//wLU//8C0///A9P//wPT//8C0///A9P//wPU
+//8D1P//A9T//wLT//8D1P//A9T//wPU//8D0///A9P//wPU//8C0///A9T//wPV//8D1v//A9v/
+/wPk//8Crc3/ABgd/wAAAPIABgjsA6zQ/wPi//8Dzv7/A879/wPO/f8Dzv7/As///wLO/v8Dzv3/
+As39/wLO/f8Dzv3/A879/wPO/f8Czv3/As79/wLO/f8Dz/3/A8/9/wPO/f8Dzv3/A879/wLO/f8D
+zv3/A8/9/wPP/f8Dz/7/A87+/wPi//8Cq9D/AAYI7ABkeewD5f//A87+/wPP/f8Dz/3/A8/+/wLK
++v8CwfP/AM3//wHP//8Czf3/A87+/wPP/f8Dzv7/A87+/wLP/v8Cz/7/As7+/wPP/v8Dz/3/As79
+/wPN/f8C0///Adn//wLV//8C1P//A879/wPP/v8Dz/7/A8/+/wPl//8AYnjsAq/W7APc//8Dz/7/
+A8/9/wPP/f8C0v//A8Px/xQ7R/8QVmv/BKTR/wDQ//8Czf//Asz9/wLO//8Bz///AdD//wHR//8C
+0P//A8///wPP//8Dzv3/Adj//wTF7/8Km7v/Brjf/wa44f8C1P//A8/9/wPP/f8Dz/3/A9z//wKv
+1uwCyfXsA9b//wPQ/v8D0P7/A8/9/wPP/v8A2f//EF5y/x0AAP8ZGx3/DHCM/wDF+v8Axvz/A6/e
+/waaxP8Hj7X/B5C3/wadx/8DtOP/Acr+/wDX//8EvuH/EGt//xwMC/8cERD/D3GH/wHb/P8D0P7/
+A8/9/wPP/v8D1v//Asj17ALP/ewD1f//BND+/wPP/f8Dz/3/A879/wHX//8GqdH/Ghga/xoWGP8b
+Dw//EUha/xFMX/8XJiz/GRkb/xoVFv8aFRb/Ghod/xcoL/8SSVn/CIut/wqEpv8dEBD/C4Wi/w50
+jP8dEhP/DYWe/wHb//8Dz/3/A8/9/wPV//8C0P3sAs/97APW//8E0P7/A8/9/wPP/f8Czv3/Ac//
+/wHE9/8WMTv/GxYY/xodIP8bExP/GxIS/xsZG/8bHB//Ghwf/xocH/8aGx7/GxMV/xwQEP8aEhL/
+DXCI/xsdIP8Kjq7/DnmU/xweIP8Fvub/AtT//wPP/f8Dz/3/A9X//wLQ/ewCz/3sA9b//wTQ/v8D
+z/3/A879/wLM/f8Azf//Aq/f/xgrM/8bGBr/Gh0h/xsdIf8bHSD/Gxkc/xsdIf8bHSH/Gx4h/xkS
+FP8VIin/GRse/xoZG/8SW2v/EmZ3/x0cHv8aMDf/FVFf/wW+6f8C1f//A8/9/wPP/f8D1v//AtD9
+7ALP/ewD1v//BNH+/wPP/v8Czf7/Ac7//wKw4P8WNUD/HRYX/xseIv8bHiL/HB4i/xogJP8XIyj/
+GxIT/xseIv8aCgr/EEdV/wPI5f8VPEb/HBMU/xsdH/8UTFj/EXGE/xFrf/8GpMz/ANP//wPN/f8E
+0P7/A9H+/wPW//8C0P3sAtD97APW//8D0f7/A9D+/wLO/v8BwPP/FEBO/x4QD/8cHiL/HB4i/xse
+Iv8dGRv/GDA3/wSw1f8RTVz/GwEA/xFDT/8C0fb/AOv//w18lf8dDg7/Gx0g/xsYGv8YMTj/Gx0f
+/xgsNP8Duef/AdD//wPP/v8D0f7/A9b//wLR/ewC0P3sA9b//wPR/v8Dz/7/ANH//wxykP8fDg3/
+HR8j/xwfIv8dHyP/HR8j/x0XGf8WN0D/D3+X/wHG+P8KdJD/A8fx/wLZ//8C2P//Bbri/xseIf8c
+HB//HB8i/x0bHf8cHCD/Hg4N/xFacP8A0f//A87+/wPQ/v8D1v//AtD97ALQ/ewD1v//A9D+/wHQ
+//8Cuur/Gisz/x4ZG/8dHyP/HiAj/x4gI/8dHyP/HhYY/xRHVP8aMzr/Cpe4/wDr//8C1P//As/+
+/wLR//8B2v//FUlW/x4TFf8dICP/HR8j/xwfI/8dHB//HBwf/wWq1f8B0///A9D+/wPW//8C0f3s
+AtD97APW//8D0P7/ANX//wqJq/8fEhL/HiAj/x4gI/8eICT/HSAj/x0cH/8dCAf/ElBe/xsiJv8b
+Jyz/Bb3h/wDd//8D0P7/A9H+/wDf//8MiKT/HxAQ/x0gJP8eICT/HiAk/x4gJP8fEA//D3KN/wDX
+//8D0P7/A9f//wLR/ewC0P3sA9b//wPQ/v8A1v//EmF3/yATE/8eICT/HiAk/x4hJP8eFBX/GxQW
+/w9kdv8Dx+X/DIOb/x0NDf8cJCn/BMDk/wDd//8D0P3/Atf//wTC6/8cJiv/Hhwf/x4gJP8eICT/
+HiAk/x8VFf8WS1r/AND//wPQ//8D1v//AtD97ALQ/ewD1v//A9D//wDR//8WTFz/IBYX/x4gJP8f
+ICT/Hhwe/xVDT/8GqMf/AOD//wHX//8A4P//BrHQ/xgvNv8cICX/BL/i/wDd//8D0P7/AN7//xRb
+bP8gEhP/HyIm/x8hJf8fICT/Hxga/xk3Qf8CyPr/AtH//wPW//8C0P3sAtD97APW//8D0P//AND/
+/xhIVv8gFhj/HiAk/x8dIf8eJSn/Bbri/wDs//8A3P//AtP//wPQ/v8B3P//AtX7/xFjc/8aKjH/
+Bbnb/wDd//8B3P//Cp6//yAUFf8fISX/HyEl/x8hJf8fGhz/GjQ9/wLH9/8C0v//A9b//wLQ/ewC
+0P3sA9b//wPQ/v8A1v//FlNk/yEVFv8gISX/HyEl/x8eIv8cLDL/FF9w/wqfvP8Czfb/AOD//wDa
+//8B1///AOL//wqatP8VTFn/BrTU/wDd//8Cz/n/GzU9/yAZHP8fISX/HyEl/yAYGv8ZPkn/As7+
+/wPR//8D1///AtD97ALQ/ewD1v//A9D+/wDb//8Rcov/IhIS/yAiJv8gIib/HyEm/yAcIP8hEhP/
+IRUX/xw1PP8TbH7/CajH/wLR+/8A4P//AOn//wTE6f8Ng5z/BLzg/wDk//8ScYf/IhER/x8hJf8g
+ISX/IRMT/xVabP8A2v//A9D+/wPW//8C0f3sAtD97ALW//8D0P7/Adj//wimzf8hGRv/HyAk/yAi
+Jv8gIib/ICIm/yAhJf8gICX/IBod/yISE/8iGRv/HDtE/xJzh/8IrM3/Adn//wDi//8DyPL/ANz/
+/wix1v8gGx7/ICAk/yAhJv8iEhL/DI6u/wDc//8D0f3/A9b//wLR/ewC0P3sAtb//wPR/v8D0f7/
+AdX+/xlHVf8iFRf/ISMn/yEjJ/8hIif/ICIm/yAiJv8gIib/ICIm/yEhJv8iGh3/IxIT/yEbHv8c
+P0j/EnaK/wiv0f8C0/3/AOf//xdQXv8iFxn/IRkc/xwxOP8DyfT/AtP//wPR/v8D1///AtH97ALQ
+/ewD1v//A9H+/wPQ/v8B2v//CajN/yIZG/8iHyP/ISMo/yEiJ/8hIif/ISMn/yEjJ/8hIif/ISIn
+/yEiJ/8hIif/ISEl/yIaHf8jExT/IRse/xw9Rv8RfY7/GFNi/yIYGv8jERH/DY+u/wHe//8D0P7/
+AtH9/wPW//8C0P3sAtD97APW//8D0f7/A9H+/wPQ/v8A3v//EICb/yQSEv8iICX/ISMo/yIjKP8i
+Iyj/IiMo/yIjKP8hIif/IiMn/yEjJ/8iIyf/IiMo/yEjKP8iIib/Ihse/yMTFv8iHB//IxAQ/xRn
+e/8B3P//AtH+/wPR/v8D0f7/A9f//wLR/ewCz/3sA9b//wPR/v8D0f3/A9D9/wPS//8A3f//EXyT
+/yUWGP8kGx7/IiQp/yMkKf8jJCn/IiMo/yIkKf8iJCj/IiMo/yIjKP8iJCj/IiMo/yIjKP8iJCn/
+Ix0h/yQSE/8UZnn/Adn//wLV//8D0P3/A9H9/wPR/f8D1///AtH97ALQ/ewC1v//A9D9/wPR/v8D
+0f7/A9H+/wPT//8A3///DZ24/x8zOv8lEhT/JBsf/yMjJ/8iJCn/IiQp/yIkKP8jJCj/IyQp/yMk
+Kf8jIyj/JB0h/yUTFP8hKS7/D4uj/wHd//8C1f//A9D+/wPR/v8D0f7/A9H+/wPW//8C0f3sAtD9
+7ALW//8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR//8B3///BMzy/xGAlv8ePUX/JB4h/yUWF/8lFhf/
+JRcZ/yUXGf8lFhj/JRUX/yQbHv8fNj3/E3SH/wXD5/8A4P//A9L//wPR/v8D0f7/A9H+/wPR/v8D
+0v7/A9b//wLQ/ewCyfXsA9f//wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPQ/v8C1f//AOD//wPS
+/P8Krc//EIii/xVug/8XYXL/F2By/xZsgP8RhJ3/CqjI/wPN9v8A4P//Adf//wPQ/v8D0f7/A9H+
+/wPR/v8D0f7/A9H+/wPR/v8D2P//Asr17AKw1ewD3f//A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f3/
+A9H+/wPR/v8D0f7/AtP//wHa//8A3///AN///wHd//8B3f//AN///wDf//8B2///AtT//wPR/v8D
+0f3/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPe//8CsNbsAGR57APn//8D0P7/A9H9/wPR
+/f8D0f3/A9H+/wPR/v8D0f7/A9H9/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPS/v8D0f7/A9H+
+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0P7/A+f//wBkeewABgjs
+AqzQ/wPk//8D0P7/A9D9/wPR/f8D0f7/A9H+/wPR/v8D0f3/A9H9/wPR/v8D0v7/A9H+/wPR/v8D
+0f3/A9H+/wPR/v8D0v7/A9L+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H9/wPR/f8D0f7/A9D+/wPk
+//8Cq9D/AAYI7AAAAPIAFxz/AqzM/wPm//8D3f//A9j//wPW//8D1v//A9f//wPW//8D1///A9b/
+/wPX//8D1v//A9f//wPX//8D1///A9f//wPX//8D1///A9f//wPX//8D1///A9f//wPX//8D1///
+A9j//wPd//8D5v//A63N/wAXHf8AAADyAAAA2wAAAOwABAbsAGd67AKw0OwCyfPsAtD87ALQ/ewC
+0P3sAtD97ALR/ewC0f3sAtD97ALR/ewC0f3sAtH97ALR/ewC0f3sAtH97ALR/ewC0P3sAtD97ALQ
+/ewC0f3sAtH97ALQ/OwCyfPsArDR7AJoe+wABAbsAAAA7AAAANsAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACgAAAAw
+AAAAYAAAAAEAIAAAAAAAgCUAAAAAAAAAAAAAAAAAAAAAAAAAAADbAAAA7AAAAOwAAADsAAAA7ABE
+UOwCjKbsArTZ7ALH8uwCzfzsAs797ALO/ewCzfzsAs387ALM/OwCzfzsAs387ALN/OwCzfzsAs39
+7ALN/ewCzfzsAs387ALN/ewCzP3sAs387ADN/ewCzfzsAs397ALN/ewCzf3sAs397ALN/OwCzf3s
+As397ALN/OwCzf3sAs787ALO/OwCx/PsArXa7ACOp+wARVHsAAAA7AAAAOwAAADsAAAA7AAAANsA
+AADyAAAA/wAAAP8BJS7/AqTC/wPf//8D4P//Atn//wLW//8C1P//AtP//wLT//8D0///AtP//wLS
+//8C0///A9P//wLT//8D0///A9P//wPU//8D0///A9P//wPT//8C0///AtL//wPU//8D1P//AtP/
+/wPT//8C0///AtP//wLT//8C0///AtP//wLT//8C0///A9T//wPU//8D1v//A9r//wPg//8C3///
+AqXD/wAlLv8AAAD/AAAA/wAAAPIAAADsAAAA/wE4Rf8Dz/P/A9///wPP//8Dzv3/A879/wLO/f8C
+zv3/As7+/wLO/f8Czf3/A839/wPN/f8Dzv3/As79/wLN/f8Dzv3/A879/wPP/v8Dz/3/A8/9/wPP
+/v8Czv3/As39/wPO/f8Dzv7/BM/9/wPO/f8Dzv3/As39/wPO/f8Dzv3/A879/wLN/f8Dzv3/A8/9
+/wPP/f8Dz/3/A8/9/wPP/f8Dzv//A9///wPO8/8BOET/AAAA/wAAAOwAAADsASIq/wPP9f8D2f//
+A879/wPO/f8Dzv3/A879/wPO/f8Dzv3/A87+/wLO/f8Czf3/A879/wPO/f8Czf3/As39/wLN/f8C
+zv3/As79/wPO/f8Dzv3/A879/wLO/f8Czv3/As79/wPO/f8Dzv3/A8/9/wPO/f8Dzv3/A879/wPO
+/f8Dzv3/A879/wLO/f8Dzv3/A8/9/wPP/f8Dz/3/A8/9/wPQ/v8Dz/7/A879/wPZ//8DzvX/ASIq
+/wAAAOwAAADsAqPH/wPf//8Dzv3/A8/9/wPP/f8Dz/3/A8/9/wPO/f8Dzf3/Asz9/wLL/f8Cyvz/
+Asv9/wLN/f8Czf3/As79/wPO/f8Dz/7/A879/wPO/f8Dzv3/As79/wPO/f8Czv3/As79/wLO/f8D
+z/3/A8/9/wPP/f8Dzv3/As79/wPO/f8Dzv3/As79/wPO/f8Czv3/As79/wPO/f8Dzv3/A8/+/wPP
+/v8Dz/7/A8/+/wPO/v8D3///AqLH/wAAAOwAQE7sA9///wPP/v8Dz/3/A8/9/wPP/f8Dz/3/A8/+
+/wPO/v8CzP3/Asb4/wHC9v8Ayv//Acj8/wLJ+v8DzP3/As79/wPO/f8Dzv3/A879/wLO/f8Dzf3/
+As79/wPO/f8Czv3/As7+/wLO/f8Dz/3/A8/+/wPP/f8Czv3/A879/wPO/f8Dzv3/AtX//wLT//8C
+zv3/A9L//wPO/f8Dzv3/A8/9/wPP/f8Ez/3/A9D+/wPP/v8Dz/7/A9///wA/TewAi6nsA+H//wPP
+/v8Dz/7/A9D+/wPP/f8Dz/3/A8/+/wPP/v8B2f//DHqW/xUvOP8MbYj/A6nX/wDJ//8CyPv/A8r7
+/wLN/f8Dzf3/As39/wLM/f8Cy/z/Asr7/wLL/P8Cy/z/A8z8/wLM/f8Dzf3/A87+/wPP/v8Dzv3/
+A879/wPP/f8D0f3/Brvi/wTF7/8B3f//A836/wLT//8Dzv3/A8/+/wPP/f8Dz/3/A8/9/wPP/f8D
+z/7/A+H//wCLqewCtNzsA9r//wPP/v8D0P7/A9D+/wPP/f8Dz/3/A8/9/wPP/v8B2P//CJi9/xsK
+CP8bDAv/GCAk/w1mgP8BuOv/Acr//wLG+P8Cx/n/AsX4/wLF+f8Bx/z/AMn+/wDI/v8Ayf7/Acn/
+/wHJ/f8CyPv/A8n7/wPL/P8Czf3/As39/wHZ//8A3///FzY9/xRIVP8MiKL/GDE4/wav1P8C2f//
+A8/+/wPP/v8Dz/7/A8/9/wPP/v8Dz/7/A9n//wK03OwCx/PsA9f//wPQ/v8D0P7/A9D+/wPP/v8D
+z/3/A879/wPO/f8Cz/7/ANb//xNJWP8bERL/Ghga/xsMC/8VND7/BZzH/wDH//8AxPv/Abru/wOm
+1f8Gkrr/CYSm/wp7nP8JfJ3/CIaq/wWWvv8DrNv/Ab/0/wDK//8Byv7/AdD//wmbvf8Odo3/GSYs
+/x0DAf8eAgD/HBAP/wijxf8B2v//A9D+/wPP/f8Dzv3/A9D+/wPP/f8Dz/3/A9b//wLH8+wCzvzs
+A9X//wPQ/v8E0P7/BND9/wPP/f8Dz/7/A8/9/wPO/f8Czf3/ANr//wqNrf8bDw7/GRwf/xkcIP8a
+ERH/GB8j/wp2lf8Ma4f/FDxJ/xciKP8ZFxj/GhIS/xsREf8bERH/GxMT/xoYGv8XJiv/E0BO/wxr
+h/8En8r/AND//xFfdP8fAQD/Gh8i/wyAmf8PcIb/Gxka/xshJP8TWGb/Atf//wPP/v8Dz/3/A8/9
+/wPP/f8Dz/3/BNT//wLP/ewCz/3sA9X//wPQ/v8Ez/3/A8/9/wPP/f8Dz/3/A8/9/wLO/f8Czf3/
+AdH//wO24/8YIif/Ghgb/xocIP8ZHSH/Ghkb/xsSEf8bEBD/GxMU/xoZG/8aHB//Ghwg/xocIP8Z
+HB//GRwf/xocH/8bGRz/GxQU/xwPDv8ZGh3/Ektc/wSiy/8ZJy3/FUhV/wDv//8A4P//GTE5/xwW
+F/8PeI//AtT//wPQ/v8Dz/3/A8/9/wPP/f8Dz/7/A9b//wLQ/ewCz/3sA9X//wPQ/v8E0P7/A9D+
+/wPP/f8Dz/3/As79/wLN/f8CzP3/Acr9/wDD9/8VOkb/GxQV/xocIP8aHSH/Gh0g/xocIP8aHCD/
+Gh0g/xsdIf8bHSH/Gh0g/xocIP8aHSD/Ghwg/xocIP8aHB//GRwf/xodIP8aEhP/FTlC/w17lf8e
+EBH/GyAk/wqRsf8MgZ7/HhIS/xZHUv8A3v//A9H//wPP/f8Dz/3/A8/9/wPQ/f8D0P7/A9b//wLQ
+/ewCz/3sA9b//wPR/v8E0f7/A8/9/wPP/f8Dzv3/As79/wLN/f8CyPr/AcP4/wDB9v8VPEn/HBUW
+/xodIP8aHSH/Ghwg/xsdIf8bHiH/Gx4h/xsdIf8bHSH/Gx0h/xodIf8bHiH/Gh0h/xgaHf8YDA3/
+GRIT/xoeIf8aGBr/FjM7/w6AmP8VUlz/GjE4/x8QEP8fERD/HiAi/x4WF/8IrdH/Adj//wPQ/f8D
+z/3/A8/9/wPQ/f8D0P7/A9b//wLR/ewCz/3sA9X//wPR/v8E0f7/A9D9/wPP/f8Dzv3/As39/wLK
++/8BxPj/AL3y/w9edf8cGBr/Gx0g/xsdIf8bHSH/Gx4h/xseIv8bHiL/Ghgb/xoZG/8bHiL/Gx4h
+/xsdIf8aHSH/GRga/xcNDv8LdYn/EVVl/xsSE/8aHiL/GxQV/xROXP8PeYn/DY2n/x8REv8UWWj/
+Bq/S/wqZuv8Cy/r/As/+/wPQ/v8E0P7/A9D9/wPQ/v8D0f7/A9f//wLQ/ewC0P3sA9b//wPR/v8D
+0f7/A9D9/wPP/v8Czv3/Acv8/wHF+f8AwPb/EFht/x4ODf8cHSD/Gx4h/xweIv8bHiL/HB4i/xwe
+Iv8bGx7/Fikv/xYfI/8bExT/Gx4i/xseIv8ZGBv/FwkI/wt7kv8A7v//BrTa/xoVFv8aHB//Gx8j
+/xsVFv8eBwb/EG2B/w6ImP8Nhp//FEhX/wDC9P8Azf//Asv8/wPO/f8E0P3/A9D+/wPR/v8D0P3/
+A9b//wLQ/ewC0P3sA9b//wPR/f8E0f7/A9D9/wPP/v8Czf7/Asf5/wDG/v8Na4b/HQ4N/xwdIf8c
+HiL/HB4h/xweIv8bHiL/Gx4h/xweIv8dDw//C4Od/wO82/8VKjP/Gw4N/xkZG/8XCgn/C3uS/wHj
+//8C1P//Adj//xRDTv8cExT/Gx8i/xseIf8bHSD/Gxsd/xc3Pf8ZJy3/HQoI/xNIWP8Axfj/Asr7
+/wLM/f8Dz/7/A9D+/wPR/v8D0P7/A9b//wLR/ewC0P3sAtb//wPR/v8D0f7/A9D+/wPP/v8Cy/z/
+AMn//weTu/8cFhf/HBse/xwfIv8cHiL/HB4i/xweIv8cHiL/Gx4h/xweIf8cFxn/Dm+D/wW73/8C
+zO//EURR/xgDAf8LepH/AeH//wPT//8D0P7/AeH//wyFoP8cDg7/Gx4i/xseIv8bHiL/Gx0h/xwa
+Hf8cGx7/Gx4h/x4ODf8Nc4//AM///wLJ+/8Dzv3/BND9/wPQ/v8D0f7/A9b//wLQ/ewC0P3sA9b/
+/wPQ/v8D0f7/A9D+/wPN/f8ByPv/AL7y/xY8SP8eFBT/HSAj/x0fI/8dHyP/HR8j/x0fI/8dHyP/
+HR8j/xwdIf8ZHyP/EGx//xdNWv8A2P//Abfq/weUtP8B2v//AtL//wLQ/v8D0f7/Atf//wS+6P8a
+ISX/HBse/x0fI/8cHyL/HR8j/xwfIv8cHiL/Gx4i/xwZHP8aICT/BK3a/wHN/v8Czf3/A8/9/wPR
+/v8D0f7/A9b//wLQ/ewC0P3sA9b//wPR/v8D0P3/A8/+/wLM/f8Azv//CYir/x8TE/8dHyP/HR8i
+/x0fI/8dHyP/HiAk/x4gJP8dICP/HR8j/x0cH/8YKjD/D3SK/yAQD/8Jm77/ANP//wHc//8C0f//
+AtD+/wLQ/v8C0P7/AtH+/wHc//8UTlz/HRIT/x0fI/8dICP/HSAk/xwfIv8cHiL/HB8i/xwfI/8e
+EA//EGN6/wDQ//8CzPz/A8/+/wPQ/v8D0f7/A9f//wLR/ewC0P3sA9b//wPQ/v8D0P7/As7+/wLL
+/f8AyPv/FUdX/x8UFP8dHyP/HR8j/x4fI/8eICT/HiAj/x0fIv8dHiL/HB4i/xwaHP8WNDz/EG2B
+/yALCv8YP0n/AdL4/wHY//8Cz/3/AtD9/wPR/v8C0P7/AtD9/wDf//8MjKj/Hg8P/x0fI/8dHyP/
+HSAj/x0gI/8eICT/HR8j/x0fI/8dGhz/Giox/wK56P8Bzf//A87+/wPQ/f8D0f7/A9f//wLR/ewC
+0P3sA9b//wPR/v8D0P3/As7+/wHO//8Eq9n/HCIm/x4cH/8eICP/HiAj/x4gJP8eICT/HiAj/x0f
+Iv8dHyL/Gx0h/xwJCP8TP0r/EWBy/x8KCf8eERL/FkpZ/wHS+f8B1///As/9/wPR/f8D0f7/AtD9
+/wLW//8ExO3/Gycs/x4bHf8dICP/HiAj/x4gJP8eICT/HiAk/x4gJP8dHyP/HxQU/wqQsv8A0///
+As79/wPQ/f8D0f7/A9f//wLR/ewC0P3sA9b//wPR/v8D0P7/As7+/wDS//8Liqz/IBUV/x4gJP8e
+ICT/HiAk/x4gJP8eICP/HiAj/x0fI/8cFhj/GwwN/xJIVP8Futr/BrbW/xY4Qf8dDQz/HwwL/xZP
+Xv8B1fv/Adf//wPP/f8D0P3/A9H+/wPR/v8A3///E15v/yAREv8eIST/HiAj/x4gJP8eICT/HiAk
+/x4gJP8dHyP/IBIR/xFpgP8A1P//As39/wPQ/f8D0f7/A9b//wLR/ewC0P3sA9b//wPR/v8D0P7/
+As7+/wDV//8Qb4n/IBIS/x4gJP8eICT/HyAk/x8hJf8eICT/HR0g/x0NDf8XKjD/CY+o/wHb//8B
+2f//Adv//wLS+P8Panz/HBIU/yAGA/8VU2L/Adb8/wHX//8Cz/3/AtD9/wPR/f8B3f//CaDB/x8U
+Ff8eHyP/HiAk/x8hJf8fISX/HyEk/x8hJP8eICP/HxUW/xZMW/8Az///As3+/wPQ/v8D0f7/A9f/
+/wLQ/ewC0P3sA9b//wPR/v8D0P3/As39/wDT//8TX3P/IRQU/x4gJf8eICT/HiAk/x8hJf8eHiH/
+HB0f/w9leP8Dye3/AOD//wLR//8C0P7/A9D+/wLV//8A4v//CKG9/xguNf8hAAD/FVNj/wHX/v8B
+1v//AtD9/wPR/v8C0///A9D6/xk3P/8fGBr/HyEl/x8iJv8fISX/HiAk/x8gJP8eICP/HhcY/xg+
+Sf8Byvz/As///wPQ/v8D0f3/A9b//wLR/ewC0P3sAtb//wPR/v8D0P3/As39/wDU//8WWWz/IRQV
+/x4gJP8fICT/HiAl/x8hJf8hEhP/EHiO/wD2//8A2///As/+/wLQ/f8C0P3/A9H+/wPR/f8C0f7/
+AN///wPL7/8RXm7/IAAA/xVQX/8B2f//Adb//wLQ/v8D0f7/AOH//xB0i/8gEBD/HyEl/x8hJf8f
+ISX/HyAk/x8hJf8fICT/Hxga/xo6RP8Byfr/As///wPQ/f8D0P3/A9b//wLQ/ewC0P3sAtb//wPR
+/f8D0P3/As3+/wDW//8VYHT/IhQV/x4gJP8eICX/HyEl/x8gJf8gGx7/GzpD/w2Kof8Ev+X/AN3/
+/wDd//8B1P//AtD+/wLQ/f8C0P3/As/9/wLX//8B4P//Cpaw/xwXGf8WSlf/Adj//wHW//8C0P3/
+Adn//wez2v8eHB//Hh4i/x8hJf8fISX/HyEk/x8hJf8eICT/IBcZ/xlASv8Bzf7/AtD//wPQ/f8D
+0P3/A9b//wLQ/ewC0P3sAtb//wLQ/v8D0f7/A879/wDY//8Rcov/IhIT/yAhJv8gIib/ICIm/yAh
+Jf8fIib/Hxod/yEREv8eJir/Flhm/wuWsv8DyPD/AN///wDd//8C1P//AtD+/wLQ/f8D0v//AeH/
+/wTG6P8VRlD/FE1b/wHU+f8B1v//AtH+/wHZ//8XSFT/IBUX/x8hJf8fICT/HyEl/x8hJf8fICT/
+IBUW/xdQX/8A1P//A8/+/wPQ/f8D0f7/A9b//wLQ/ewC0P3sA9b//wPQ/v8D0f7/A8/+/wDY//8L
+kbL/IRQV/yAhJv8gISb/ICIm/yAiJv8fISX/HyEl/x8gJf8fHB//IRIU/yETFP8dLzX/FGRz/wqg
+vf8Czfb/AN///wDb//8C0///A9D9/wLZ//8A3v//DoCU/xFnev8CzO//AtT//wDf//8NiqX/IRES
+/x8hJf8fISX/HyEl/x8hJf8eICT/IRES/xJuhf8A2v//A8/9/wPQ/f8D0f7/Atf//wLQ/ewCz/3s
+A9b//wPQ/f8D0P7/A9D+/wHT//8FueT/HyQp/yAeIv8fISX/HyEm/yEiJ/8gISb/ICEm/yAhJv8f
+ISX/HyAl/x8hJf8gHB//IRIT/yEWF/8cNTz/E2x9/wmnxv8C0fv/AOD//wHa//8C1P//AeH//wex
+0/8Jl7X/As71/wHY//8Fw+z/HScs/yAcIP8fISX/ICEm/yAhJf8fICT/IRUV/wqZu/8B2v//A9D9
+/wPQ/f8D0f7/A9f//wLR/ewC0P3sA9b//wLQ/f8C0P7/A9D+/wLO/v8A1///F1Fg/yIVFv8fISX/
+ICIm/yAiJv8gISb/ICEm/yAiJv8gISX/ICEl/yAhJf8fISX/HyEl/yAhJf8hGx7/IxIT/yEZGv8b
+OkL/EnGE/wiqyv8C0vz/AN///wDh//8C0f3/A8r2/wLR/v8A3///FV1t/yETFP8gIib/ICIm/yAh
+Jf8gGx3/HDA2/wPH9P8C0v//A9D9/wPR/v8D0f7/A9f//wLR/ewC0P3sAtb//wLQ/v8D0f7/A9H+
+/wPP/f8A2v//C5q8/yMVFf8gISb/ISIn/yEiJ/8hIyf/ISIn/yAiJv8gISb/HyEl/yAiJv8gIib/
+ICEm/yAiJv8hIif/ISMn/yEhJf8hGhz/IxIT/yEaHf8cPUb/EnSH/wmry/8C0/3/AOD//wDa//8A
+3///Cp2+/yAVF/8gISX/ISIm/x8hJv8iEBD/EXCI/wDd//8Dz/3/A9H+/wPR/v8D0f7/A9f//wLR
+/ewC0P3sAtb//wPR/v8D0f3/A9D9/wPQ/f8C0P7/ANT//xpJVv8iFRf/ICMo/yEiJ/8hIif/ISMn
+/yEiJ/8hIif/ISIn/yEiJ/8hIif/ISIn/yAiJv8hIif/ISIn/yEiJ/8hIib/ISIn/yEhJf8iGh3/
+JBMU/yEbHf8cPET/E3GE/wmoyP8C0vr/ANv//xw5Qf8hGh3/ICIm/yEbHv8eKC7/BMHq/wLV//8D
+0P3/AtD9/wPR/v8D0f3/A9b//wLR/ewC0P3sAtb//wPR/v8D0f7/AtD+/wPQ/v8Dz/3/Adj//wew
+1f8iHiH/IR0h/yEjKP8hIyj/ISIn/yEiJ/8hIif/ISIn/yEjJ/8hIyj/ISIn/yEiJv8hIif/ISIn
+/yEiJ/8hIif/ISIn/yEiJ/8hIif/ISMn/yEhJf8iGh3/IxMU/yIaHP8cO0T/FGd3/x4wN/8hHiL/
+ISEl/yMREv8Ni6n/AN///wPQ/v8D0f3/AtH+/wLR/f8D0f3/A9b//wLQ/ewC0P3sA9b//wPR/f8D
+0f7/A9H+/wPR/v8D0f3/A9D+/wDe//8OiaX/JBMT/yIhJf8iJCn/ISIn/yEiJ/8hIyf/ISMo/yEj
+KP8hIyj/IiMo/yEiJ/8hIif/ISMn/yIjJ/8hIyf/ISIn/yEjJ/8iIyj/ISMn/yEjJ/8hIyf/ISMo
+/yEhJv8hGh3/IxQW/yEgJP8hIyf/Iw8P/xRidP8B3P//A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/
+A9f//wLR/ewC0P3sA9b//wPR/v8D0f7/A9H9/wPQ/f8D0P7/A9H9/wPS/v8A3v//EneO/yQSE/8i
+ICT/ISQp/yIjKP8iIyj/IiMo/yMkKf8iIyn/IiMo/yIjKP8iIyj/IiMo/yIjKP8hIyj/IiMo/yIj
+KP8iJCj/IiQo/yIjKP8iIyj/IiMo/yEjJ/8hIif/ISMn/yEiJ/8jEBD/F1Ri/wHW/P8C1f//A9D9
+/wLQ/f8D0f3/A9H9/wPR/v8D0f7/A9f//wLR/ewCz/3sAtb//wPR/v8D0f7/A9H9/wPR/f8D0P3/
+A9H+/wPR/v8D0///AN7//xCAl/8lGRv/JBse/yIkKf8iIyj/IiMo/yMkKf8jJSn/IiQp/yIjKP8i
+JCn/IyQp/yIjKP8iIyf/IiMo/yIjKP8iJCj/IiQp/yIjKP8iIyj/IiMo/yIjKP8iJCn/Ix4i/yQR
+Ev8VYHH/Adb8/wLX//8D0P3/A9H9/wPQ/f8D0f3/A9H+/wPR/f8D0f7/A9f//wLR/ewCz/3sAtb/
+/wLR/v8C0P7/A9D+/wPR/v8D0f3/A9H+/wPR/v8D0P7/A9L//wDg//8MoLz/IDE4/yUSFP8iHyT/
+IiQp/yIkKf8iJCn/IiMo/yIjKP8iJCn/IyQp/yMkKP8jJCj/IyQp/yMkKf8jJCn/IyQp/yMkKf8j
+JCn/IyQp/yIiJv8lFRb/IiIm/xCGnf8B3f//Atb//wPQ/v8D0f7/A9H+/wPR/f8D0f3/A9H+/wPR
+/v8D0f7/A9f//wLR/ewC0P3sAtb//wLQ/v8D0P3/A9H9/wPR/v8D0f7/A9H+/wPS/v8D0f7/A9H+
+/wPR/v8B3///BMru/xRugP8iJCj/JRMV/yQcIP8iIyf/IyQp/yMkKf8jJCn/IiQo/yIjKP8jJCn/
+IiQp/yMkKf8jJCn/IyQp/yMkKf8jHyP/JRUW/yMbHv8YWWb/B7na/wDg//8D0///A9H+/wPR/v8D
+0f7/A9H+/wPR/v8D0f7/A9L+/wPR/v8D0f7/A9f//wLR/ewCz/zsAtb//wLQ/v8D0f7/A9H+/wPR
+/v8D0f7/A9H+/wPS/v8D0f7/A9H+/wPR/v8D0P7/Atb//wDg//8HvN//E3WJ/x86Qf8kHR//JRUX
+/yUXGf8kGx7/Ix4h/yMfI/8kHyP/JB4i/yQcH/8lGRv/JRUW/yQZG/8gMDb/FmV1/wmuzf8A3f//
+Adr//wPQ/v8D0f7/A9H+/wPR/v8D0f7/A9H9/wPR/v8D0f7/A9H+/wPS/v8D0f7/A9b//wLQ/ewC
+x/LsAtj//wLQ/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H9/wPR
+/v8C2P//AOD//wPP+f8Lqsr/En+W/xhdbP8dRlD/IDhB/yAyOf8fMjj/Hzc//x1DTf8YWGb/EneM
+/wuhvv8EyPD/AN///wHb//8C0f//AtH+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/
+A9H+/wPR/v8D0f7/A9j//wLI8+wCtNvsAtv//wPQ/v8D0f7/A9L+/wPR/v8D0f7/A9H9/wPR/f8D
+0v7/A9H+/wPR/f8D0f7/A9H+/wPR/v8D0f7/A9H+/wLT//8B2///AOD//wHd//8C1f//BM33/wXH
+8P8Fx/D/BMz2/wLU//8B3P//AOD//wHd//8C1f//A9H+/wPR/v8C0f3/A9H9/wPR/v8D0f7/A9H+
+/wPR/v8D0f7/A9H+/wPR/f8D0f7/A9L+/wPR/v8D0f7/A9z//wK13OwCjKjsA+L//wPR/v8D0f7/
+A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/f8D0f7/A9H+/wPR/v8D0f7/A9L+/wPR/v8D
+0f7/A9H+/wPR/v8D0///A9X//wLV//8C1f//AtT//wPT//8D0f//A9H+/wPR/v8D0f7/A9H+/wPR
+/v8D0f7/A9H+/wPR/v8D0f3/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9L+/wPR/v8D0f7/A+L/
+/wKMq+wAQE3sA+D//wPR/v8D0f7/A9H9/wPR/f8D0f3/A9H9/wPR/f8D0f3/A9H+/wPS/v8D0f7/
+A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0v7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D
+0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f3/A9H+/wPR
+/v8D0f7/A9H9/wPR/v8D0v7/A+H//wBATewAAADsAqPH/wPh//8D0P7/A9H9/wPQ/f8D0f3/A9D9
+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H9/wLR/f8D0P3/A9H+/wPR/v8D0f7/A9H+/wPS/v8D0v7/
+A9H+/wPR/v8D0v7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f3/A9H9/wPR/v8D0f7/A9H+/wPR/v8D
+0f7/A9H+/wPR/f8D0f3/A9H+/wPS/v8D0f7/A9H+/wPQ/v8D4f//AqPH/wAAAOwAAADsASMq/wPP
+9P8D2///A9D+/wPR/f8C0P3/A9D9/wPR/f8D0f7/A9H+/wPQ/f8D0f7/A9H9/wPR/v8D0f3/A9D9
+/wPR/v8D0v7/A9L+/wPR/v8D0f7/A9H9/wPR/v8D0v7/A9H+/wPR/v8D0v7/A9L+/wPS/v8D0f7/
+A9H9/wPR/v8D0f7/A9H+/wPS/v8D0f7/A9H+/wPR/f8D0f3/A9H+/wPR/v8D0f7/A9D9/wPb//8D
+z/X/ACIq/wAAAOwAAADsAAAA/wA2RP8CzvL/AuH//wPR//8D0f3/A9H+/wPR/v8D0f7/A9H9/wPQ
+/f8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f3/A9H+/wPR/v8D0f7/A9H+
+/wPR/v8D0v7/A9L+/wPR/v8D0f7/A9H+/wPR/f8D0f3/A9H+/wPR/v8D0f7/A9H+/wPR/f8D0f7/
+A9H+/wPR/v8D0f//A+D//wPP8/8BN0T/AAAA/wAAAOwAAADyAAAA/wAAAP8AJC3/AqXC/wPg//8D
+4v//Atv//wLY//8C1v//Atb//wPW//8D1///A9b//wPX//8D1///A9b//wPX//8D1v//A9b//wPX
+//8D1///A9f//wPX//8D1v//A9f//wPX//8D1///A9f//wPX//8D1v//A9f//wPX//8D1///A9f/
+/wPX//8D1///A9b//wPX//8D1///A9v//wPh//8D4P//A6bD/wElLf8AAAD/AAAA/wAAAPIAAADb
+AAAA7AAAAOwAAADsAAAA7ABEUOwCjqfsArXa7ALH8uwCz/zsAtH97ALQ/ewC0f3sAtD97ALQ/ewC
+0f3sAtH97ALR/ewC0P3sAtH97ALR/ewC0f3sAtH97ALR/ewC0f3sAtH97ALR/ewC0f3sAtH97ALQ
+/ewC0f3sAtD97ALQ/ewC0P3sAtD97ALR/ewC0f3sAtH97ALQ/OwCyPLsArXa7AKPqOwAR1LsAAAA
+7AAAAOwAAADsAAAA7AAAANsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAoAAAAQAAAAIAAAAABACAAAAAAAABCAAAAAAAAAAAAAAAAAAAAAAAAAAAA2wAAAOwAAADsAAAA
+7AAAAOwAAADsAAAA7AAkK+wCZ3nsApe17AC03OwCw+/sAsz77ADO/ewCzf3sAs787ALN/ewCzfzs
+As387ALN/OwCzfzsAMz87ALN/OwCzf3sAs387ALN/ewCzf3sAs397ALN/OwCzfzsAs387ADN/ewC
+zP3sAM397ALN/OwAzfzsAs387ALN/OwCzf3sAs797ALN/ewCzv3sAs397ALM/OwCzfzsAs397ADN
+/ewCzfzsAs387ALN/OwCzvzsAs377ALE8ewCtdzsApm37ABoeuwAJSzsAAAA7AAAAOwAAADsAAAA
+7AAAAOwAAADsAAAA2wAAAPIAAAD/AAAA/wAAAP8AAAD/AR8m/wKPqP8D0vv/AuH//wLe//8C2f//
+Atb//wLU//8C0///AtT//wLT//8D0///AtP//wLT//8C0v//AtP//wLS//8C0v//AtP//wPT//8D
+0///AtP//wLT//8C0///AtL//wLT//8C0///AtL//wLS//8C0///AtP//wLT//8C0///AtP//wLT
+//8C0///AtT//wLT//8C0///AtP//wLT//8C0v//AtP//wLT//8D1P//A9T//wLV//8D1v//A9n/
+/wLe//8C4f//AtL7/wKQqf8BICj/AAAA/wAAAP8AAAD/AAAA/wAAAPIAAADsAAAA/wAAAP8AAAD/
+AVBg/wLO8/8C4f//A9L//wPO/v8Dz/7/A8/+/wLO/v8Czv3/As79/wLO/v8Czv3/A879/wLO/f8C
+zf3/As39/wPO/f8Dzv3/As39/wLO/v8Dzf3/As39/wLO/f8Dz/7/A879/wPO/f8Dzv3/A879/wLO
+/f8Czf3/A839/wPO/f8Dz/7/A87+/wPO/f8Dz/3/A879/wLN/f8Czf3/A839/wLO/f8Czv3/As79
+/wLN/f8Czv3/A879/wPP/f8Dz/3/A8/+/wPP/v8Dz/7/A8/+/wLR//8C4f//As/0/wFPYP8AAAD/
+AAAA/wAAAP8AAADsAAAA7AAAAP8AAAD/AWF2/wPh//8D1v//A87+/wPP/v8Dzv3/A879/wLO/f8D
+zv3/As79/wLO/f8Dzv3/As79/wLN/f8Czf3/A839/wPN/f8Dzf3/A879/wLN/f8Czf3/A879/wPN
+/f8Dzv7/As/9/wPP/v8Dz/3/A8/+/wPO/f8Czv3/As39/wLO/f8Dzv3/A8/9/wTP/f8Ez/3/A8/9
+/wPO/f8Dzf3/A879/wPO/f8Dzv3/A8/+/wLO/f8Czf3/A879/wPP/f8Dz/3/A8/9/wPP/f8Dz/3/
+A8/9/wPP/f8Dzv3/A87+/wLW//8D4P//AmF2/wAAAP8AAAD/AAAA7AAAAOwAAAD/Akxd/wPh//8D
+0///A879/wPO/f8Dzv3/A8/+/wPO/f8Dzv3/A879/wPP/v8Dzv3/As7+/wLO/f8Czf3/A839/wPO
+/f8Dzv3/As39/wLN/f8Czv3/As39/wLO/f8Czv3/As79/wPO/f8Dzv3/A879/wLO/f8Czv7/As79
+/wPO/f8Czf3/A879/wPO/f8Dzv3/A8/9/wPO/f8Czv3/A879/wPO/f8Dzv3/A879/wPO/f8Czv3/
+As79/wPO/f8Dz/3/A8/9/wPP/f8Dzv3/A8/9/wPP/f8D0P7/A8/+/wPP/v8Dz/3/A9P//wPg//8B
+S13/AAAA/wAAAOwAAADsABwi/wPO9f8D1v//A879/wPO/f8Dz/3/A8/+/wPO/f8Dzv3/A8/9/wPO
+/f8Dzv7/A839/wLM/f8CzP3/Asz9/wPM/f8Czf3/As39/wLN/f8Czf3/As39/wPO/f8Dz/7/A879
+/wPO/f8Dzv3/A879/wPO/f8Czf3/As79/wPO/v8Dz/7/As7+/wLO/f8Dz/3/A8/9/wTP/f8Dzv3/
+A879/wPO/f8Czv3/A879/wPO/f8Dzv3/As39/wLO/f8Dzv3/As79/wPO/f8Dz/3/A8/9/wPP/f8D
+z/7/A8/+/wPP/v8Dz/3/A8/+/wPP/v8D1v//A872/wAcIv8AAADsAAAA7AKMqv8D4f//A87+/wPP
+/v8Dz/3/A8/9/wPP/f8Dz/3/A8/9/wPP/f8Czv3/A839/wLK/P8CyPv/Asf5/wLG+f8CyPr/Asr8
+/wLM/f8Czf3/As79/wLO/f8Dzv3/A87+/wPO/f8Dzv3/As79/wPO/f8Dzf3/A879/wPO/f8Czv3/
+As79/wLO/f8Czf3/A879/wPP/f8Ez/3/A879/wLO/f8Czv3/As39/wPO/f8Dz/3/A879/wLO/f8D
+zv3/A8/9/wLP/f8Dz/3/A879/wPO/f8Dz/3/A8/9/wPP/v8Dz/7/A8/+/wPP/v8Dz/3/A8/+/wLh
+//8Bi6r/AAAA7AAgJuwD0v3/A9L//wPP/v8Dz/3/A8/9/wPP/v8Dz/3/A8/9/wPP/v8Dz/7/A879
+/wLM/f8Cyvz/AcX4/wDE+f8Ax/3/AcP2/wLE9v8Cyfr/A8v8/wLN/f8Dzv7/A879/wPO/f8Dzv3/
+A879/wLN/f8Dzf3/A839/wLN/f8Czv3/As79/wLO/f8Czv3/As79/wPO/f8Dz/3/A8/9/wPO/f8C
+zv3/A879/wPO/f8Dzv3/A8/9/wPP/f8D0f//As/+/wLO/f8Dz/3/A8/9/wPO/f8Dzv3/A8/9/wPP
+/f8Dz/3/BM/+/wPP/f8Dz/7/A8/+/wPP/v8D0v//AtH8/wAfJuwAZXrsAuL//wPP/v8Dz/7/A8/+
+/wPQ/v8D0P7/A8/+/wPP/f8Dz/7/A8/9/wPP/f8C0f//BL/s/xNCUP8SSFj/CX+g/wKw4f8Axv3/
+AcL2/wPF9v8Cyfr/Asz9/wLN/f8Dzf3/A839/wLN/f8CzP3/Asz9/wLL/P8Cy/z/Asz9/wLM/f8C
+zP3/Asz9/wLN/f8Dzf3/A879/wPP/f8Dz/3/A879/wPO/f8Dz/3/As79/wPO/f8C2f//A9L//wPR
+//8D0P//Atr//wHb//8Cz///A879/wPP/f8Dz/3/A8/9/wPP/f8Dz/3/A8/9/wPP/f8Dz/7/A9D+
+/wPi//8AZXvsApi57APf//8Dz/7/As/+/wPQ/v8D0P7/A9D+/wPP/f8Dzv3/A8/9/wPP/v8Dzv7/
+AtL//wLG8f8XKjD/GwgF/xsQD/8XKTD/DGyH/wGy5P8Axv3/AsL1/wPH+f8Cyvv/Asr7/wLJ+/8C
+yPr/Asb4/wLG9/8CxPb/AsP2/wLD9v8DxPX/A8X2/wPG9/8Dx/n/A8j6/wPL/P8Dzf3/A879/wPO
+/f8Czf3/A8/9/wPQ/v8B2f//DJOu/xkqL/8JmLb/AOX//w51jP8MhaD/As/4/wPR/v8D0P7/A8/+
+/wPP/v8Dz/3/A8/+/wPP/f8Dz/7/A8/+/wPP/v8C3v//Api67AK13ewD2v//A8/+/wPP/v8E0P7/
+A9D+/wPQ/v8Dz/3/A8/9/wPP/f8Dz/3/A879/wPO/v8A2v//Coem/xoODf8ZHB//GhYY/xsNDP8W
+Ljb/CIuv/wDE+/8CwvX/AsL0/wLC9f8CwPP/Ar/y/wG/8/8Awvf/AMT6/wDF+/8Aw/n/AMT6/wDF
++/8AxPv/AcT5/wLD9v8Cw/X/A8X3/wPI+f8Cyvz/A8z8/wLN/f8B1v//AO3//w51i/8eAQD/GCgt
+/xRIUv8cERD/GiAi/wPD7P8C1v//A8/+/wPP/f8Dz/7/A8/9/wPP/f8D0P7/A8/+/wPP/v8Dz/3/
+A9n//wK03OwCw+/sA9f//wPQ/v8D0P7/A9D+/wPQ/v8D0P7/A8/+/wPP/v8Dz/3/A879/wPO/f8D
+zv3/AdD//wHJ9/8WMDj/GhUX/xkcH/8ZHB//GhMU/xoSEv8NYHj/ALru/wG/9P8AwPX/AMD2/wG0
+5/8Doc7/Boyy/wp6m/8Lbov/DWeD/wxphP8LcY//CX6f/waSuP8Dp9X/ALnt/wDE+v8Bxfr/AsP2
+/wPF9/8B0f7/DnqT/xFkdP8XO0X/GxUX/x0KCf8eBgT/GxQV/xY1Pf8CzPb/AtT//wPR//8Dz/7/
+A8/9/wPO/f8Dz/7/A9D+/wPP/f8Dz/3/BM/9/wPX//8Cw+/sAs377APV//8D0P3/A9D+/wTQ/v8E
+0P3/A9D9/wPP/f8D0P7/A8/9/wPO/f8Dzv3/A879/wLM/f8A2v//Dm6G/xsNDP8ZHB//GRwf/xkc
+H/8YGRz/Gw0L/xJFVP8Ensr/B4iu/w9Zb/8UNUD/GCAk/xoVFv8aERH/Gw8P/xsQD/8bEA//GxAP
+/xwSEv8aFxj/GCMo/xQ6R/8OYHf/B46z/wG15/8Ayf//AcX1/xopLv8fBQP/HBUW/xklKf8Pc4f/
+EWN2/xsaHf8bGRr/GDM7/xVLVv8EyfX/AtL//wPP/f8Dzv3/A8/9/wPP/f8Dz/3/A8/9/wPO/f8D
+1f//As777ALP/ewD1f//A9D9/wPQ/v8E0P3/BND9/wTQ/f8Dz/3/A8/9/wPP/f8Dzv3/As79/wLO
+/f8Czf3/ANT//waiyf8aFhj/GRse/xkcIP8ZHCD/GRwg/xkcH/8aFBT/GR0g/xoWFv8bEA//GhUV
+/xoZG/8ZHB//GRwf/xocIP8ZHCD/GRwf/xkcH/8ZHSD/Gxwg/xsaHP8bFRX/Gw8P/xoUFf8VMTr/
+DGuF/wSp1/8Hl73/GSQp/x0NDP8MhqL/AOn//wDl//8SYHL/HRIS/x0PD/8cGx3/Bbrg/wLV//8D
+zv3/A8/9/wPP/f8Dzv3/A8/9/wPP/f8D0P3/BNX//wLR/uwCz/zsA9X//wPQ/f8D0P7/BM/9/wPP
+/f8Dz/7/A8/+/wPP/f8Dz/3/A879/wLO/f8Czf3/Asz9/wHM/v8BvO7/Fy01/xoXGP8ZHCD/Ghwg
+/xodIP8ZHSD/GRwg/xoaHf8ZGx7/GRwf/xkdIP8aHSD/Gh0g/xodIP8bHSD/Ghwg/xkcIP8aHCD/
+Gh0g/xodIf8aHSH/Gh0g/xodIP8aHB//GhUW/xwLCf8UNT//AbTi/xg2P/8eCwn/CpGw/wDj//8A
+5v//EWyB/x8IBv8XPkf/Bbze/wLR/f8D0P7/A8/9/wPP/f8Dz/3/A8/+/wPP/f8D0P7/A9D+/wPW
+//8C0P3sAs/87APV//8D0P7/BND+/wTQ/f8D0P7/A9D9/wPP/f8Dz/3/A879/wLO/f8Czf3/Asz9
+/wLK/P8Bxvn/AMP4/xRDUf8cExT/Ghwg/xocIP8bHSH/Gh0g/xocIP8aHSD/Gh0g/xodIP8aHSD/
+Gx4h/xodIP8aHSD/Gh0g/xocIP8aHSD/Ghwg/xocIP8aHCD/Ghwf/xkcH/8ZHSD/Ghwg/xkcH/8b
+Dw//C4ik/xJmev8dExT/HRQW/xkvN/8LjKn/DXyX/xshJf8eDxD/E1pq/wDh//8D0P//A9D9/wPP
+/f8Dz/3/A8/+/wPP/f8D0P7/A9D+/wPQ/v8D1v//AtD97ALP/ewD1f//A9D+/wTR/v8E0f7/A9D+
+/wPP/f8Ez/3/A879/wPO/f8Czv3/Asz9/wLK+/8Bxfj/Ar7x/wDG/f8STF7/HBIS/xocIP8aHSD/
+Gh0h/xocIP8aHCD/Gx0h/xseIf8bHiH/Gx4h/xsdIf8aHSH/Gx0h/xodIP8aHSD/Gx4h/xsdIf8Z
+HCD/GBwf/xgWGP8YExT/GRwf/xodIP8ZHCD/GxER/w5rf/8QeI7/HR8h/xktM/8fEBD/HhQV/x8Q
+EP8gEBD/HhMU/x8QD/8LmLj/Adv//wPQ/f8D0P7/A8/9/wPP/f8Ez/3/A9D+/wPQ/v8D0P7/A9b/
+/wLR/ewC0P3sA9X//wPQ/v8E0f7/BNH9/wTQ/v8Dz/3/A8/9/wPO/f8Czv3/As39/wHL/P8Bxvj/
+Ab3w/wDC+f8HirD/GSMo/xwaHf8aHSH/Gx0h/xsdIf8aHSD/Gx0h/xseIf8bHiH/Gx4h/xodIP8a
+HCD/Gh0h/xseIf8bHSH/Gx0h/xseIf8aHSD/GRwg/xcREv8UISb/FDY+/xkXGf8aHSH/Gh0g/xob
+Hv8aHB7/Cpi1/wmmw/8KpsT/F0dT/x4TFP8cJSn/D3yR/xNqff8XSVT/A8Xt/wHS//8Cz/3/BND+
+/wPQ/f8Dz/3/A9D+/wPQ/v8D0f7/A9H+/wPX//8C0P3sAs/97APV//8D0P3/A9H+/wTR/v8D0P7/
+A9D+/wPP/f8Czv3/As39/wLL/P8Cx/n/Ab7y/wDC+P8Kfp//HBga/x0YGv8bHyL/Gx4h/xweIv8b
+HiH/Gx4h/xweIv8cHiL/Gx0h/xocH/8aFBX/GRod/xoeIf8bHiH/Gx0h/xodIf8aHCD/GBwf/xcO
+D/8VHyP/BbHR/wHV+/8VMTn/GhQW/xodIP8aHiL/Gxkc/xokJ/8aIib/EWFz/wyTr/8iAAD/EHOI
+/waszv8BxPX/Ac7//wHN/v8By/z/As79/wPP/f8E0P3/A9D9/wTQ/v8D0P3/A9H+/wPR/v8D1v//
+AtD97ALQ/ewD1v//A9D+/wPR/v8D0f7/A9D+/wPQ/f8Dz/7/As79/wHM/f8ByPr/AcHz/wDD+v8K
+gaP/HBQV/xwZG/8cHyL/Gx0h/xweIf8cHiL/Gx4h/xweIv8cHiL/HB4i/xsdIf8ZGx7/Ezc//xcV
+F/8aFhj/Gh4h/xseIf8aHSH/GBwg/xcPD/8UHSH/BbHR/wHg//8A4v//DnaM/xsLC/8aHSH/Gx4i
+/xsfIv8bGh3/HBQV/xgvNf8Knrv/C5qy/wioyf8bJyv/Ek1f/wDG/P8Bxvn/Asn6/wLM/f8Dzv3/
+BND9/wPQ/v8D0f7/A9H+/wPQ/f8D0P7/A9b//wLQ/ewC0P3sAtb//wPQ/f8E0f3/BNH+/wPQ/v8D
+0P7/A8/+/wLN/v8By/z/AsP1/wDD+v8Glb3/Gxkb/xwYGv8cHyP/HB4i/xseIf8cHiL/HB4i/xse
+Iv8bHiH/HB4i/xseIf8cGBv/Fysy/wHT//8Ik67/FxcZ/xoREv8aHSH/GRwg/xgPEP8UHSH/BbHQ
+/wHh//8D0P7/Adn//wa12/8ZGhz/Ghse/xseIv8bHiL/Gx4h/xseIv8bGRv/Ghwf/xc1PP8ZKC7/
+GhYZ/x0ODP8OaYH/AMr//wLG9/8Cyvv/A839/wPP/f8D0P7/A9H+/wPR/v8D0P7/A9H9/wPX//8C
+0f3sAtD97ALW//8C0P7/A9H+/wPR/v8D0P7/A9D+/wPP/v8Czf3/Asj5/wHC9v8Cr+D/GC01/xwU
+Ff8cHiL/HB4i/xweIv8cHiH/HB4h/xweIv8cHiL/Gx4h/xseIf8cHiL/HRUX/xRBTP8FsNP/ANr/
+/wWszf8ULTP/GQwL/xcPEP8VHiH/BbDP/wHh//8D0P7/A9H+/wLS//8B3P//E0tZ/xwREv8bHiL/
+Gx4h/xseIf8bHiH/Gx4h/xscH/8cGRz/HBoc/xodIP8bGx7/HRQU/wiOsv8AzP//Asf4/wLL/P8D
+zf3/A8/9/wTQ/f8D0P7/A9H+/wPR/v8D1///AtH97ALQ/ewD1v//A9D9/wPR/v8D0f7/A9D9/wPP
+/f8Dzv3/Asv8/wHD9f8Aw/r/EVpw/x4PDv8cHyP/HR8j/x0fIv8cHiL/HB4i/xweIv8dHyL/HR8j
+/xweIv8cHiH/HB4i/xwSE/8QWmv/Emt8/wuRr/8A4///Ar/r/xA/TP8VGBr/Ba/O/wHh//8Cz/7/
+A9H+/wPR/v8D0f7/AeD//wqMqv8cDg7/Gx4i/xweIv8cHyL/HB4i/xweIv8cHyL/HB8i/xweIv8b
+HiL/Gx4i/x0WF/8ZLjb/Abfo/wHH+/8Cyvv/As39/wPP/f8E0P7/A9H+/wPR/v8D0f7/A9b//wLQ
+/ewC0P3sA9b//wPQ/f8D0P7/A9H+/wPQ/v8Dz/7/Asz9/wHH+f8Axvv/BZrD/xwZGv8cHB//HR8i
+/x0fI/8dHyP/HR8j/x0fI/8dHyP/HR8j/x0gI/8dHyP/HR8j/xweIv8cDw//DWt//xVba/8ZP0b/
+ANH+/wDE+f8Cs+P/BLfc/wHd//8C0P7/AtD+/wLQ/v8D0f7/A9H9/wLX//8Ew+3/GSUq/xwaHf8c
+HyL/HR8j/x0fI/8cHyL/HB8j/xweIv8cHiL/Gx4h/xweIv8bHiL/Hg4N/w5rhP8Azv//Asf5/wLM
+/f8Dzv3/A9D9/wPR/v8C0f7/A9H+/wPW//8C0P3sAtD97APW//8D0f7/A9H+/wPQ/f8Dz/3/As7+
+/wLM/P8Cxff/AMb7/xNRYv8fEhL/HR8j/x0fIv8dHyP/HR8j/x0fI/8eICP/HSAj/x4gJP8eICT/
+HR8j/x0fI/8cHyL/HA8P/wx5kP8WVmX/IAsJ/wqfwP8AxPb/Asv5/wHZ//8Cz/3/AtD+/wLQ/v8C
+0P7/A9D+/wPQ/v8C0f7/At7//xRUYv8dERH/HB8i/x0fI/8dHyP/HiAk/x0fI/8cHiL/HB4i/xwe
+Iv8cHyL/HB4i/xwZHP8aJiv/A7Ph/wHJ/P8Cy/z/A87+/wPQ/f8D0f7/AtH+/wPR/v8D1///AtD9
+7ALQ/ewD1v//A9H+/wPR/v8D0P7/A8/9/wLN/v8Cy/z/Acn9/wWjz/8cHiH/HR0g/x0fI/8dHyP/
+HR8j/x4gI/8dICP/HiAk/x4fI/8dHyP/HR8i/x0fIv8cHiL/HB4i/xwREv8MhZ7/F0VQ/yANDP8X
+SFL/ANr//wLW//8Cz/3/AtD9/wLQ/v8C0P7/A9D+/wLQ/v8C0P7/AtH+/wHf//8Lka7/HQ8P/xwe
+Iv8dHyP/HSAj/x4gI/8dHyP/HR8j/x0gI/8dHyP/HR8j/xweIv8cHyP/HhAP/wx3lP8Az///Asr7
+/wPO/f8Dz/3/A9D9/wPR/v8D0f7/A9f//wLR/ewC0P3sAtb//wPQ/f8D0P7/A9D9/wLO/v8Czf3/
+Asn6/wDM//8ObYj/HxAQ/x0fI/8eHyP/HR8j/x0fI/8eICT/HiAk/x4gI/8dHyP/HR4i/x0eIv8d
+HiL/HB4i/xsdIf8aFRb/C4mk/xk1PP8dGx3/HhIT/xBsgf8A3f//AdL//wLP/f8C0P3/A9D+/wPR
+/v8D0f7/AtH+/wLQ/f8B1f//BMbw/xopLv8dGhz/HR8j/xwfI/8dICP/HiAj/x4gJP8eICT/HiAj
+/x0fI/8dICP/HR8i/x4VFv8XP0v/Acb4/wLJ+/8Czf3/A879/wPQ/f8D0f7/A9H+/wPX//8C0P3s
+AtD97ALW//8D0P3/A9H+/wPQ/f8Dzv7/As39/wLI+v8Bwvb/Fz9M/x8WF/8eICP/HiAk/x4fI/8e
+ICT/HiAk/x4gJP8eICT/HR8j/x0eIv8dHyL/HB4h/xodIf8aERL/GBYZ/wmRrP8bGx3/HRod/x0e
+If8fDg7/EHCG/wDe//8C0///AtD9/wLQ/v8D0f7/A9H+/wLR/v8D0f3/AtD+/wDf//8SYHL/HhAQ
+/x0fI/8dICT/HSAj/x4gI/8eICT/HiAk/x4gJP8eICT/HiAk/x4gI/8eHSD/HR8i/wWq1P8Bzf//
+Asz9/wPP/f8D0P3/A9H+/wPR/v8D1///AtH97ALQ/ewD1v//A9H9/wPR/v8D0P7/A8/+/wLM/f8B
+y/7/Ba3Z/x0kKf8fHSD/HiAk/x4gJP8eICT/HiAk/x4gJP8eICT/HiAk/x4fI/8dHyL/Gx8i/xsZ
+G/8aCgr/FDE4/wieuf8C1fX/Dmt9/xsREf8cFRf/HB4h/x8QD/8QdYv/AN///wLT//8D0P3/A9D9
+/wPQ/f8D0f7/A9H+/wPQ/v8A3f//CaPE/x4UFf8eHyP/HiEk/x0gI/8eICP/HiAk/x4gJP8eICT/
+HiAk/x4gI/8dHyP/HR8j/yAUE/8Lh6f/ANH//wLL/P8Dzv3/A9D9/wPR/v8D0f7/A9b//wLR/ewC
+0P3sA9f//wPR/v8D0f7/A9D+/wPP/v8CzP3/AND//wmVuv8fFxj/HiAj/x4gJP8eICT/HiAk/x8g
+JP8fIST/HiAj/x4gI/8dHyP/HB0h/xwOD/8YGh3/DXSI/wLQ9v8A3v//AtT//wDh//8Inrn/Fyow
+/x0NDf8cHB//HxEQ/w94j/8A3///AtL//wLQ/f8C0P7/A9H9/wPR/f8D0f3/A9P//wLS+/8ZOEH/
+Hxga/x4gJP8eICP/HiAk/x8hJP8fISX/HyEk/x8hJP8eICT/Hh8j/x0gJP8gEhL/EWd9/wDS//8C
+y/z/A87+/wPQ/f8D0f7/AtH+/wPW//8C0P3sAtD97APW//8D0f7/A9H+/wPQ/f8Czv7/Asz8/wDT
+//8NgJ7/IBMT/x4gJP8eICT/HiAk/x4gJP8fISX/HyEl/x4gJP8dICP/HRYY/xsODv8STVn/BbfX
+/wDh//8C1P//As/9/wLQ/f8C0P//AN///wPJ7P8RWGb/HA8P/x0WGP8fERH/DnqS/wDg//8B0v//
+AtD9/wLQ/f8C0f3/A9H+/wPQ/f8A4f//EHaN/yAPD/8eICT/HiAk/x8hJf8fIib/HyEl/x4gJP8f
+ISX/HyEl/x4gI/8dHyP/HxQV/xVRYf8Az///Asv9/wPO/f8D0P3/A9H+/wPR/v8D1///AtD97ALQ
+/ewD1v//A9H+/wPR/v8D0P3/As79/wLL/P8A0///EHGK/yETE/8eICX/HiAl/x4gJP8eICT/HiEk
+/x8gJP8eICT/HRga/xgtM/8Jkav/ANv//wHa//8Cz/3/AtD9/wLQ/f8C0f7/A9D+/wPQ/v8C2P//
+Ad///wqQqP8ZIyj/Hg0N/x8REP8Ofpb/AOD//wHS//8C0P3/AtD9/wPR/v8C0P7/Adn//we13P8d
+HR//Hh4h/x4gJP8fIib/HyIm/x8hJf8eICT/HiAk/x8gJP8fICT/HR8i/x4WF/8XRVL/AMz//wLN
+/v8Czv7/A9D9/wPQ/f8D0f3/A9f//wLR/ewC0P3sAtX//wLQ/f8D0f7/A9D9/wLO/f8CzPz/ANX/
+/xJsg/8hExT/HiAk/x8hJP8fICT/HiAk/x8hJf8fISX/Hxwf/x0sMf8Dx/D/AOT//wHQ//8C0P3/
+AtD9/wLQ/f8C0P3/A9H+/wPR/f8D0f7/A9D9/wLS//8A4f//BMDh/xNOWv8eCwr/HwwL/w6Cmv8A
+4f//AtL//wLQ/f8C0f7/A9H+/wPS/v8B2v//F0xZ/x8UFf8fISX/HyEl/x8hJf8fISX/HyEk/x4g
+JP8fISX/HyAk/x0fI/8fFxn/GUFM/wHM/v8Czf//A879/wPQ/f8D0P3/AtD9/wPW//8C0f3sAtD9
+7ALW//8C0P3/A9H9/wPQ/f8Czv3/Acz9/wDW//8Tb4b/IhMU/x4gI/8eICT/HiAk/x8hJf8fICX/
+HyEk/x8dIP8eJyv/CqPE/wDY//8A3v//Adf//wLR//8C0P3/AtD9/wLQ/f8C0P3/AtD9/wLQ/f8C
+0P7/A9D+/wLa//8B3P//DIWb/xsaHf8gBAH/DoSc/wDh//8B0f//AtD+/wLR/f8D0P7/Ad///w2N
+qf8gERH/HiAk/x4hJf8fISX/HyEl/x8gJP8fISX/HyEl/x4gJP8eICT/HxcY/xlET/8Bzv//As7/
+/wPP/f8D0P3/A9D9/wLQ/f8C1v//AtD97ALQ/ewC1v//A9D9/wPQ/f8D0P3/A8/9/wLM/f8A1///
+D3yX/yITFP8fISX/HyAl/x8hJf8fISX/HyEl/x8hJf8fISX/Hx0g/x8aG/8ZQkz/D4CW/wW63v8A
+2v//AN7//wHV//8C0P7/AtD+/wPR/v8C0P3/AtD9/wLQ/f8D0P7/A9P//wHj//8FuNj/FkNM/yAA
+AP8NgZr/AOL//wLR/v8C0P3/AtD+/wHW//8Exe//HCku/x8bHv8eICT/HyAl/x8hJf8fICT/ICEl
+/x8hJf8fIST/HiAk/yAVF/8XTlz/ANP//wLO/v8Dz/3/A9D9/wPR/f8D0P3/A9b//wLQ/ewC0P3s
+Atb//wLR/v8C0P7/A9H+/wPQ/f8Czf3/ANb//wuSs/8hFRb/HyAl/yAiJv8gIib/ICIm/yAiJv8g
+ISX/HyEl/x8hJf8fHiP/IBYZ/yEREf8fIiX/F1Bc/w2Op/8Dw+n/AN3//wDd//8B1P//AtH+/wLR
+/v8C0P3/AtH9/wPR/v8D0P7/Atz//wLb//8Oeo7/HQ4N/w5+lP8A4v//AtH//wLQ/v8C0f7/AN//
+/xRfcP8gEhL/HyEl/x8gJf8fISX/HyAl/x8hJf8fISX/HyEl/x4fI/8gEhP/FGN2/wDY//8Czf3/
+A8/9/wPQ/f8D0f7/A9H+/wPW//8C0P3sAtD97APW//8D0P7/A9D+/wPR/v8D0P7/As39/wDT//8G
+rdb/IB8i/x8fI/8gISb/ICEm/yAiJv8gIib/ICIm/x8hJf8fICX/HyEl/x4gJP8eICT/Hx0g/yAU
+Fv8hEhP/Hiou/xZcaf8LmLP/A8nw/wDe//8A3P//AtT//wLQ/v8C0P3/A9H9/wPQ/v8D1P//AOL/
+/wavzf8YNz3/DnyS/wDe//8C0v//AtD9/wDd//8KocL/IBUW/x8gJP8fISX/HyEl/x8gJP8fISX/
+HyEk/x8gJP8eICP/IhMT/w+Cnf8A2f//A879/wPQ/f8D0P3/A9H+/wPR/v8C1v//AtH97ALP/ewD
+1f//A9D9/wPQ/f8D0P3/A9D9/wLO/f8Bz///Acn3/xw2P/8hGh3/ICEm/yAhJf8fISX/ICIm/yEi
+J/8gISb/ICEl/x8hJf8fISX/HyAl/x8gJP8fICX/HyEl/yAdIP8iExX/IRQV/x0vNP8UZHP/Cp+9
+/wLN9f8A3///ANv//wLT//8D0P3/A9D9/wPQ/v8B3f//A9T4/xBvgP8LiaL/AdX7/wLR/v8C0///
+AtH6/xs3P/8gGRv/HyEl/x8hJf8fISX/ICEm/yAhJf8fICX/Hh8j/yAaHP8HqM7/Adb//wPP/f8D
+0P3/A9D9/wPQ/v8C0f7/Atf//wLR/ewC0P3sAtb//wPQ/f8C0P3/AtD9/wPQ/v8Dz/3/As39/wDa
+//8TZXr/IhIT/x8hJv8fISX/HyAl/yAiJv8gIib/ICIm/yAhJv8gIib/ICIm/yAhJf8gISX/HyEl
+/yAhJf8gISX/HyEl/x8hJf8gGx//IhMU/yIWF/8dNTv/E2t8/wmmxP8C0fr/AN///wDa//8D0///
+A9D9/wLU//8A3f//CKjJ/wa01/8C1P7/AtH+/wDh//8Rdov/IRAR/x8gJf8gISb/ICIm/yAhJf8g
+ISX/HyEl/yAaHP8bNz//Asv4/wLQ//8D0P3/A9D9/wPR/f8D0f7/A9H+/wPX//8C0f3sAtD97ALW
+//8D0P3/AtD+/wLQ/v8D0f7/A9D9/wLO/f8A1///CaPI/yIYGf8fICT/HyEl/x8hJv8hIif/ICEm
+/yAhJv8gISb/ICIm/yAiJv8gISX/HyEl/yAhJf8gISX/ICEl/x8hJf8fISX/ICIm/yEiJv8gISX/
+IRse/yISE/8hGBn/HDpB/xJvgf8Iqcj/AtH7/wDf//8A2v//AtP//wHX//8Dz/v/AtD9/wLQ/f8B
+2f//CLPZ/x8dH/8gHyP/ICIm/yAiJv8gISX/ICEl/x8hJf8iERH/EXCF/wDc//8Dzv3/A9D9/wPR
+/f8D0f7/A9H+/wPR/v8D1///AtD97ALQ/ewC1v//AtD9/wLQ/v8D0f7/A9H+/wPR/f8Dz/3/As/+
+/wDT/v8aRE//IhcZ/yAiJv8gIif/ISIn/yEiJ/8hIyf/ISMo/yEiJv8gIib/ICEm/x8hJf8fISX/
+ICIm/yAiJv8gIib/ICEm/yAiJv8hIif/ISIn/yEiJv8gIib/ICAk/yEaHP8jEhP/IRoc/xw8RP8T
+cYT/CarK/wLR+/8A3///ANr//wLT//8C0P3/AdH//wHZ//8YSFT/IRUX/yAhJf8hIib/ICEl/x8h
+Jf8gHiL/IB4h/wWz3P8B1v//A8/9/wPQ/f8D0f7/A9H+/wPR/v8D0f7/A9f//wLR/ewC0P3sAtb/
+/wPR/v8D0f7/A9H+/wPR/f8D0f3/A9D9/wPO/f8A2v//DJe5/yMUFf8fISb/ICIn/yEiJ/8hIib/
+ISMn/yEjJ/8gIif/ISIn/yEiJ/8hIib/ICEm/yEiJv8gIib/ISIn/yAiJv8gIib/ISIn/yEiJ/8h
+Iif/ISIn/yAiJv8hIif/ICIn/yEhJf8iGx7/JBMU/yIbHf8cO0P/E3CD/wmnx/8Cz/j/AN7//wDb
+//8A4v//DYyn/yEUFP8gISX/ICIm/yAiJv8fISb/IhES/xRgcv8A2///A8/+/wPQ/f8C0P3/AtH+
+/wPR/v8D0f7/A9H+/wPX//8C0f3sAtD97ALW//8D0f7/A9H+/wPR/v8D0f3/AtD+/wPQ/f8Dz/3/
+Ac7+/wDX//8ZT13/IxQV/yAjKP8gIif/ISIn/yAiJ/8iIyf/ISIn/yEjJ/8hIif/ISIn/yEiJ/8h
+Iif/ISMn/yEiJ/8hIif/ICIm/yEiJ/8hIib/ISIn/yEiJ/8hIib/ISIn/yEiJv8gIib/ISIm/yEi
+J/8hISX/IRkc/yMSE/8iGhz/HTlA/xRsfv8KosH/AdX5/wa84v8hIST/IB8j/yAhJv8gIib/IRwf
+/x8kKP8FvOP/Adf//wPQ/f8D0P7/AtD9/wLR/v8C0f3/A9H9/wPR/v8D1v//AtH97ALQ/ewC1v//
+AtD9/wPR/v8D0f7/AtD+/wLQ/v8D0P7/A9D9/wPP/f8B1///Brne/yEjJ/8iHB//ISMn/yEjKP8i
+Iyj/ISIn/yEiJ/8hIif/ISIn/yEiJ/8hIif/ISMn/yEjKP8hIyf/ISIn/yAiJv8hIif/ISIm/yEi
+J/8hIif/ISIn/yEiJ/8hIyf/ISMn/yEiJ/8hIif/ISMn/yEiJ/8gIib/ISEm/yIbHv8jExT/Ihga
+/xw7Q/8aQk3/ICAk/yAhJf8hIib/ISEl/yMREv8OiKT/AN///wPQ/f8D0P3/A9H9/wPR/v8C0f7/
+AtH9/wPR/f8C0f3/A9b//wLQ/ewC0P3sAtb//wLQ/f8D0f3/A9H+/wPQ/v8D0f7/A9H9/wPR/f8D
+0P3/A8/9/wDe//8Nk7D/IxUV/yIgJP8iIyj/IiQp/yEjJ/8hIif/ISIn/yEjJ/8hIyf/ISMo/yEj
+J/8hIyj/IiMo/yIjKP8hIif/ISIn/yEiJ/8hIyf/IiIn/yIjKP8hIif/ISIn/yEjJ/8iIyj/ISMn
+/yEjKP8hIif/ISMn/yEjJ/8hIyf/ICIn/yAhJf8hGh7/Ihod/yEjJ/8hIif/ISIm/yMPEP8UXnD/
+Adz//wPR/v8D0P3/A9H+/wPR/v8D0f7/A9H9/wPR/v8D0f7/AtH+/wPX//8C0f3sAtD97APW//8D
+0f3/A9H9/wPR/f8D0P3/A9D9/wPR/f8D0f7/A9D9/wPQ/f8D0P7/AN///xF6kv8kEhL/IiEl/yEj
+KP8hIyj/ISMo/yEjKP8iIyj/ISMo/yIjKP8iIyj/ISMo/yIjKP8iIyj/IiMn/yIjKP8iIyf/IiMn
+/yIjKP8iIyj/ISMn/yIjKP8iIyf/IiQp/yIkKP8iJCj/ISMo/yIkKP8iIyj/ISMo/yEiJ/8hIif/
+ISIn/yIjJ/8hIyf/ICMn/yMQEf8YSlb/AtT5/wLW//8D0P3/A9D9/wLR/v8D0f3/A9H9/wPR/f8D
+0f7/A9H+/wPR/v8D1///AtH97ALQ/ewC1v//AtD9/wPR/v8D0f7/A9H+/wPR/f8D0f3/A9D+/wLQ
+/v8D0f7/A9H+/wLT//8A3f//EnWL/yQTFP8iHyP/IiQp/yIjKP8iJCn/IiMo/yIjKP8iJCn/IyQp
+/yIkKf8iIyn/IiMo/yIjKP8iIyj/IiMo/yIkKP8iIyj/ISMo/yIjKP8hIyj/IiMn/yIjKP8iJCn/
+IiQo/yIjKP8iIyj/IiQp/yIjKP8iJCj/ISMo/yIjKP8iIyj/ISIn/yMQEf8ZSVX/A9D0/wLZ//8D
+0P7/A9H9/wPR/f8D0P3/A9D+/wPR/f8D0f3/A9H9/wPR/v8D0f7/A9f//wLR/ewCz/3sAtb//wLQ
+/f8D0f7/A9H+/wPR/f8D0f7/A9H9/wPQ/f8C0f7/A9H+/wPR/v8D0f3/A9P//wDe//8PhZz/JBsd
+/yQbHv8iJCn/IiMo/yIjKP8iIyj/IiMo/yMkKf8kJSn/IyQp/yIjKP8iIyj/IyQp/yMlKv8jJCn/
+IiMo/yIjJ/8iIyj/IiMo/yIjKP8iIyj/IiQp/yIkKf8hIyj/ISMo/yIjKP8iIyj/IiMo/yIjKP8i
+JCn/Ix8j/yMREv8WW2r/AtP4/wHZ//8D0P3/A9H9/wPR/v8D0f3/A9D9/wLQ/f8D0f7/BNH+/wPR
+/f8D0f7/AtH+/wPX//8C0f3sAs/97ALW//8C0P7/AtD+/wLQ/v8C0P3/A9H+/wPR/v8D0f7/A9H9
+/wPR/v8D0f7/A9H+/wPQ/f8D0v//AOD//wulwf8gMzn/JRMV/yIhJf8iIyj/IiMo/yIjKf8jJCn/
+IiQp/yIkKf8iIyj/IiMo/yIkKf8iJCn/IyQp/yMkKP8iJCj/IyQp/yIkKf8jJCn/IyQp/yMkKf8j
+JCn/IyQp/yIjKP8jJCn/IiQo/yIjKP8jJCj/JBYZ/yIfIv8QgZf/Adz//wHW//8D0P7/A9H+/wPR
+/v8D0f7/A9H+/wPQ/v8C0P3/A9H+/wPR/v8D0f7/A9H+/wPR/f8D1///AtH97ALQ/ewD1v//AtH+
+/wLQ/v8C0P3/A9H9/wPR/f8D0f3/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f3/A9H9/wPQ/v8B3v//
+BMvu/xZoeP8jHB//JBUX/yIhJv8iJCn/IiQo/yIkKP8iJCj/IiQp/yIkKf8jJCn/IiMo/yIkKP8j
+JCj/IyQp/yMkKf8jJCn/IyUp/yMkKf8jJCn/IyQp/yMkKf8jJCn/IyQp/yIjKP8jGRz/JBQW/xpJ
+VP8IstH/AOH//wLT//8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+
+/wPR/v8D0f3/A9f//wLR/ewC0P7sA9b//wLQ/v8C0P7/A9H9/wPR/f8D0f7/A9H+/wPR/f8D0f7/
+A9H+/wPS/v8D0v3/A9H+/wPR/v8D0f7/A9D+/wLX//8A4P//Ca/N/xlXZP8jHiH/JRQW/yQdIf8i
+Iyj/IyQp/yMkKf8jJCn/IyQp/yMkKf8iIyj/IiMo/yMkKf8jJCn/IiQp/yIkKf8jJCn/IyQp/yIk
+Kf8iJCn/IyAk/yQWGP8kFxn/HEBJ/w2Vrf8C2v//Adz//wPQ/v8D0f7/A9H+/wPS/v8D0f7/A9H+
+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9L+/wPS/v8D0f7/A9D9/wPW//8C0f7sAs767ALW//8C0f7/
+AtD9/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0v7/A9H+/wPR/v8D0f7/A9L+/wPR/v8D
+0f7/A9H+/wHb//8B3f//CLLS/xVugP8fNz7/JRwe/yYVF/8kGRz/Ix0h/yMhJf8jIyj/IiMo/yMk
+Kf8jIyj/IyQp/yMjKP8jISb/JB8j/yQbHf8lFRf/JBcZ/yEsMP8YWmn/C5+6/wLV/f8A3///AtP/
+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f3/A9H9/wPR/v8D0f7/A9H+/wPR/v8D0f7/
+A9H+/wPQ/v8D1v//As/77ALD7uwC2P//AtD+/wLQ/v8C0f3/A9H+/wPR/v8D0f7/A9H+/wPR/v8D
+0f7/A9H+/wPR/v8C0f7/A9H+/wPR/v8D0f7/A9H9/wPR/f8D0f3/A9H//wHa//8A3///A832/wum
+xf8TeY3/GlJf/x84P/8iKCz/JB8j/yUcHv8kGRv/JBkb/yQbHf8kHyL/IiYq/x80Ov8aSlX/FW1/
+/w2ZtP8Ew+n/AN3//wDd//8C0///A9H+/wLR/v8C0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/
+A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H9/wPR/f8D0f7/A9j//wLF7+wCtNvsAtv//wLQ/v8D
+0P7/A9H+/wPR/v8D0v3/A9H+/wPR/v8D0v7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR
+/v8D0f7/A9H9/wPR/v8D0f7/A9D+/wLT//8B2///AOD//wHa//8Ezff/B7zi/wqt0P8LocH/DZq4
+/w2auP8MoL//CqvM/wi53f8EyvL/Adf//wDf//8B3v//Atb//wLR//8D0f7/A9H+/wPR/f8C0f3/
+A9H9/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/BNH+/wPR/v8D
+0f7/A9H+/wPb//8CtdzsApi37ALg//8C0P3/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR
+/v8D0f7/A9L+/wPR/v8D0f3/A9H9/wPR/f8D0v7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+
+/wPR/v8D0v//A9T//wLX//8B2v//Adz//wHd//8B3f//Adz//wHb//8C2P//AtX//wPT//8D0v7/
+A9H+/wPR/v8D0f7/A9H+/wLR/v8C0f3/A9H9/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D
+0f7/A9H+/wPR/f8D0f7/A9H+/wTS/v8D0v7/A9H+/wPR/f8D4P//Apm67ABleewD4///A9D+/wPR
+/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPS/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+
+/wPR/v8D0f7/A9H+/wPS/v8D0v7/AtH+/wPR/v8C0f7/A9H+/wPR/v8D0f7/A9L9/wPR/v8D0f7/
+A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0v7/A9H+/wPR/v8D0f7/A9H+/wPR/f8D
+0f7/A9H9/wPR/f8D0f7/A9H+/wLR/f8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR
+/f8D0f7/A+P//wBne+wAICbsA9P9/wPU//8D0f7/A9H+/wPR/v8D0f3/BNH9/wPR/f8D0f3/A9H9
+/wPR/f8D0f3/A9H+/wPS/v8D0v7/A9H+/wPR/f8D0f7/A9H+/wPR/v8D0f7/AtH+/wPR/v8D0f7/
+A9H+/wPR/v8D0f7/A9L+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wLR/v8D0f7/A9H+/wPR/v8D
+0f7/A9H9/wPR/v8D0f7/A9H+/wPR/v8D0f7/AtH+/wPR/v8D0f3/A9H+/wPR/v8D0f7/A9H9/wPR
+/v8D0f7/A9H+/wPR/v8D0f3/A9H+/wPR/v8D0f7/A9T//wPS/P8AICbsAAAA7AKMqv8D4///A9D+
+/wPR/v8D0f7/A9H9/wPQ/f8D0f3/A9H9/wPQ/f8D0f7/A9H+/wPR/f8D0v7/A9L+/wPR/v8D0f3/
+A9H9/wLR/v8D0f3/AtD9/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9L+/wPS/v8D0f7/A9H+/wPR/v8D
+0f7/A9L+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8C0f7/A9H+/wPR/v8D0v7/A9H+/wPR
+/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/f8D0f3/A9L+/wPS/v8D0f7/A9H+/wPR/v8D0P7/A9D+
+/wPj//8CjKr/AAAA7AAAAOwAHCL/A8/2/wPY//8C0P7/A9H+/wPR/f8D0P3/A9D9/wPQ/f8D0P3/
+A9H+/wPR/v8D0f7/A9H+/wLR/v8D0f7/A9H+/wPR/f8D0f3/A9H9/wPQ/f8D0f3/A9H+/wPS/v8D
+0f7/A9H+/wPS/v8D0f7/A9H+/wPR/f8D0f7/A9L+/wPR/v8D0f7/A9H+/wPR/v8D0f3/A9H+/wPR
+/v8D0f3/A9H9/wPR/f8D0f7/A9H+/wPR/v8D0f7/A9L+/wPR/v8D0f7/A9H9/wPR/f8D0P3/A9H9
+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9D+/wPY//8DzvX/ARwi/wAAAOwAAADsAAAA/wFLXP8D4f//
+AtT//wPQ/f8D0f7/A9H9/wLR/f8D0P3/A9D9/wPR/f8D0f7/A9H+/wPR/v8D0f3/A9H+/wPR/f8D
+0f3/A9H+/wPR/v8D0f3/AtD+/wPR/v8D0v7/A9L+/wPS/v8D0f7/A9H+/wPR/v8D0f7/A9L+/wPS
+/v8D0f7/A9H+/wPS/v8D0v7/A9L+/wPS/v8D0v7/A9H+/wPR/v8D0f3/A9H+/wPR/v8D0f7/A9H+
+/wPS/v8D0f7/A9H+/wPR/v8D0f7/A9H9/wPR/f8D0f7/A9H+/wPR/v8D0f3/A9D9/wPV//8D4f//
+AUtd/wAAAP8AAADsAAAA7AAAAP8AAAD/AV91/wLg//8C1///A9D+/wPR/v8D0f3/A9H+/wPR/v8D
+0f7/A9H+/wPR/v8D0f7/A9D9/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H9/wLR/v8C0f3/A9H+/wPR
+/v8D0f7/A9H9/wPR/f8D0f3/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0v7/A9L+/wPS/v8D0v3/A9H+
+/wPR/v8D0f7/A9H9/wPR/f8D0f3/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H9/wPR/v8D0f3/
+A9H+/wPR/v8D0f7/A9D9/wPX//8E4f//AmB1/wAAAP8AAAD/AAAA7AAAAOwAAAD/AAAA/wAAAP8B
+Tl//As7z/wLi//8D1P//A9D+/wPR/v8C0f7/AtH+/wPR/v8C0f7/A9D9/wPR/f8D0f7/AtH+/wLQ
+/f8D0f7/A9H+/wPR/f8C0f7/A9H+/wPR/v8D0f7/A9H9/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+
+/wPS/f8D0f7/A9H+/wPS/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/A9H+/wPR/v8D0f7/
+A9H+/wPR/v8D0f7/A9H9/wPR/v8D0f7/A9H9/wPR/v8D0P7/A9T//wPj//8Ez/P/Ak9f/wAAAP8A
+AAD/AAAA/wAAAOwAAADyAAAA/wAAAP8AAAD/AAAA/wEfJ/8Cj6j/AtP7/wPj//8D3///Atr//wLX
+//8C1///Atb//wPX//8C1///A9f//wPX//8D1v//A9f//wPX//8D1///A9f//wPX//8D1v//A9f/
+/wPX//8D1///A9f//wPX//8D1///A9f//wPX//8D1///A9f//wPX//8D1///A9f//wPX//8D1///
+A9f//wPX//8D1///A9f//wPX//8D1///A9f//wPX//8D1///A9b//wPW//8D1///A9j//wLa//8D
+3///A+L//wPT/P8Dkan/ASAn/wAAAP8AAAD/AAAA/wAAAP8AAADyAAAA2wAAAOwAAADsAAAA7AAA
+AOwAAADsAAAA7AAkK+wAaHnsApm37AK02+wAxO7sAs767ALR/ewC0P3sAtD97ALR/ewC0f3sAtD9
+7ALQ/ewC0f3sAtH97ALR/ewC0f3sAtD97ALR/ewC0f3sAtH97ALR/ewC0f3sAtH97ALR/ewC0f3s
+AtH97ALR/ewC0f3sAtH97ALR/ewC0f3sAtD97ALR/ewC0f3sAtD97ALQ/ewC0f3sAtD97ALQ/ewC
+0f3sAtH97ALQ/ewC0f3sAs767ALF7+wCtdzsApm57ABpe+wAJi3sAAAA7AAAAOwAAADsAAAA7AAA
+AOwAAADsAAAA2wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAA
+'@
+
+function Get-AppIcon {
+    # 1) 옆에 있는 app.ico (가장 선명합니다)
+    try {
+        $iconPath = Join-Path $AppDir 'app.ico'
+        if (Test-Path -LiteralPath $iconPath) { return (New-Object System.Drawing.Icon($iconPath)) }
+    } catch { }
+    # 2) 프로그램 안에 담아 둔 아이콘
+    try {
+        $bytes = [Convert]::FromBase64String(($script:AppIconBase64 -replace '\s', ''))
+        $stream = New-Object System.IO.MemoryStream(,$bytes)
+        return (New-Object System.Drawing.Icon($stream))
+    } catch { }
+    # 3) 실행 파일에 박힌 아이콘 (크기가 하나뿐이라 조금 흐릴 수 있습니다)
+    try {
+        if ($script:IsExe -and $script:HostPath) { return [System.Drawing.Icon]::ExtractAssociatedIcon($script:HostPath) }
+    } catch { }
+    return $null
+}
+
+# 작업 표시줄이 이 프로그램을 파워셸이 아니라 별개의 프로그램으로 보게 합니다.
+try { [NativeKakao]::SetAppId('KakaoSender.Broadcaster') } catch { }
 try {
-    $iconPath = Join-Path $AppDir 'app.ico'
-    if ($script:IsExe -and $script:HostPath) {
-        $script:form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($script:HostPath)
-    } elseif (Test-Path -LiteralPath $iconPath) {
-        $script:form.Icon = New-Object System.Drawing.Icon($iconPath)
-    }
+    $script:appIcon = Get-AppIcon
+    if ($null -ne $script:appIcon) { $script:form.Icon = $script:appIcon }
 } catch { }
 $script:form.Font = $FontBase
 
@@ -6714,8 +7933,14 @@ $btnCancelArm = New-AppButton $cardSend '예약 취소' 350 206 150 42
 $btnSave      = New-AppButton $cardSend '설정 저장' 508 206 120 42 'ghost'
 $btnGoPaceSettings = New-AppButton $cardSend '설정에서 바꾸기' 636 206 124 42
 $btnCancelArm.Enabled = $false
-$script:lblCountdown = New-CardLabel $cardSend '예약이 설정되지 않았습니다.' 24 256 736 24 $FontStrong $Theme.Muted
+$script:lblCountdown = New-CardLabel $cardSend '예약이 설정되지 않았습니다.' 24 256 380 24 $FontStrong $Theme.Muted
 
+# 중간에 꺼졌거나 실패한 방이 있을 때 쓰는 단추입니다.
+# 이미 보낸 방과 이미 나간 사진은 다시 보내지 않습니다.
+$script:btnResumeRun = New-AppButton $cardSend '이어서 발송' 412 252 174 32
+$script:btnRetryFailed = New-AppButton $cardSend '실패한 방만 다시 보내기' 594 252 166 32
+$script:btnResumeRun.Enabled = $false
+$script:btnRetryFailed.Enabled = $false
 # ----- 발송 진행 상황 -----
 # 보내는 동안 여기만 보고 있으면 됩니다. 스크롤할 필요가 없어야 합니다.
 $cardProgress = New-Card $pageRun 28 316 784 322 '발송 진행 상황' '방마다 어디까지 갔는지 보여 줍니다. 실패한 방은 까닭도 적습니다.'
@@ -7172,6 +8397,7 @@ function Get-SelectedGroupName {
 # 저장된 목록에서 방 하나를 골라 이름을 돌려줍니다.
 function Show-RoomPicker([string]$Title) {
     $dialog = New-Object System.Windows.Forms.Form
+    try { if ($null -ne $script:appIcon) { $dialog.Icon = $script:appIcon } } catch { }
     $dialog.Text = $Title
     $dialog.ClientSize = (New-UiSize 520 520)
     $dialog.StartPosition = 'CenterParent'
@@ -7433,6 +8659,7 @@ $btnPickSchedule.Add_Click({
 function Show-HolidayManager {
     $year = (Get-Date).Year
     $dialog = New-Object System.Windows.Forms.Form
+    try { if ($null -ne $script:appIcon) { $dialog.Icon = $script:appIcon } } catch { }
     $dialog.Text = "$($year)년 공휴일 설정"
     $dialog.ClientSize = (New-UiSize 640 520)
     $dialog.StartPosition = 'CenterParent'
@@ -8140,6 +9367,7 @@ $btnVerifyRoom.Add_Click({
 # 달력에서 예약 시각을 고릅니다.
 function Show-SchedulePicker([datetime]$Current) {
     $dialog = New-Object System.Windows.Forms.Form
+    try { if ($null -ne $script:appIcon) { $dialog.Icon = $script:appIcon } } catch { }
     $dialog.Text = '예약 시각 고르기'
     $dialog.ClientSize = (New-UiSize 560 470)
     $dialog.StartPosition = 'CenterParent'
@@ -8234,6 +9462,7 @@ function Show-SchedulePicker([datetime]$Current) {
 function Show-SendConfirm([string]$Action) {
     $rooms = @($script:roomEntries | Where-Object { $_.Checked })
     $dialog = New-Object System.Windows.Forms.Form
+    try { if ($null -ne $script:appIcon) { $dialog.Icon = $script:appIcon } } catch { }
     $dialog.Text = $Action
     $dialog.ClientSize = (New-UiSize 600 620)
     $dialog.StartPosition = 'CenterParent'
@@ -8429,7 +9658,7 @@ function Start-RepeatIfNeeded {
     Set-StatusPill "반복 대기 — $($next.ToString('HH:mm')) 에 다시" 'wait'
 }
 
-function Start-BroadcastAsync {
+function Start-BroadcastAsync([string[]]$Targets = $null, [bool]$Resume = $false) {
     if ($script:running) { return }
     $script:running = $true
     $script:armed = $false
@@ -8443,8 +9672,9 @@ function Start-BroadcastAsync {
     $btnHeaderEdit.Enabled = $false
     Update-RunButtons
     try {
-        $count = Invoke-Broadcast
+        $count = Invoke-Broadcast $Targets $Resume
         Set-StatusPill "작업 완료 · 성공 $($count)개" 'done'
+        Show-RunResult
         Start-RepeatIfNeeded
     } catch {
         Write-RunLog "작업 중단: $($_.Exception.Message)"
@@ -8457,8 +9687,61 @@ function Start-BroadcastAsync {
         $script:running = $false
         $script:pauseRequested = $false
         Update-RunButtons
+        Update-ResumeButtons
         $script:form.Activate()
     }
+}
+
+# 끝난 뒤 결과를 한눈에 보여 줍니다. 숫자가 맞는지 여기서 바로 확인하실 수 있습니다.
+function Show-RunResult {
+    $r = $script:lastRunResult
+    if ($null -eq $r) { return }
+    $lines = @()
+    $lines += "전체 대상: $($r.Total)개"
+    $lines += "성공:      $($r.Sent)개"
+    $lines += "실패:      $($r.Failed)개"
+    $lines += "누락:      $($r.Missing)개"
+    $lines += ''
+    if ($r.DryRun) {
+        $lines += '확인 전용이라 실제로 보낸 것은 없습니다.'
+    } else {
+        $lines += "발송 사진: $($r.Photos)장"
+        $lines += "발송 파일: $($r.Files)개"
+        $lines += "메시지:    $($r.Messages)건"
+    }
+    if ($r.Missing -ne 0) {
+        $lines += ''
+        $lines += '[주의] 누락이 0이 아닙니다. 실행 기록을 확인해 주세요.'
+    }
+    if (@($r.FailedRooms).Count -gt 0) {
+        $lines += ''
+        $lines += "[실패한 채팅방 $(@($r.FailedRooms).Count)개]"
+        $lines += ((@($r.FailedRooms) | Select-Object -First 15) -join "`r`n")
+        if (@($r.FailedRooms).Count -gt 15) { $lines += "… 외 $((@($r.FailedRooms).Count) - 15)개" }
+        $lines += ''
+        $lines += '[보내기] 화면의 [실패한 방만 다시 보내기] 로 이 방들만 다시 보낼 수 있습니다.'
+    }
+    $title = if ($r.Missing -eq 0) { '발송 완료 — 빠진 방 없음' } else { '발송 완료 — 확인 필요' }
+    [System.Windows.Forms.MessageBox]::Show(($lines -join "`r`n"), $title) | Out-Null
+}
+
+# 이어서 발송 · 실패한 방만 다시 보내기 단추를 켜고 끕니다.
+function Update-ResumeButtons {
+    try {
+        $failed = @()
+        if ($null -ne $script:lastRunResult) { $failed = @($script:lastRunResult.FailedRooms) }
+        if ($null -ne $script:btnRetryFailed) {
+            $script:btnRetryFailed.Enabled = ((-not $script:running) -and $failed.Count -gt 0)
+            $script:btnRetryFailed.Tag.Label = if ($failed.Count -gt 0) { "실패한 $($failed.Count)개 다시 보내기" } else { '실패한 방만 다시 보내기' }
+            $script:btnRetryFailed.Invalidate()
+        }
+        if ($null -ne $script:btnResumeRun) {
+            $left = @(Get-ResumableRooms (Import-RunProgress))
+            $script:btnResumeRun.Enabled = ((-not $script:running) -and $left.Count -gt 0)
+            $script:btnResumeRun.Tag.Label = if ($left.Count -gt 0) { "이어서 발송 ($($left.Count)개 남음)" } else { '이어서 발송' }
+            $script:btnResumeRun.Invalidate()
+        }
+    } catch { }
 }
 
 $btnSave.Add_Click({ Sync-ConfigFromForm; Write-RunLog '설정을 저장했습니다.'; Set-StatusPill '설정 저장됨' 'done' })
@@ -8541,6 +9824,59 @@ $btnTestDry.Add_Click({
 })
 
 # ----- 카카오톡 연결 확인 -----
+
+# ----- 이어서 발송 · 실패한 방만 다시 보내기 -----
+$script:btnResumeRun.Add_Click({
+    try {
+        $saved = Import-RunProgress
+        $left = @(Get-ResumableRooms $saved)
+        if ($left.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('이어서 보낼 방이 없습니다.', '이어서 발송') | Out-Null
+            return
+        }
+        Sync-ConfigFromForm
+        # 문구가 바뀌었으면 이어서 보내면 안 됩니다. 앞뒤가 다른 글이 나갑니다.
+        $mark = Get-MessageFingerprint ([string]$script:config.Message)
+        if ([string]$saved.MessageMark -and [string]$saved.MessageMark -ne $mark) {
+            $ask = "저장된 발송과 지금 문구가 다릅니다." + "`r`n`r`n" +
+                   "이어서 보내면 앞에 보낸 것과 다른 글이 나갑니다." + "`r`n`r`n" +
+                   "그래도 이어서 보낼까요?"
+            if ([System.Windows.Forms.MessageBox]::Show($ask, '이어서 발송', 'YesNo', 'Warning') -ne 'Yes') { return }
+        }
+        $ask2 = "저장된 발송을 이어서 진행합니다." + "`r`n`r`n" +
+                "· 남은 방: $($left.Count)개" + "`r`n" +
+                "· 시작한 때: $([string]$saved.StartedAt)" + "`r`n`r`n" +
+                "이미 보낸 방과 이미 나간 사진은 다시 보내지 않습니다." + "`r`n`r`n" +
+                "계속할까요?"
+        if ([System.Windows.Forms.MessageBox]::Show($ask2, '이어서 발송', 'YesNo', 'Question') -ne 'Yes') { return }
+        Restore-RunProgress $saved
+        Show-AppPage 'run'
+        Start-BroadcastAsync $left $true
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '이어서 발송 실패') | Out-Null
+    }
+})
+
+$script:btnRetryFailed.Add_Click({
+    try {
+        $failed = @()
+        if ($null -ne $script:lastRunResult) { $failed = @($script:lastRunResult.FailedRooms) }
+        if ($failed.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('다시 보낼 실패한 방이 없습니다.', '실패한 방만 다시 보내기') | Out-Null
+            return
+        }
+        Sync-ConfigFromForm
+        $ask = "실패한 방 $($failed.Count)개에만 다시 보냅니다." + "`r`n`r`n" +
+               ((@($failed) | Select-Object -First 10) -join "`r`n")
+        if ($failed.Count -gt 10) { $ask += "`r`n… 외 $($failed.Count - 10)개" }
+        $ask += "`r`n`r`n이미 나간 사진은 다시 보내지 않습니다. 계속할까요?"
+        if ([System.Windows.Forms.MessageBox]::Show($ask, '실패한 방만 다시 보내기', 'YesNo', 'Question') -ne 'Yes') { return }
+        Show-AppPage 'run'
+        Start-BroadcastAsync $failed $true
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '다시 보내기 실패') | Out-Null
+    }
+})
 function Update-KakaoStateLabel {
     $lines = New-Object System.Collections.Generic.List[string]
     $ready = Test-KakaoReady
@@ -8752,6 +10088,7 @@ function Show-GuideTour([string]$CaptureDir = '') {
     $total = $script:TourSteps.Count
 
     $tour = New-Object System.Windows.Forms.Form
+    try { if ($null -ne $script:appIcon) { $tour.Icon = $script:appIcon } } catch { }
     $tour.FormBorderStyle = 'None'
     $tour.Size = (New-UiSize 600 440)
     $tour.StartPosition = 'Manual'
@@ -8953,6 +10290,7 @@ $limitTimer.Start()
 # ---------------------------------------------------------------------------
 function Show-SplashScreen {
     $splash = New-Object System.Windows.Forms.Form
+    try { if ($null -ne $script:appIcon) { $splash.Icon = $script:appIcon } } catch { }
     $splash.FormBorderStyle = 'None'
     $splash.StartPosition = 'CenterScreen'
     $splash.Size = (New-UiSize 560 420)
@@ -9146,6 +10484,7 @@ function Show-SplashScreen {
 }
 
 Show-AppPage 'compose'
+Update-ResumeButtons
 # 처음 켠 것이라면 기록을 남기지 않습니다. 빈 화면으로 시작해야 하기 때문입니다.
 if (-not $script:isFirstRun) {
     Write-RunLog "프로그램 시작 (v$($script:AppVersion)). 설정은 자동 저장됩니다."
