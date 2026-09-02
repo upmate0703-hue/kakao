@@ -587,8 +587,20 @@ if (-not $AppDir) { $AppDir = (Get-Location).Path }
 $ConfigPath = Join-Path $AppDir 'config.json'
 $LogDir = Join-Path $AppDir 'logs'
 $BackupDir = Join-Path $AppDir 'backup'
-if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
 
+# 처음 쓰는 컴퓨터에서는 아무것도 없는 상태로 시작해야 합니다.
+# 설정 파일이 없다는 것은 이 컴퓨터에서 한 번도 안 썼다는 뜻입니다.
+# 그런데 프로그램을 덮어 설치했거나 옮겨 온 폴더라면 예전 기록이 남아 있을 수 있습니다.
+# 남의 기록이 남아 있으면 처음 켰는데 남이 보낸 내역이 보입니다. 그래서 지웁니다.
+$script:isFirstRun = (-not (Test-Path -LiteralPath $ConfigPath))
+if ($script:isFirstRun) {
+    foreach ($stale in @($LogDir, $BackupDir)) {
+        if (Test-Path -LiteralPath $stale) {
+            try { Remove-Item -LiteralPath $stale -Recurse -Force -ErrorAction Stop } catch { }
+        }
+    }
+}
+if (-not (Test-Path -LiteralPath $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
 $script:txtLog = $null
 $script:form = $null
 $script:armed = $false
@@ -2516,41 +2528,56 @@ function Get-KakaoRoomNames([int]$MaxPages = 30) {
 
 # 이 창이 채팅방 창인지 가리는 규칙입니다.
 # 규칙만 따로 떼어 두어야 카카오톡 없이도 시험할 수 있습니다.
-function Test-ChatWindowShape([string]$Title, [int]$Width, [int]$Height,
-                              [bool]$Visible, [bool]$IsMain, [bool]$HasInput, [bool]$HasList) {
+#
+# 카카오톡 창을 실제로 들여다보면 이렇게 생겼습니다.
+#   메인 창    : EVA_Window_Dblclk '카카오톡'  자식에 ChatRoomListView / ContactListView / OnlineMainView
+#   채팅방 창  : EVA_Window_Dblclk '방 이름'   자식에 RICHEDIT50W + EVA_VH_ListControl_Dblclk
+#   알림·툴팁  : tooltips_class32, EVA_Window  등 다른 클래스
+#   빈 창      : EVA_Window_Dblclk ''          제목이 없음
+# 그래서 클래스와 자식 구성을 함께 봐야 채팅방 창만 정확히 골라낼 수 있습니다.
+function Test-ChatWindowShape([string]$Title, [string]$ClassName, [int]$Width, [int]$Height,
+                              [bool]$Visible, [bool]$HasMainView, [bool]$HasInput, [bool]$HasList) {
     if (-not $Visible) { return $false }
-    if ($IsMain) { return $false }
+    # 채팅방 창은 반드시 이 클래스입니다. 툴팁이나 알림 창은 여기서 걸러집니다.
+    if (([string]$ClassName) -cne 'EVA_Window_Dblclk') { return $false }
     if ($Width -lt 200 -or $Height -lt 200) { return $false }
     $t = ([string]$Title).Trim()
     if (-not $t) { return $false }
     if ($t -eq '카카오톡' -or $t -eq 'KakaoTalk') { return $false }
-    # 글 입력칸이 없으면 보낼 수 없는 창입니다. (미리보기, 알림 등)
+    # 채팅 목록·친구 목록 화면을 품고 있으면 메인 창입니다. 채팅방이 아닙니다.
+    if ($HasMainView) { return $false }
+    # 글 입력칸이 없으면 보낼 수 없는 창입니다. (사진 미리보기, 알림 등)
     if (-not $HasInput) { return $false }
     # 대화 목록이 없으면 채팅방이 아닙니다. (프로필, 설정 등)
     if (-not $HasList) { return $false }
     return $true
 }
 
+# 이 창이 카카오톡 메인 창인지 자식 화면 이름으로 봅니다.
+function Test-HasMainView([object]$Window) {
+    try {
+        foreach ($child in [NativeKakao]::GetChildWindows($Window.Handle)) {
+            if ([string]$child.Title -match '^(ChatRoomListView|ContactListView|OnlineMainView|MoreView)') { return $true }
+        }
+    } catch { }
+    return $false
+}
+
 function Get-OpenChatRooms {
     $rooms = @()
     $seen = @{}
-    $mainHandles = @{}
-    try {
-        foreach ($main in (Get-KakaoMainWindows)) { $mainHandles[[string]$main.Handle] = $true }
-    } catch { }
-
     foreach ($process in (Get-KakaoProcesses)) {
         $windows = @()
         try { $windows = @([NativeKakao]::GetWindows($process.Id)) } catch { continue }
         foreach ($window in $windows) {
-            $isMain = $mainHandles.ContainsKey([string]$window.Handle)
             # 자식 컨트롤을 뒤지는 것은 값이 비싸므로, 싼 조건을 먼저 봅니다.
-            if (-not (Test-ChatWindowShape $window.Title $window.Width $window.Height $window.Visible $isMain $true $true)) { continue }
+            if (-not (Test-ChatWindowShape $window.Title $window.ClassName $window.Width $window.Height $window.Visible $false $true $true)) { continue }
+            if (Test-HasMainView $window) { continue }
             $inputBox = $null
             try { $inputBox = Get-ChatInputControl $window } catch { }
             $listBox = $null
             try { $listBox = Get-ChatListControl $window } catch { }
-            if (-not (Test-ChatWindowShape $window.Title $window.Width $window.Height $window.Visible $isMain ($null -ne $inputBox) ($null -ne $listBox))) { continue }
+            if (-not (Test-ChatWindowShape $window.Title $window.ClassName $window.Width $window.Height $window.Visible $false ($null -ne $inputBox) ($null -ne $listBox))) { continue }
 
             $name = Get-RoomTitleName $window.Title
             if (-not $name) { continue }
@@ -2567,7 +2594,6 @@ function Get-OpenChatRooms {
     }
     return @($rooms)
 }
-
 # 이름으로 열려 있는 채팅방 창을 찾습니다. 정확히 같은 이름일 때만 찾습니다.
 # 창이 아직 살아 있는지도 다시 확인합니다. 그 사이에 닫혔을 수 있기 때문입니다.
 function Find-OpenChatWindow([string]$Name) {
@@ -2609,8 +2635,8 @@ function Find-OpenChatWindow([string]$Name) {
 function ConvertTo-ExactKey([string]$Text) {
     $t = [string]$Text
     if (-not $t) { return '' }
-    # 전각 빈칸과 눈에 안 보이는 빈칸을 보통 빈칸으로 맞춥니다.
-    $t = $t -replace '[​‌‍﻿]', ''
+    # 눈에 안 보이는 글자만 없앱니다. 이모지를 잇는 글자(ZWJ)는 건드리지 않습니다.
+    $t = $t -replace '[​﻿]', ''
     $t = ($t -replace '\s+', ' ').Trim()
     return $t
 }
@@ -5213,19 +5239,34 @@ if ($SelfTest) {
     } finally { $script:strictTitleMatch = $false }
 
 
+
+    # 이모지가 든 방 이름이 상하면 안 됩니다. 실제로 그런 방이 있습니다.
+    $probeEmoji = '나만의 대표님' + [char]::ConvertFromUtf32(0x1F618)
+    if ((ConvertTo-ExactKey $probeEmoji) -cne $probeEmoji) { throw '이모지가 든 이름이 바뀝니다' }
+    if ((Get-RoomTitleName $probeEmoji) -cne $probeEmoji) { throw '이모지가 든 제목이 바뀝니다' }
+    if (-not (Test-SameRoomExact $probeEmoji $probeEmoji)) { throw '이모지가 든 같은 방을 다르다고 합니다' }
+    # 가족 이모지처럼 여러 글자를 이어 붙인 것도 그대로 두어야 합니다.
+    $probeZwj = '가족' + [char]::ConvertFromUtf32(0x1F468) + [char]0x200D + [char]::ConvertFromUtf32(0x1F467) + '방'
+    if ((ConvertTo-ExactKey $probeZwj) -cne $probeZwj) { throw '이어 붙인 이모지가 끊어집니다' }
     # ----- 채팅방 창 가려내기 -----
     # 사용자가 열어 둔 채팅방 창만 골라내야 합니다.
     # 미리보기 창이나 메인 창이 섞여 들어오면 엉뚱한 곳에 보내게 됩니다.
-    if (-not (Test-ChatWindowShape '뽀식' 400 500 $true $false $true $true)) { throw '멀쩡한 채팅방 창을 걸러 냅니다' }
-    if (Test-ChatWindowShape '뽀식' 400 500 $false $false $true $true) { throw '안 보이는 창을 채팅방이라고 합니다' }
-    if (Test-ChatWindowShape '뽀식' 400 500 $true $true $true $true) { throw '메인 창을 채팅방이라고 합니다' }
-    if (Test-ChatWindowShape '카카오톡' 400 500 $true $false $true $true) { throw '카카오톡 본 창을 채팅방이라고 합니다' }
-    if (Test-ChatWindowShape 'KakaoTalk' 400 500 $true $false $true $true) { throw 'KakaoTalk 본 창을 채팅방이라고 합니다' }
-    if (Test-ChatWindowShape '' 400 500 $true $false $true $true) { throw '제목 없는 창을 채팅방이라고 합니다' }
-    if (Test-ChatWindowShape '뽀식' 100 500 $true $false $true $true) { throw '너무 좁은 창을 채팅방이라고 합니다' }
-    if (Test-ChatWindowShape '뽀식' 400 100 $true $false $true $true) { throw '너무 낮은 창을 채팅방이라고 합니다' }
-    if (Test-ChatWindowShape '사진 보내기' 400 500 $true $false $false $false) { throw '입력칸 없는 창을 채팅방이라고 합니다' }
-    if (Test-ChatWindowShape '프로필' 400 500 $true $false $true $false) { throw '대화 목록 없는 창을 채팅방이라고 합니다' }
+    $okShape = 'EVA_Window_Dblclk'
+    if (-not (Test-ChatWindowShape '뽀식' $okShape 400 500 $true $false $true $true)) { throw '멀쩡한 채팅방 창을 걸러 냅니다' }
+    if (Test-ChatWindowShape '뽀식' $okShape 400 500 $false $false $true $true) { throw '안 보이는 창을 채팅방이라고 합니다' }
+    if (Test-ChatWindowShape '카카오톡' $okShape 400 500 $true $false $true $true) { throw '카카오톡 본 창을 채팅방이라고 합니다' }
+    if (Test-ChatWindowShape 'KakaoTalk' $okShape 400 500 $true $false $true $true) { throw 'KakaoTalk 본 창을 채팅방이라고 합니다' }
+    if (Test-ChatWindowShape '' $okShape 400 500 $true $false $true $true) { throw '제목 없는 창을 채팅방이라고 합니다' }
+    if (Test-ChatWindowShape '뽀식' $okShape 100 500 $true $false $true $true) { throw '너무 좁은 창을 채팅방이라고 합니다' }
+    if (Test-ChatWindowShape '뽀식' $okShape 400 100 $true $false $true $true) { throw '너무 낮은 창을 채팅방이라고 합니다' }
+    if (Test-ChatWindowShape '사진 보내기' $okShape 400 500 $true $false $false $false) { throw '입력칸 없는 창을 채팅방이라고 합니다' }
+    if (Test-ChatWindowShape '프로필' $okShape 400 500 $true $false $true $false) { throw '대화 목록 없는 창을 채팅방이라고 합니다' }
+    # 클래스가 다르면 채팅방이 아닙니다. 툴팁과 알림 창이 여기서 걸러집니다.
+    if (Test-ChatWindowShape '뽀식' 'tooltips_class32' 400 500 $true $false $true $true) { throw '툴팁 창을 채팅방이라고 합니다' }
+    if (Test-ChatWindowShape '뽀식' 'EVA_Window' 400 500 $true $false $true $true) { throw '다른 클래스 창을 채팅방이라고 합니다' }
+    if (Test-ChatWindowShape '뽀식' 'Chrome_WidgetWin_1' 400 500 $true $false $true $true) { throw '카카오톡이 아닌 창을 채팅방이라고 합니다' }
+    # 채팅 목록 화면을 품고 있으면 메인 창입니다. 제목이 방 이름처럼 보여도 아닙니다.
+    if (Test-ChatWindowShape '뽀식' $okShape 400 500 $true $true $true $true) { throw '메인 창을 채팅방이라고 합니다' }
     # ----- 저장된 목록 -----
     $savedRoster = @($script:config.Roster)
     try {
@@ -6187,7 +6228,7 @@ $script:NavPages = @(
 )
 
 $navY = 122
-$bottomY = 470
+$bottomY = 306
 foreach ($page in $script:NavPages) {
     if ($page.Group -eq 'bottom' -and $navY -lt $bottomY) { $navY = $bottomY }
     $script:navText[$page.Key] = $page.Text
@@ -6311,16 +6352,15 @@ $script:pillStatus.Add_Paint({
 })
 $header.Controls.Add($script:pillStatus)
 
-# 지금 예약과 반복 설정을 위쪽에 한 줄로 보여 줍니다.
+# 지금 어떤 방식으로, 언제 보내는지 상태 알약 옆에 한 줄로 보여 줍니다.
 $script:lblHeaderPlan = New-Object System.Windows.Forms.Label
-$script:lblHeaderPlan.Font = $FontSmall
+$script:lblHeaderPlan.Font = $FontBase
 $script:lblHeaderPlan.ForeColor = $Theme.Sub
 $script:lblHeaderPlan.BackColor = $Theme.Bg
-$script:lblHeaderPlan.Location = (New-UiPoint 222 40)
-$script:lblHeaderPlan.Size = (New-UiSize 374 46)
+$script:lblHeaderPlan.Location = (New-UiPoint 222 56)
+$script:lblHeaderPlan.Size = (New-UiSize 264 22)
 $script:lblHeaderPlan.Cursor = [System.Windows.Forms.Cursors]::Hand
 $header.Controls.Add($script:lblHeaderPlan)
-
 # 어느 화면에 있든 바로 누를 수 있게 위쪽에 둡니다.
 $btnHeaderEdit  = New-AppButton $header '내용 수정' 498 26 104 46
 $script:btnHeaderStart = New-AppButton $header '발송 시작' 610 26 132 46 'primary'
@@ -6372,71 +6412,85 @@ function Show-AppPage([string]$Key) {
 # ===========================================================================
 $pageCompose = New-Page 'compose'
 
-$cardMessage = New-Card $pageCompose 28 12 784 268 '발송 문구' '카카오톡에 붙여넣기로 전송됩니다. 줄바꿈도 그대로 유지됩니다.'
-$script:txtMessage = New-AppTextBox $cardMessage 24 78 736 158 $true
+$cardMessage = New-Card $pageCompose 28 12 784 224 '발송 문구' '카카오톡에 붙여넣기로 전송됩니다. 줄바꿈도 그대로 유지됩니다.'
+$script:txtMessage = New-AppTextBox $cardMessage 24 74 736 118 $true
 $script:txtMessage.Text = [string]$script:config.Message
-$script:lblMessageCount = New-CardLabel $cardMessage '' 24 240 736 20 $FontSmall $Theme.Muted
+$script:lblMessageCount = New-CardLabel $cardMessage '' 24 196 736 18 $FontSmall $Theme.Muted
 
 # 자주 보내는 문구를 이름을 붙여 담아 둡니다. 다시 칠 필요가 없습니다.
-$cardTemplates = New-Card $pageCompose 28 292 784 152 '저장 메시지' '자주 쓰는 문구에 이름을 붙여 두고 골라서 불러옵니다.'
+$cardTemplates = New-Card $pageCompose 28 244 784 112 '저장 메시지'
+$script:lblTemplateState = New-CardLabel $cardTemplates '' 24 46 736 18 $FontSmall $Theme.Muted
 $script:cmbTemplate = New-Object System.Windows.Forms.ComboBox
 $script:cmbTemplate.DropDownStyle = 'DropDownList'
 $script:cmbTemplate.Font = $FontBase
-$script:cmbTemplate.Location = (New-UiPoint 24 78)
+$script:cmbTemplate.Location = (New-UiPoint 24 68)
 $script:cmbTemplate.Size = (New-UiSize 300 32)
 $cardTemplates.Controls.Add($script:cmbTemplate)
-$btnTplLoad   = New-AppButton $cardTemplates '불러오기' 334 76 108 36 'strong'
-$btnTplSave   = New-AppButton $cardTemplates '새로 저장' 450 76 108 36
-$btnTplUpdate = New-AppButton $cardTemplates '덮어쓰기' 566 76 100 36
-$btnTplDelete = New-AppButton $cardTemplates '삭제' 674 76 86 36 'danger'
-$script:lblTemplateState = New-CardLabel $cardTemplates '' 24 118 736 24 $FontSmall $Theme.Muted
+$btnTplLoad   = New-AppButton $cardTemplates '불러오기' 334 68 100 32 'strong'
+$btnTplSave   = New-AppButton $cardTemplates '새로 저장' 442 68 100 32
+$btnTplUpdate = New-AppButton $cardTemplates '덮어쓰기' 550 68 96 32
+$btnTplDelete = New-AppButton $cardTemplates '삭제' 654 68 106 32 'danger'
 
-$cardFiles = New-Card $pageCompose 28 456 784 312 '첨부 사진 · 파일' '첨부를 먼저 보내고 그다음 문구를 보냅니다. [첨부 시험]은 붙는지만 확인하고 보내지 않습니다.'
-$frameFiles = New-FieldFrame $cardFiles 24 78 576 212
+$cardFiles = New-Card $pageCompose 28 364 784 248 '첨부 사진 · 파일' '첨부를 먼저 보내고 그다음 문구를 보냅니다. [첨부 시험]은 붙는지만 확인하고 보내지 않습니다.'
+$frameFiles = New-FieldFrame $cardFiles 24 74 576 156
 $script:lstFiles = New-Object System.Windows.Forms.ListBox
 $script:lstFiles.BorderStyle = 'None'
 $script:lstFiles.Font = $FontBase
 $script:lstFiles.Location = (New-UiPoint 12 12)
-$script:lstFiles.Size = (New-UiSize 552 188)
+$script:lstFiles.Size = (New-UiSize 552 132)
 $script:lstFiles.DisplayMember = 'Name'
 $script:lstFiles.ItemHeight = 24
 $frameFiles.Controls.Add($script:lstFiles)
 foreach ($file in @($script:config.Attachments)) { [void]$script:lstFiles.Items.Add((New-AttachmentItem ([string]$file))) }
 
-$btnAddFile    = New-AppButton $cardFiles '파일 추가' 616 78 144 40 'strong'
-$btnFileUp     = New-AppButton $cardFiles '위로' 616 128 144 36
-$btnFileDown   = New-AppButton $cardFiles '아래로' 616 170 144 36
-$btnRemoveFile = New-AppButton $cardFiles '선택 제거' 616 218 144 36 'danger'
-$btnCheckAttach = New-AppButton $cardFiles '첨부 시험' 616 262 144 36
+$btnAddFile    = New-AppButton $cardFiles '파일 추가' 616 74 144 36 'strong'
+$btnFileUp     = New-AppButton $cardFiles '위로' 616 118 70 32
+$btnFileDown   = New-AppButton $cardFiles '아래로' 690 118 70 32
+$btnRemoveFile = New-AppButton $cardFiles '선택 제거' 616 158 144 32 'danger'
+$btnCheckAttach = New-AppButton $cardFiles '첨부 시험' 616 198 144 32
 
-$lblComposeHint = New-CardLabel $pageCompose '내용은 자동 저장됩니다. 실제 발송 전에 [3. 보내기] 화면에서 테스트 발송으로 결과를 먼저 확인하세요.' 28 782 784 30 $FontSmall $Theme.Muted
+$lblComposeHint = New-CardLabel $pageCompose '내용은 자동 저장됩니다. 실제로 보내기 전에 [설정] 화면의 테스트 발송으로 결과를 먼저 확인해 보세요.' 28 622 784 22 $FontSmall $Theme.Muted
 $lblComposeHint.BackColor = $Theme.Bg
 
 # ===========================================================================
-# 페이지 2 — 채팅방 선택
+# 페이지 2 — 받을 채팅방
 # ===========================================================================
 $pageRooms = New-Page 'rooms'
-$cardRooms = New-Card $pageRooms 28 12 784 700 '발송 대상 채팅방' '카카오톡에서 보낼 채팅방을 창으로 열어 두시고 [열어 둔 채팅방 읽기]를 누르세요. 창 제목이 곧 정확한 이름입니다.'
+$cardRooms = New-Card $pageRooms 28 12 784 620 '발송 대상 채팅방' '카카오톡에서 보낼 채팅방을 창으로 열어 두시고 [열어 둔 채팅방 읽기]를 누르세요.'
 
-$btnReadOpen   = New-AppButton $cardRooms '열어 둔 채팅방 읽기' 24 80 190 38 'strong'
-$btnScanRooms  = New-AppButton $cardRooms '전체 목록 읽기' 222 80 140 38
-$btnVerifyRoom = New-AppButton $cardRooms '이름 확인·보정' 370 80 130 38
-$btnAddRoom    = New-AppButton $cardRooms '직접 추가' 508 80 88 38
-$btnEditRoom   = New-AppButton $cardRooms '이름 수정' 604 80 88 38
-# 방이 많을 때를 위한 검색칸
-[void](New-CardLabel $cardRooms '검색' 24 134 38 26 $FontSmall $Theme.Muted)
-$script:txtRoomSearch = New-AppTextBox $cardRooms 62 128 236 36
-$btnSearchClear = New-AppButton $cardRooms '지우기' 306 128 74 36 'ghost'
+$btnReadOpen   = New-AppButton $cardRooms '열어 둔 채팅방 읽기' 24 78 176 36 'strong'
+$btnScanRooms  = New-AppButton $cardRooms '전체 목록 읽기' 208 78 124 36
+$btnVerifyRoom = New-AppButton $cardRooms '이름 확인·보정' 340 78 124 36
+$btnAddRoom    = New-AppButton $cardRooms '직접 추가' 472 78 80 36
+$btnEditRoom   = New-AppButton $cardRooms '이름 수정' 560 78 80 36
+$btnClearRooms = New-AppButton $cardRooms '목록 비우기' 648 78 112 36 'ghost'
 
-[void](New-CardLabel $cardRooms '보기' 392 134 40 26 $FontSmall $Theme.Muted)
-$btnFilterAll    = New-AppButton $cardRooms '전체' 436 128 58 36
-$btnFilterPerson = New-AppButton $cardRooms '1:1' 500 128 58 36
-$btnFilterChat   = New-AppButton $cardRooms '단체' 564 128 58 36
-$btnFilterOpen   = New-AppButton $cardRooms '오픈채팅' 628 128 84 36
-$script:lblRoomCount = New-CardLabel $cardRooms '선택 0 / 전체 0' 24 172 480 24 $FontStrong $Theme.Ink
-$script:lblSearchState = New-CardLabel $cardRooms '' 24 196 736 22 $FontSmall $Theme.Info
+# 방이 많을 때를 위한 검색칸과 보기 필터
+[void](New-CardLabel $cardRooms '검색' 24 130 34 22 $FontSmall $Theme.Muted)
+$script:txtRoomSearch = New-AppTextBox $cardRooms 60 122 200 34
+$btnSearchClear = New-AppButton $cardRooms '지우기' 268 122 66 34 'ghost'
 
-$frameRooms = New-FieldFrame $cardRooms 24 222 736 324
+[void](New-CardLabel $cardRooms '보기' 346 130 34 22 $FontSmall $Theme.Muted)
+$btnFilterAll    = New-AppButton $cardRooms '전체' 384 122 56 34
+$btnFilterPerson = New-AppButton $cardRooms '1:1' 444 122 56 34
+$btnFilterChat   = New-AppButton $cardRooms '단체' 504 122 56 34
+$btnFilterOpen   = New-AppButton $cardRooms '오픈채팅' 564 122 78 34
+
+[void](New-CardLabel $cardRooms '탐색' 650 130 34 22 $FontSmall $Theme.Muted)
+$script:numScanPages = New-Object System.Windows.Forms.NumericUpDown
+$script:numScanPages.Minimum = 1
+$script:numScanPages.Maximum = 60
+$script:numScanPages.Value = [Math]::Max(1, [Math]::Min(60, [int]$script:config.ScanPages))
+$script:numScanPages.Location = (New-UiPoint 688 123)
+$script:numScanPages.Size = (New-UiSize 72 32)
+$script:numScanPages.Font = $FontBase
+$script:numScanPages.BorderStyle = 'FixedSingle'
+$cardRooms.Controls.Add($script:numScanPages)
+
+$script:lblRoomCount = New-CardLabel $cardRooms '선택 0 / 전체 0' 24 166 500 22 $FontStrong $Theme.Ink
+$script:lblSearchState = New-CardLabel $cardRooms '' 530 166 230 22 $FontSmall $Theme.Info
+
+$frameRooms = New-FieldFrame $cardRooms 24 194 736 300
 $script:lstRooms = New-Object System.Windows.Forms.ListView
 $script:lstRooms.View = 'Details'
 $script:lstRooms.CheckBoxes = $true
@@ -6445,115 +6499,89 @@ $script:lstRooms.HideSelection = $false
 $script:lstRooms.BorderStyle = 'None'
 $script:lstRooms.Font = $FontBase
 $script:lstRooms.Location = (New-UiPoint 12 12)
-$script:lstRooms.Size = (New-UiSize 712 300)
+$script:lstRooms.Size = (New-UiSize 712 276)
 [void]$script:lstRooms.Columns.Add('채팅방 이름', 470)
 [void]$script:lstRooms.Columns.Add('종류', 130)
 [void]$script:lstRooms.Columns.Add('이름 확인', 108)
 $frameRooms.Controls.Add($script:lstRooms)
 
-$btnCheckAll   = New-AppButton $cardRooms '전체 선택' 24 560 92 34
-$btnCheckNone  = New-AppButton $cardRooms '전체 해제' 124 560 92 34
-$btnPickNormal = New-AppButton $cardRooms '일반채팅만' 224 560 104 34
-$btnPickOpen   = New-AppButton $cardRooms '오픈채팅만' 336 560 104 34
-$btnDeleteRoom = New-AppButton $cardRooms '체크 삭제' 448 560 96 34 'danger'
-[void](New-CardLabel $cardRooms '최대 탐색 화면 수' 552 566 116 22 $FontSmall $Theme.Muted)
-$script:numScanPages = New-Object System.Windows.Forms.NumericUpDown
-$script:numScanPages.Minimum = 1
-$script:numScanPages.Maximum = 60
-$script:numScanPages.Value = [Math]::Max(1, [Math]::Min(60, [int]$script:config.ScanPages))
-$script:numScanPages.Location = (New-UiPoint 672 562)
-$script:numScanPages.Size = (New-UiSize 88 30)
-$script:numScanPages.Font = $FontBase
-$script:numScanPages.BorderStyle = 'FixedSingle'
-$cardRooms.Controls.Add($script:numScanPages)
+$btnCheckAll   = New-AppButton $cardRooms '전체 선택' 24 506 92 34
+$btnCheckNone  = New-AppButton $cardRooms '전체 해제' 124 506 92 34
+$btnPickNormal = New-AppButton $cardRooms '일반채팅만' 224 506 104 34
+$btnPickOpen   = New-AppButton $cardRooms '오픈채팅만' 336 506 104 34
+$btnDeleteRoom = New-AppButton $cardRooms '체크 삭제' 448 506 96 34 'danger'
+
 # ----- 그룹 -----
-[void](New-CardLabel $cardRooms '그룹' 24 606 42 26 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardRooms '그룹' 24 556 40 24 $FontSmall $Theme.Muted)
 $script:cmbGroup = New-Object System.Windows.Forms.ComboBox
 $script:cmbGroup.DropDownStyle = 'DropDownList'
 $script:cmbGroup.Font = $FontBase
-$script:cmbGroup.Location = (New-UiPoint 68 604)
-$script:cmbGroup.Size = (New-UiSize 174 30)
+$script:cmbGroup.Location = (New-UiPoint 66 552)
+$script:cmbGroup.Size = (New-UiSize 160 30)
 $cardRooms.Controls.Add($script:cmbGroup)
-$btnGroupCheck  = New-AppButton $cardRooms '이 그룹 체크' 250 602 116 32
-$btnGroupNew    = New-AppButton $cardRooms '새 그룹 만들기' 374 602 130 32
-$btnGroupAdd    = New-AppButton $cardRooms '체크한 방 넣기' 512 602 130 32
-$btnGroupDelete = New-AppButton $cardRooms '그룹 삭제' 650 602 110 32 'danger'
+$btnGroupCheck  = New-AppButton $cardRooms '이 그룹 체크' 234 550 106 32
+$btnGroupNew    = New-AppButton $cardRooms '새 그룹 만들기' 348 550 118 32
+$btnGroupAdd    = New-AppButton $cardRooms '체크한 방 넣기' 474 550 118 32
+$btnGroupDelete = New-AppButton $cardRooms '그룹 삭제' 600 550 96 32 'danger'
 
-[void](New-CardLabel $cardRooms '방을 연 뒤 창 제목이 정확히 같을 때만 보냅니다. 비슷한 이름이면 보내지 않고 닫습니다. 투투 와 토토 는 다른 방입니다.' 24 644 736 24 $FontSmall $Theme.Muted)
+$lblRoomsHint = New-CardLabel $cardRooms '방을 연 뒤 창 제목이 정확히 같을 때만 보냅니다. 비슷한 이름이면 보내지 않고 닫습니다.' 24 590 736 22 $FontSmall $Theme.Muted
+$lblRoomsHint.BackColor = $Theme.Card
 
 # ===========================================================================
-# 페이지 3 — 실행 · 예약
+# 페이지 3 — 보내기
 # ===========================================================================
 $pageRun = New-Page 'run'
 
-$cardMode = New-Card $pageRun 28 12 784 150 '발송 방식'
+$cardSend = New-Card $pageRun 28 12 784 292 '보내기' '지금 바로 보내거나, 시각을 정해 예약할 수 있습니다.'
 $script:rdoLive = New-Object System.Windows.Forms.RadioButton
-$script:rdoLive.Text = '실제 발송 — 선택한 모든 방에 문구와 첨부를 실제로 보냅니다.'
-$script:rdoLive.Location = (New-UiPoint 24 58)
-$script:rdoLive.Size = (New-UiSize 730 28)
+$script:rdoLive.Text = '실제 발송 — 고른 모든 방에 문구와 첨부를 실제로 보냅니다.'
+$script:rdoLive.Location = (New-UiPoint 24 76)
+$script:rdoLive.Size = (New-UiSize 730 26)
 $script:rdoLive.BackColor = $Theme.Card
 $script:rdoLive.Font = $FontBase
-$cardMode.Controls.Add($script:rdoLive)
+$cardSend.Controls.Add($script:rdoLive)
 
 $script:rdoDry = New-Object System.Windows.Forms.RadioButton
 $script:rdoDry.Text = '확인 전용 — 방만 열어 보고 아무것도 보내지 않습니다. (연습용)'
-$script:rdoDry.Location = (New-UiPoint 24 92)
-$script:rdoDry.Size = (New-UiSize 730 28)
+$script:rdoDry.Location = (New-UiPoint 24 106)
+$script:rdoDry.Size = (New-UiSize 730 26)
 $script:rdoDry.BackColor = $Theme.Card
 $script:rdoDry.Font = $FontBase
-$cardMode.Controls.Add($script:rdoDry)
+$cardSend.Controls.Add($script:rdoDry)
 if ([bool]$script:config.DryRun) { $script:rdoDry.Checked = $true } else { $script:rdoLive.Checked = $true }
 
-$cardTest = New-Card $pageRun 28 174 784 214 '테스트 모드' '실제 발송 전에 지정한 한 방에만 똑같이 보내 결과를 확인합니다.'
-[void](New-CardLabel $cardTest '테스트로 보낼 채팅방 (직접 입력하거나 목록에서 고르세요)' 24 82 460 22 $FontSmall $Theme.Muted)
-$script:txtTestRoom = New-AppTextBox $cardTest 24 108 414 38
-$script:txtTestRoom.Text = [string]$script:config.TestRoom
-$btnPickTestRoom = New-AppButton $cardTest '목록에서 고르기' 454 108 150 38
-$btnTestMyChat   = New-AppButton $cardTest '나와의 채팅' 614 108 146 38 'ghost'
-$btnTestSend = New-AppButton $cardTest '테스트 발송' 24 156 200 40 'primary'
-$btnTestDry  = New-AppButton $cardTest '방 확인만 (전송 안 함)' 236 156 200 40
-[void](New-CardLabel $cardTest '기본값은 나와의 채팅이라 아무에게도 가지 않습니다.' 452 162 308 30 $FontSmall $Theme.Muted)
-
-$cardSchedule = New-Card $pageRun 28 400 784 350 '지금 실행 및 예약'
-[void](New-CardLabel $cardSchedule '예약 시각' 24 56 100 22 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardSend '예약 시각' 24 144 100 22 $FontSmall $Theme.Muted)
 $script:dtSchedule = New-Object System.Windows.Forms.DateTimePicker
 $script:dtSchedule.Format = 'Custom'
 $script:dtSchedule.CustomFormat = 'yyyy-MM-dd  HH:mm:ss'
 $script:dtSchedule.ShowUpDown = $true
-$script:dtSchedule.Location = (New-UiPoint 24 80)
-$script:dtSchedule.Size = (New-UiSize 222 32)
+$script:dtSchedule.Location = (New-UiPoint 24 166)
+$script:dtSchedule.Size = (New-UiSize 222 30)
 $script:dtSchedule.Font = $FontBase
 try { $script:dtSchedule.Value = [datetime]::ParseExact([string]$script:config.ScheduledAt, 'yyyy-MM-dd HH:mm:ss', $null) }
 catch { $script:dtSchedule.Value = (Get-Date).Date.AddDays(1) }
 if ($script:dtSchedule.Value -lt $script:dtSchedule.MinDate -or $script:dtSchedule.Value -le (Get-Date)) { $script:dtSchedule.Value = (Get-Date).Date.AddDays(1) }
-$cardSchedule.Controls.Add($script:dtSchedule)
+$cardSend.Controls.Add($script:dtSchedule)
+$btnPickSchedule = New-AppButton $cardSend '달력에서 고르기' 254 166 140 30
 
-$btnPickSchedule = New-AppButton $cardSchedule '달력에서 고르기' 254 78 148 32
-$btnRunNow    = New-AppButton $cardSchedule '지금 실행' 24 134 164 46 'primary'
-$btnArm       = New-AppButton $cardSchedule '예약 시작' 200 134 164 46
-$btnCancelArm = New-AppButton $cardSchedule '예약 취소' 376 134 164 46
-$btnSave      = New-AppButton $cardSchedule '설정 저장' 552 134 164 46 'ghost'
+# 간격과 반복은 [설정] 화면 한 곳에서만 정합니다. 여기서는 지금 상태만 보여 줍니다.
+$script:lblRunPace = New-CardLabel $cardSend '' 410 140 350 56 $FontSmall $Theme.Sub
+
+$btnRunNow    = New-AppButton $cardSend '지금 실행' 24 206 160 42 'primary'
+$btnArm       = New-AppButton $cardSend '예약 시작' 192 206 150 42
+$btnCancelArm = New-AppButton $cardSend '예약 취소' 350 206 150 42
+$btnSave      = New-AppButton $cardSend '설정 저장' 508 206 120 42 'ghost'
+$btnGoPaceSettings = New-AppButton $cardSend '설정에서 바꾸기' 636 206 124 42
 $btnCancelArm.Enabled = $false
+$script:lblCountdown = New-CardLabel $cardSend '예약이 설정되지 않았습니다.' 24 256 736 24 $FontStrong $Theme.Muted
 
-# 간격과 반복은 [설정] 화면 한 곳에서만 정합니다.
-# 두 화면에 같은 항목이 있으면 어느 쪽이 진짜인지 헷갈립니다.
-# 여기서는 지금 어떻게 설정돼 있는지만 보여 줍니다.
-$script:lblRunPace = New-CardLabel $cardSchedule '' 24 194 540 52 $FontBase $Theme.Sub
-$btnGoPaceSettings = New-AppButton $cardSchedule '설정에서 바꾸기' 576 196 184 44
-$script:lblCountdown = New-CardLabel $cardSchedule '예약이 설정되지 않았습니다.' 24 250 736 26 $FontStrong $Theme.Muted
-[void](New-CardLabel $cardSchedule '발송 간격, 반복, 방해금지, 묶음 발송 등 모든 설정은 [설정] 화면 한 곳에 있습니다.' 24 282 736 22 $FontSmall $Theme.Muted)
-[void](New-CardLabel $cardSchedule '예약 시각까지 이 프로그램과 PC 카카오톡을 모두 켜 두어야 합니다. 화면 잠금·절전 상태에서는 동작하지 않습니다.' 24 304 736 22 $FontSmall $Theme.Muted)
-
-# ===========================================================================
-# 페이지 4 — 설정
 # ----- 발송 진행 상황 -----
-# 기록에 줄만 쌓이면 지금 어디까지 갔는지 알기 어렵습니다.
-# 방마다 상태를 표로 보여 주고, 실패한 방은 까닭도 적습니다.
-$cardProgress = New-Card $pageRun 28 760 784 340 '발송 진행 상황' '보내는 동안 방마다 어디까지 갔는지 보여 줍니다.'
-$script:lblProgressCount = New-CardLabel $cardProgress '전체 0    완료 0    진행중 0    대기 0    실패 0' 24 74 736 26 $FontStrong $Theme.Ink
+# 보내는 동안 여기만 보고 있으면 됩니다. 스크롤할 필요가 없어야 합니다.
+$cardProgress = New-Card $pageRun 28 316 784 322 '발송 진행 상황' '방마다 어디까지 갔는지 보여 줍니다. 실패한 방은 까닭도 적습니다.'
+$script:lblProgressCount = New-CardLabel $cardProgress '전체 0    발송 완료 0    진행중 0    대기 0    실패 0' 24 74 736 24 $FontStrong $Theme.Ink
 $script:barProgress = New-Object System.Windows.Forms.ProgressBar
-$script:barProgress.Location = (New-UiPoint 24 106)
-$script:barProgress.Size = (New-UiSize 736 14)
+$script:barProgress.Location = (New-UiPoint 24 104)
+$script:barProgress.Size = (New-UiSize 736 12)
 $script:barProgress.Minimum = 0
 $script:barProgress.Maximum = 1
 $script:barProgress.Value = 0
@@ -6565,13 +6593,15 @@ $script:lstProgress.FullRowSelect = $true
 $script:lstProgress.HideSelection = $false
 $script:lstProgress.BorderStyle = 'FixedSingle'
 $script:lstProgress.Font = $FontBase
-$script:lstProgress.Location = (New-UiPoint 24 134)
-$script:lstProgress.Size = (New-UiSize 736 186)
+$script:lstProgress.Location = (New-UiPoint 24 128)
+$script:lstProgress.Size = (New-UiSize 736 176)
 [void]$script:lstProgress.Columns.Add('채팅방', (S 300))
-[void]$script:lstProgress.Columns.Add('유형', (S 90))
+[void]$script:lstProgress.Columns.Add('종류', (S 110))
 [void]$script:lstProgress.Columns.Add('상태', (S 110))
-[void]$script:lstProgress.Columns.Add('비고', (S 210))
+[void]$script:lstProgress.Columns.Add('비고', (S 190))
 $cardProgress.Controls.Add($script:lstProgress)
+
+
 
 # ===========================================================================
 $pageSettings = New-Page 'settings'
@@ -6790,6 +6820,18 @@ $script:lblLimitState = New-CardLabel $cardLimit '' 24 236 736 56 $FontSmall $Th
 
 # 페이지 5 — 실행 기록
 # ===========================================================================
+
+# ----- 테스트 발송 -----
+# 실제로 보내기 전에 한 방에만 똑같이 보내 결과를 확인합니다.
+$cardTest = New-Card $pageSettings 28 1378 784 214 '테스트 발송' '실제 발송 전에 지정한 한 방에만 똑같이 보내 결과를 확인합니다.'
+[void](New-CardLabel $cardTest '테스트로 보낼 채팅방 (직접 입력하거나 목록에서 고르세요)' 24 82 460 22 $FontSmall $Theme.Muted)
+$script:txtTestRoom = New-AppTextBox $cardTest 24 108 414 38
+$script:txtTestRoom.Text = [string]$script:config.TestRoom
+$btnPickTestRoom = New-AppButton $cardTest '목록에서 고르기' 454 108 150 38
+$btnTestMyChat   = New-AppButton $cardTest '나와의 채팅' 614 108 146 38 'ghost'
+$btnTestSend = New-AppButton $cardTest '테스트 발송' 24 156 200 40 'primary'
+$btnTestDry  = New-AppButton $cardTest '방 확인만 (전송 안 함)' 236 156 200 40
+[void](New-CardLabel $cardTest '기본값은 나와의 채팅이라 아무에게도 가지 않습니다.' 452 162 308 30 $FontSmall $Theme.Muted)
 $pageLog = New-Page 'log'
 $cardLog = New-Card $pageLog 28 12 784 636 '실행 기록' '날짜별 파일로도 저장됩니다.'
 $frameLog = New-FieldFrame $cardLog 24 78 736 470
@@ -6946,7 +6988,7 @@ function Update-RoomListView {
     Update-RoomCountLabel
     if ($null -ne $script:lblSearchState) {
         if ($key) {
-            $script:lblSearchState.Text = "'$query' 검색 결과 $($items.Count)개 — [전체 선택]으로 보이는 것을 한 번에 고를 수 있습니다"
+            $script:lblSearchState.Text = "'$query' 검색 결과 $($items.Count)개"
             $script:lblSearchState.ForeColor = if ($items.Count -gt 0) { $Theme.Info } else { $Theme.Danger }
         } else {
             $script:lblSearchState.Text = ''
@@ -7099,8 +7141,8 @@ function Update-HeaderSummary {
     # 확인 전용인지 실제 발송인지가 가장 중요합니다. 맨 앞에 둡니다.
     $dry = $false
     try { $dry = [bool]$script:rdoDry.Checked } catch { }
-    $modeText = if ($dry) { '확인 전용 — 보내지 않습니다' } else { '실제 발송' }
-    $script:lblHeaderPlan.Text = "$modeText`r`n$when · $repeat"
+    $modeText = if ($dry) { '확인 전용' } else { '실제 발송' }
+    $script:lblHeaderPlan.Text = "$modeText · $when · $repeat"
     $script:lblHeaderPlan.ForeColor = if ($dry) { $Theme.Danger } elseif ($script:armed) { $Theme.Info } else { $Theme.Muted }
 
     # [보내기] 화면의 요약도 같이 맞춥니다.
@@ -7736,6 +7778,10 @@ $btnDeleteRoom.Add_Click({
 # 사용자가 창으로 열어 둔 채팅방을 읽습니다.
 # 이것이 가장 정확합니다. 창 제목은 윈도우가 알려 주는 진짜 글자라 틀리지 않습니다.
 # 화면 글자를 읽지 않으므로 뽀식 을 포식 으로 잘못 읽는 일이 아예 없습니다.
+#
+# 목록은 열려 있는 방으로 통째로 바꿉니다. 더하지 않습니다.
+# 열어 두신 방이 곧 보낼 방이기 때문입니다.
+# 예전에 읽어 둔 방이 섞여 있으면 무엇을 보내는지 알 수 없게 됩니다.
 $btnReadOpen.Add_Click({
     try {
         Sync-ConfigFromForm
@@ -7750,13 +7796,33 @@ $btnReadOpen.Add_Click({
             return
         }
 
-        # 읽은 방을 저장된 목록에 넣습니다. 창 제목으로 확인한 이름이라 확인됨으로 둡니다.
-        foreach ($room in $found) { Set-RosterVerified $room.Name $room.Kind '' }
-        Sync-RoomEntriesFromRoster
-        # 열어 두신 방이 곧 보낼 방입니다. 그 방들만 체크해 둡니다.
-        $openNames = @{}
-        foreach ($room in $found) { $openNames[$room.Name] = $true }
-        foreach ($entry in $script:roomEntries) { $entry.Checked = $openNames.ContainsKey($entry.Name) }
+        $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $rows = @()
+        $order = 0
+        foreach ($room in $found) {
+            $rows += [pscustomobject]@{
+                Name = $room.Name
+                ListText = $room.Name
+                Kind = $room.Kind
+                Order = $order
+                Verified = $true
+                LastSeen = $stamp
+            }
+            $order++
+        }
+        Set-Roster $rows
+
+        # 화면 목록도 열려 있는 방만 남깁니다.
+        $script:roomEntries = New-Object System.Collections.Generic.List[object]
+        foreach ($room in $found) {
+            $type = if ($room.Kind -eq 'open') { $script:RoomTypeOpen } else { $script:RoomTypeNormal }
+            $script:roomEntries.Add([pscustomobject]@{
+                Name = $room.Name; Type = $type; Checked = $true
+                Kind = $room.Kind; Verified = $true
+            })
+        }
+        $script:roomFilter = '전체'
+        if ($null -ne $script:txtRoomSearch) { $script:txtRoomSearch.Text = '' }
         Update-RoomListView
         Sync-ConfigFromForm
         try { Save-Config $script:config } catch { }
@@ -7767,14 +7833,39 @@ $btnReadOpen.Add_Click({
         $text = "열려 있는 채팅방 $($found.Count)개를 읽었습니다." + "`r`n`r`n" +
                 ((@($found | ForEach-Object { '· ' + $_.Name }) | Select-Object -First 12) -join "`r`n")
         if ($found.Count -gt 12) { $text += "`r`n… 외 $($found.Count - 12)개" }
-        $text += "`r`n`r`n이 $($found.Count)개를 발송 대상으로 체크했습니다."
+        $text += "`r`n`r`n이 $($found.Count)개만 목록에 남기고 모두 체크했습니다."
         $text += "`r`n창 제목에서 가져온 이름이라 틀릴 일이 없습니다."
-        $text += "`r`n`r`n보낼 방을 바꾸시려면 아래 목록에서 체크를 고쳐 주세요."
+        $text += "`r`n`r`n보낼 방을 바꾸시려면 카카오톡에서 창을 열거나 닫은 뒤 다시 눌러 주세요."
         [System.Windows.Forms.MessageBox]::Show($text, '열어 둔 채팅방 읽기') | Out-Null
     } catch {
         Write-RunLog "열어 둔 채팅방 읽기 실패: $($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '열어 둔 채팅방 읽기 실패') | Out-Null
     }
+})
+
+# 목록을 통째로 비웁니다. 예전에 잘못 읽힌 방이 잔뜩 쌓였을 때 씁니다.
+$btnClearRooms.Add_Click({
+    $count = $script:roomEntries.Count
+    if ($count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('목록이 이미 비어 있습니다.', '목록 비우기') | Out-Null
+        return
+    }
+    $ask = "저장된 채팅방 $($count)개를 모두 지웁니다." + "`r`n`r`n" +
+           "카카오톡의 채팅방을 지우는 것이 아닙니다." + "`r`n" +
+           "이 프로그램이 기억하고 있는 목록만 비웁니다." + "`r`n`r`n" +
+           "계속할까요?"
+    if ([System.Windows.Forms.MessageBox]::Show($ask, '목록 비우기', 'YesNo', 'Warning') -ne 'Yes') { return }
+    Set-Roster @()
+    Set-ConfigValue 'KnownRooms' @()
+    Set-ConfigValue 'Rooms' @()
+    $script:roomEntries = New-Object System.Collections.Generic.List[object]
+    $script:roomFilter = '전체'
+    if ($null -ne $script:txtRoomSearch) { $script:txtRoomSearch.Text = '' }
+    Update-RoomListView
+    Sync-ConfigFromForm
+    try { Save-Config $script:config } catch { }
+    Write-RunLog "저장된 채팅방 목록 $($count)개를 비웠습니다."
+    [System.Windows.Forms.MessageBox]::Show("목록을 비웠습니다.`r`n`r`n카카오톡에서 보낼 방을 창으로 열어 두시고 [열어 둔 채팅방 읽기]를 눌러 주세요.", '목록 비우기') | Out-Null
 })
 
 # 카카오톡에 보이는 채팅방 목록을 통째로 읽어 저장합니다.
@@ -8910,8 +9001,11 @@ function Show-SplashScreen {
 }
 
 Show-AppPage 'compose'
-Write-RunLog "프로그램 시작 (v$($script:AppVersion)). 설정은 자동 저장됩니다."
-if ($script:roomRepairNote) { Write-RunLog $script:roomRepairNote }
+# 처음 켠 것이라면 기록을 남기지 않습니다. 빈 화면으로 시작해야 하기 때문입니다.
+if (-not $script:isFirstRun) {
+    Write-RunLog "프로그램 시작 (v$($script:AppVersion)). 설정은 자동 저장됩니다."
+    if ($script:roomRepairNote) { Write-RunLog $script:roomRepairNote }
+}
 
 if ($ScreenshotDir) {
     if (-not (Test-Path -LiteralPath $ScreenshotDir)) { New-Item -ItemType Directory -Path $ScreenshotDir -Force | Out-Null }
