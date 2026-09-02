@@ -701,6 +701,14 @@ function New-DefaultConfig {
         # 발송 속도입니다.  자동 / 빠르게 / 기본 / 안정적
         # 자동은 카카오톡이 반응하는 속도를 보고 스스로 정합니다. 손댈 것이 없습니다.
         SendSpeed = '자동'
+        # 발송 뒤 채팅방을 열어 둘지 닫을지 정합니다.
+        # 열어 두면 다음에 다시 여느라 드는 시간이 없어 훨씬 빠릅니다.
+        KeepRoomsOpen = $true
+        # 예약을 켤 때 바로 한 번 보낼지 정합니다.
+        # 다만 방금 보낸 적이 있으면 중복을 막으려고 건너뜁니다.
+        ScheduleSendAtStart = $true
+        # 마지막으로 실제 발송에 성공한 때입니다.
+        LastSuccessAt = ''
         # 공휴일마다 어떻게 할지 하나씩 정합니다.
         #   { Date = '2026-09-24'; Name = '추석'; Action = 'move'; MoveTo = '2026-09-25' }
         #   Action: normal(그대로 보냄) / skip(그날은 안 보냄) / move(다른 날로 옮김)
@@ -2509,6 +2517,7 @@ function Get-KakaoRoomNames([int]$MaxPages = 30) {
     $names = New-Object System.Collections.Generic.List[string]
     $pages = 0
     $noChange = 0
+    $atBottom = $false
     # 같은 이름이 몇 번 나왔는지 세어 둡니다.
     # 이름이 같은 방이 여럿이면 이름만으로는 서로를 가릴 수 없어 알려 드려야 합니다.
     $seenCount = @{}
@@ -2632,9 +2641,9 @@ function Add-WaitCost([double]$Ms) {
 function Get-WaitTick([int]$Floor = 0) {
     $mode = [string]$script:config.SendSpeed
     switch ($mode) {
-        '빠르게' { $tick = 25 }
-        '기본'   { $tick = 60 }
-        '안정적' { $tick = 200 }
+        '초고속'      { $tick = 20 }
+        '빠름'        { $tick = 40 }
+        '안정성 우선' { $tick = 200 }
         default  {
             # 확인 한 번 값의 두 배 반쯤을 주기로 씁니다.
             # 확인이 8밀리초면 20밀리초, 80밀리초면 200밀리초가 됩니다.
@@ -2677,6 +2686,101 @@ function Wait-Until([scriptblock]$Check, [int]$TimeoutMs, [int]$Stable = 1) {
 }
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 발송 성능 모드 — 어디까지 기다릴지 정합니다
+# ---------------------------------------------------------------------------
+# 여기 값들은 모두 '최대 이만큼까지만 기다린다' 는 뜻입니다.
+# 확인이 되는 즉시 다음 단계로 넘어가므로, 잘 되는 PC 에서는 이 값에 닿지 않습니다.
+# 값이 클수록 안 되는 상황에서 오래 붙잡고 있습니다.
+#
+#   초고속      : 이미 열린 방에 빠르게. 확인은 그대로 하되 못 되면 빨리 포기하고 다시 합니다.
+#   빠름        : 초고속보다 조금 넉넉합니다.
+#   자동        : 카카오톡 반응 속도를 보고 스스로 고릅니다.  ← 기본값
+#   안정성 우선 : 느린 PC 나 카카오톡이 자주 버벅일 때.
+function Get-SpeedTuning {
+    $mode = [string]$script:config.SendSpeed
+    if ($mode -eq '자동') {
+        # 확인 한 번이 얼마나 걸리는지 보고 고릅니다.
+        if ($script:waitCostAvg -le 25) { $mode = '초고속' }
+        elseif ($script:waitCostAvg -le 60) { $mode = '빠름' }
+        else { $mode = '안정성 우선' }
+    }
+    switch ($mode) {
+        '초고속' {
+            return [pscustomobject]@{
+                Name = '초고속'; Settle = 500; Foreground = 350; Cleared = 900
+                Landed = 1500; PreviewEach = 500; AttachWait = 500; OpenTimeout = 3000
+            }
+        }
+        '빠름' {
+            return [pscustomobject]@{
+                Name = '빠름'; Settle = 900; Foreground = 500; Cleared = 1400
+                Landed = 2200; PreviewEach = 800; AttachWait = 800; OpenTimeout = 5000
+            }
+        }
+        '안정성 우선' {
+            return [pscustomobject]@{
+                Name = '안정성 우선'; Settle = 4000; Foreground = 900; Cleared = 2200
+                Landed = 3500; PreviewEach = 1200; AttachWait = 1500; OpenTimeout = 8000
+            }
+        }
+        default {
+            return [pscustomobject]@{
+                Name = '기본'; Settle = 1500; Foreground = 600; Cleared = 1800
+                Landed = 2800; PreviewEach = 1000; AttachWait = 1200; OpenTimeout = 6000
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 단계별 시간 재기
+# ---------------------------------------------------------------------------
+# 어느 단계에서 오래 걸리는지 방마다 적어 둡니다.
+# 느리다고 느껴질 때 이 기록만 보면 어디가 문제인지 바로 압니다.
+$script:stageTimes = $null
+$script:stageWatch = $null
+$script:stageTotals = @{}
+
+function Start-StageLog {
+    $script:stageTimes = New-Object System.Collections.Generic.List[object]
+    $script:stageWatch = [System.Diagnostics.Stopwatch]::StartNew()
+}
+
+function Add-Stage([string]$Name) {
+    if ($null -eq $script:stageWatch) { return }
+    $ms = $script:stageWatch.Elapsed.TotalMilliseconds
+    $script:stageWatch.Restart()
+    $script:stageTimes.Add([pscustomobject]@{ Name = $Name; Ms = $ms })
+    if (-not $script:stageTotals.ContainsKey($Name)) { $script:stageTotals[$Name] = @() }
+    $script:stageTotals[$Name] += $ms
+}
+
+function Write-StageLog([string]$Room) {
+    if ($null -eq $script:stageTimes -or $script:stageTimes.Count -eq 0) { return }
+    $sum = 0.0
+    foreach ($s in $script:stageTimes) { $sum += $s.Ms }
+    $parts = @()
+    foreach ($s in $script:stageTimes) { $parts += ("{0} {1:N0}ms" -f $s.Name, $s.Ms) }
+    Write-RunLog ("[{0}] {1}  ·  총 {2:N2}초" -f $Room, ($parts -join ' / '), ($sum / 1000))
+    $script:stageTimes = $null
+    $script:stageWatch = $null
+}
+
+# 발송이 끝난 뒤 단계별 평균을 정리해 보여 줍니다.
+function Write-StageSummary {
+    if ($script:stageTotals.Count -eq 0) { return }
+    Write-RunLog '단계별 평균 처리시간'
+    $grand = 0.0
+    foreach ($name in @($script:stageTotals.Keys)) {
+        $arr = @($script:stageTotals[$name])
+        $avg = ($arr | Measure-Object -Average).Average
+        $grand += $avg
+        Write-RunLog ("  {0,-12} {1,4}회  평균 {2,7:N0}ms" -f $name, $arr.Count, $avg)
+    }
+    Write-RunLog ("  {0,-12}          방 하나당 {1,7:N2}초" -f '합계', ($grand / 1000))
+    $script:stageTotals = @{}
+}
 # 열려 있는 채팅방 창 — 한 번만 훑고 기억해 둡니다
 # ---------------------------------------------------------------------------
 # 창 목록을 훑는 데 25밀리초쯤 걸립니다.
@@ -2953,6 +3057,32 @@ function Stop-RosterScan { $script:rosterCancel = $true }
 #   Exact 가 참이면 방을 하나씩 열어 창 제목으로 이름을 확정합니다. 느리지만 정확합니다.
 #   Exact 가 거짓이면 화면 글자만 읽습니다. 빠르지만 이름이 틀릴 수 있습니다.
 # 같은 방은 한 번만 담습니다. 정확히 같은 이름일 때만 같은 방으로 봅니다.
+# 목록을 한 화면 내립니다.
+# 한 번에 화면 하나를 통째로 넘기면 중간 방을 놓칩니다.
+# 그래서 보이는 줄 수보다 두세 줄 적게 내려 앞뒤가 겹치게 합니다.
+# 그리고 화면이 실제로 움직인 것을 확인한 뒤에 다음 일을 합니다.
+function Move-ListOnePage([object]$List, [int]$VisibleRows) {
+    $before = Get-ChatListSignature $List
+    # 보이는 줄에서 3줄을 겹치게 남깁니다. 최소 2줄은 내립니다.
+    $step = [Math]::Max(2, $VisibleRows - 3)
+    $step = [Math]::Min(10, $step)
+    Move-ListByWheel $List 'down' $step
+    # 화면이 실제로 바뀔 때까지 기다립니다. 바뀌는 즉시 나갑니다.
+    $moved = Wait-Until {
+        $now = Get-ChatListSignature $List
+        return ($now -and $now -ne $before)
+    } 1500 1
+    if (-not $moved) { return $false }
+    # 움직임이 멈출 때까지 기다립니다. 흐르는 중에 읽으면 글자가 뭉갭니다.
+    $script:scrollLast = ''
+    [void](Wait-Until {
+        $now = Get-ChatListSignature $List
+        $same = ($now -and $now -eq $script:scrollLast)
+        $script:scrollLast = $now
+        return $same
+    } 2000 1)
+    return $true
+}
 function Invoke-RosterScan([bool]$Exact, [int]$MaxPages) {
     $script:rosterCancel = $false
     $ready = Test-KakaoReady $true $false
@@ -2978,6 +3108,7 @@ function Invoke-RosterScan([bool]$Exact, [int]$MaxPages) {
     $titleFailures = 0
     $pages = 0
     $noChange = 0
+    $atBottom = $false
 
     Move-ListToTop $layout.List $pageLimit
     $howText = if ($Exact) { '방을 열어 이름 확정 (정확)' } else { '화면 글자만 읽기 (빠름)' }
@@ -3044,11 +3175,20 @@ function Invoke-RosterScan([bool]$Exact, [int]$MaxPages) {
         }
 
         if ($found.Count -eq $before) { $noChange++ } else { $noChange = 0 }
-        if ($noChange -ge 2) { break }
+        # 끝났다고 보려면 두 가지가 모두 맞아야 합니다.
+        #   ① 더 내려가지 않는다 (맨 아래에 닿았다)
+        #   ② 새로 나오는 방이 없다
+        # 하나만 보고 끝내면 중간에서 멈춥니다.
+        if ($noChange -ge 2 -and $atBottom) { break }
+        if ($noChange -ge 4) { break }
 
-        $notches = [Math]::Max(3, [Math]::Min(8, $rows.Count - 1))
-        Move-ListByWheel $list 'down' $notches
-        Start-Sleep -Milliseconds 200
+        $moved = Move-ListOnePage $list $rows.Count
+        if (-not $moved) {
+            # 더 내려가지 않습니다. 맨 아래입니다.
+            # 바로 끝내지 않고 한 화면 더 읽어 빠뜨린 것이 없는지 봅니다.
+            if ($atBottom) { break }
+            $atBottom = $true
+        }
     }
 
     Move-ListToTop $layout.List $pages
@@ -3385,26 +3525,28 @@ function Get-DeliveryState([string]$Room) {
 }
 
 # 이미 열린 채팅창에 보냅니다. 제목이 목표 방과 맞을 때만 전송합니다.
-# 차례는 이렇습니다.
-#   채팅방 확인 -> 파일 첨부 -> 첨부 확인 -> 첨부 전송 -> 메시지 입력 -> 메시지 전송 -> 전송 확인 -> 닫기
-# 한 단계라도 확인이 안 되면 그 방은 실패입니다. 보내지 못한 것을 완료라고 하지 않습니다.
+# 차례:  채팅방 확인 -> 첨부 -> 첨부 확인 -> 메시지 -> 전송 확인 -> (설정에 따라) 닫기
+# 한 단계라도 확인이 안 되면 그 방은 실패입니다.
 #
-# CloseWhenDone 이 거짓이면 창을 닫지 않습니다.
-# 사용자가 직접 열어 둔 창은 사용자 것입니다. 우리가 마음대로 닫지 않습니다.
+# 빠른 길:
+#   방을 열 때 이미 대화 로딩을 기다렸으므로 문구를 보낼 때 또 기다리지 않습니다.
+#   첨부가 없으면 첨부 관련 단계를 아예 지나갑니다.
+#   문구가 없으면 문구 단계를 지나갑니다.
+#   사용자가 열어 둔 창은 닫지 않습니다.
 function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool]$CloseWhenDone = $true) {
-    # 대화가 많이 쌓인 방은 창이 뜬 뒤에도 한참 뒤에야 내용이 채워집니다.
-    # 그 사이에 판단하면 제목이 아직 이전 방이거나 입력칸이 준비되지 않은 상태라
-    # 엉뚱한 방에 보내거나, 보내지도 않고 보낸 것으로 착각합니다.
-    # 그래서 방이 완전히 열릴 때까지 기다린 뒤에만 손을 댑니다.
+    $tune = Get-SpeedTuning
+    Start-StageLog
     Set-SendProgress $Room '채팅방 확인' ''
-    Write-StepLog $Room '채팅방 확인 시작'
     if (-not (Wait-KakaoResponsive $Chat 20000)) {
         $script:lastSendProblem = 'KAKAO_NOT_RESPONDING — 카카오톡이 응답하지 않습니다.'
         Write-StepLog $Room $script:lastSendProblem
         if ($CloseWhenDone) { Close-ChatWindow $Chat }
         return $false
     }
-    $ready = Wait-ChatWindowReady $Chat $Room ([int]$Content.OpenTimeoutMs)
+    # 방 열림 대기는 설정값과 성능 모드 중 짧은 쪽을 씁니다.
+    $openMs = [Math]::Min([Math]::Max(1000, [int]$Content.OpenTimeoutMs), $tune.OpenTimeout)
+    $ready = Wait-ChatWindowReady $Chat $Room $openMs
+    Add-Stage '방 확인'
     if ($null -eq $ready) {
         $script:lastSendProblem = 'ROOM_OPEN_FAILED — 방이 다 열리지 않았거나 창 제목이 이 방과 달랐습니다.'
         Write-StepLog $Room ('채팅방 확인 실패 — ' + $script:lastSendProblem)
@@ -3412,7 +3554,6 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
         return $false
     }
     $chat = $ready.Window
-    Write-StepLog $Room '채팅방 확인 성공'
 
     if ([bool]$Content.DryRun) {
         Write-StepLog $Room '확인만 함 — 아무것도 보내지 않았습니다'
@@ -3425,10 +3566,10 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
     $problems = @()
 
     # ----- 1) 첨부 파일 -----
-    # 사진은 묶어서 한 번에 보냅니다. 한 장씩 보내는 것보다 훨씬 잘 갑니다.
-    $waitMs = [Math]::Max(500, [int]$Content.AttachmentWaitMs)
+    # 첨부가 없으면 이 구역을 통째로 지나갑니다.
     $files = @($Content.Attachments)
     if ($files.Count -gt 0) {
+        $waitMs = [Math]::Min([Math]::Max(300, [int]$Content.AttachmentWaitMs), $tune.AttachWait)
         Set-SendProgress $Room '파일 첨부 중' ''
         # 이미 보낸 파일은 빼고 묶습니다. 다시 할 때 같은 사진을 또 보내면 안 됩니다.
         $left = @()
@@ -3456,7 +3597,6 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
             $label = if ($count -gt 1) { "$($count)장 묶음" } else { $names[0] }
             $mark = "$($batchNo)/$($batches.Count)"
             Set-SendProgress $Room '파일 첨부 중' "묶음 $mark — $label"
-            Write-StepLog $Room "첨부 묶음 $mark 붙여넣기 ($label)"
             $outcome = $null
             try { $outcome = Send-ChatAttachments $chat $inputBox $batch $waitMs $true } catch { $outcome = $null }
             if ($null -eq $outcome) {
@@ -3468,7 +3608,6 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
                 foreach ($path in @($batch)) { if (Test-IsImageFile ([string]$path)) { $images++ } }
                 $script:runStats.Photos += $images
                 $script:runStats.Files += ($count - $images)
-                Write-StepLog $Room "첨부 묶음 $mark 전송 성공 — $($names -join ', ')  [$($outcome.Method) / $($outcome.SendWay)]"
                 # 묶음 하나가 나갈 때마다 적어 둡니다. 중간에 꺼져도 여기까지는 남습니다.
                 Save-RunProgress $Content
             } else {
@@ -3476,14 +3615,16 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
                 Write-StepLog $Room "첨부 묶음 $mark 실패 — $($outcome.Reason)"
             }
         }
+        Add-Stage '첨부'
     }
 
     # ----- 2) 문구 -----
+    # 문구가 없으면 이 구역을 통째로 지나갑니다.
     $message = [string]$Content.Message
     if ((-not [string]::IsNullOrWhiteSpace($message)) -and (-not $state.MessageSent)) {
         Set-SendProgress $Room '메시지 전송 중' ''
-        Write-StepLog $Room '메시지 입력'
-        $how = Send-ChatText $chat $inputBox $message ([int]$Content.SettleMs)
+        # 방을 열 때 이미 대화 로딩을 기다렸습니다. 여기서 또 기다리지 않습니다.
+        $how = Send-ChatText $chat $inputBox $message ([int]$Content.SettleMs) $true
         if (-not $how) {
             $why = $script:lastSendProblem
             if (-not $why) { $why = 'SEND_FAILED 까닭을 알 수 없습니다.' }
@@ -3492,29 +3633,36 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
             [void](Reset-ChatAfterFailure $chat $inputBox)
             if ($CloseWhenDone) { Close-ChatWindow $chat }
             $script:lastSendProblem = $why
+            Add-Stage '메시지'
+            Write-StageLog $Room
             return $false
         }
         $state.MessageSent = $true
         $script:runStats.Messages++
-        Write-StepLog $Room "메시지 전송 성공 ($how)"
         if ($script:sendMethodLogged -ne $how) {
             $script:sendMethodLogged = $how
             Write-RunLog "전송 방식: $how"
         }
+        Add-Stage '메시지'
     }
 
-    if ($CloseWhenDone) { Close-ChatWindow $chat }
+    # ----- 3) 닫기 -----
+    # 사용자가 열어 둔 창은 닫지 않습니다. 닫으면 다음에 다시 여느라 시간이 듭니다.
+    if ($CloseWhenDone) {
+        Close-ChatWindow $chat
+        Add-Stage '닫기'
+    }
     if ($problems.Count -gt 0) {
         # 문구는 갔는데 파일만 못 갔다면 그렇게 적어 둡니다.
-        # 아무것도 못 간 것과 구별돼야 어디를 다시 해야 할지 압니다.
         $head = if ($state.MessageSent -and @($state.SentFiles.Keys).Count -gt 0) { '일부 파일 전송 실패' }
                 elseif ($state.MessageSent) { '파일 전송 실패 (문구는 보냄)' }
                 else { '전송 실패' }
         $script:lastSendProblem = $head + ' — ' + ($problems -join ' / ')
         Write-StepLog $Room $script:lastSendProblem
+        Write-StageLog $Room
         return $false
     }
-    Write-StepLog $Room '발송 완료'
+    Write-StageLog $Room
     return $true
 }
 # 채팅창을 앞으로 가져오고 입력칸에 포커스를 줍니다.
@@ -3523,32 +3671,24 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
 # 카카오톡은 창 메시지로 넣은 글자를 '사용자 입력'으로 인정하지 않아
 # 전송 버튼이 회색으로 남습니다. 그래서 전송할 때만 실제 키보드 입력을 씁니다.
 function Enter-ChatForeground([object]$Chat, [object]$InputBox) {
+    # 창이 앞으로 나오는 것은 되든 안 되든 몇십 밀리초 안에 판가름납니다.
+    # 오래 붙잡고 있어 봐야 소용이 없어, 짧게 여러 번 해 봅니다.
+    $tune = Get-SpeedTuning
     for ($attempt = 0; $attempt -lt 3; $attempt++) {
         [void][NativeKakao]::ForceForeground($Chat.Handle)
-        $deadline = (Get-Date).AddMilliseconds(900)
-        while ((Get-Date) -lt $deadline) {
-            if ([NativeKakao]::GetForegroundWindow() -eq $Chat.Handle) {
-                # 마우스를 움직이지 않고 입력칸에 포커스를 줍니다.
-                if (-not (Set-ChatInputFocus $Chat)) {
-                    [NativeKakao]::ClickControl($InputBox.Handle,
-                        ($InputBox.Rect.Left + [int]($InputBox.Width / 2)),
-                        ($InputBox.Rect.Top + [int]($InputBox.Height / 2)), $false)
-                }
-                Start-Sleep -Milliseconds (Get-WaitTick)
-                return $true
+        $came = Wait-Until { [NativeKakao]::GetForegroundWindow() -eq $Chat.Handle } $tune.Foreground 1
+        if ($came) {
+            # 마우스를 움직이지 않고 입력칸에 포커스를 줍니다.
+            if (-not (Set-ChatInputFocus $Chat)) {
+                [NativeKakao]::ClickControl($InputBox.Handle,
+                    ($InputBox.Rect.Left + [int]($InputBox.Width / 2)),
+                    ($InputBox.Rect.Top + [int]($InputBox.Height / 2)), $false)
             }
-            Start-Sleep -Milliseconds 60
+            return $true
         }
     }
     return $false
 }
-
-# 실제 키보드 입력으로 붙여넣고 보냅니다. 성공은 입력칸이 비워졌는지로 판단합니다.
-# 입력칸에 우리가 넣은 글이 그대로 남아 있는지 봅니다.
-# 비어 있으면 이미 전송된 것이므로 다시 보내면 안 됩니다. 두 번 가 버립니다.
-# 입력칸에 우리가 넣은 글이 그대로 남아 있는지 봅니다.
-# 비어 있으면 이미 전송된 것이므로 다시 보내면 안 됩니다. 두 번 가 버립니다.
-# 입력칸이 실제로 키보드 입력을 받는 상태인지 봅니다.
 function Test-ChatInputFocused([object]$InputBox) {
     if ($null -eq $InputBox) { return $false }
     try { return ([NativeKakao]::GetFocusedControl($InputBox.Handle) -eq $InputBox.Handle) } catch { return $false }
@@ -3700,9 +3840,15 @@ function Add-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message,
 # 글을 보냅니다.
 # 넣는 방법을 확실한 것부터 시도하고, 보낸 뒤에는 대화창을 보고 진짜 갔는지 확인합니다.
 # 갔는지 확인되지 않으면 성공이라고 하지 않습니다.
-function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]$SettleMs = 4000) {
+# 이미 열린 채팅창에 글을 보냅니다.
+# AlreadySettled 가 참이면 대화 로딩 대기를 건너뜁니다.
+# 방을 열 때 이미 기다렸는데 여기서 또 기다리면 방마다 몇 초씩 그냥 버립니다.
+function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]$SettleMs = 4000, [bool]$AlreadySettled = $false) {
+    $tune = Get-SpeedTuning
     # 대화를 아직 불러오는 중이면 Enter 가 먹지 않습니다.
-    [void](Wait-ChatContentSettled $Chat $SettleMs)
+    if (-not $AlreadySettled) {
+        [void](Wait-ChatContentSettled $Chat ([Math]::Min([Math]::Max(1, $SettleMs), $tune.Settle)))
+    }
     $list = Get-ChatListControl $Chat
     $script:lastSendProblem = ''
 
@@ -3715,8 +3861,6 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
     foreach ($way in $ways) {
         # 보내기 전 대화창 모습을 기억해 둡니다.
         # 보낸 뒤 이것과 견주어 글이 실제로 올라왔는지 확인합니다.
-        # 어떤 방법으로 넣었든 확인합니다. 키를 눌렀다는 것과
-        # 메시지가 갔다는 것은 다른 상태이기 때문입니다.
         $before = ''
         if ($null -ne $list) { $before = Get-ChatTailSignature $list }
 
@@ -3738,21 +3882,20 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
                 if (-not (Enter-ChatForeground $Chat $InputBox)) { continue }
                 [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
             }
-            if (-not (Wait-ChatInputCleared $InputBox 2200)) {
+            if (-not (Wait-ChatInputCleared $InputBox $tune.Cleared)) {
                 $script:lastSendProblem = "SEND_ACTION_FAILED — '$way' 로 넣고 Enter 를 눌렀지만 입력칸이 그대로입니다."
                 continue
             }
             # 입력칸이 비워진 것만으로는 보냈다고 할 수 없습니다.
             # 카카오톡이 글을 그냥 지워 버리는 경우가 있고, 그때도 입력칸은 빕니다.
             # 그래서 대화창에 글이 올라온 것까지 확인해야 성공으로 봅니다.
-            if (Test-ChatMessageLanded $list $before 3500) {
+            if (Test-ChatMessageLanded $list $before $tune.Landed) {
                 $script:preferredSendWay = $way
                 return "$way + $press"
             }
 
             # 여기서 다른 방법으로 다시 써 넣으면 안 됩니다.
             # 실제로는 갔는데 확인만 못 한 경우라면 같은 글이 두 번 가 버립니다.
-            # 확인되지 않았다고 알리고 끝냅니다.
             $script:lastSendProblem = 'SEND_VERIFY_FAILED — 보낸 뒤 대화창에 글이 올라온 것을 확인하지 못했습니다.'
             return ''
         }
@@ -3761,9 +3904,6 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
     try { Reset-ChatInput $InputBox } catch { }
     return ''
 }
-
-# 사진은 '파일 목록'이 아니라 '그림 자체'를 클립보드에 넣어야 붙습니다.
-# 파일 목록만 넣으면 카카오톡이 받아들이지 않아 전송 버튼이 회색으로 남습니다.
 function Test-IsImageFile([string]$Path) {
     $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
     return ($ext -in @('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'))
@@ -3874,52 +4014,54 @@ function Close-KakaoPreview([object]$Preview) {
 # 한 가지 방법만 쓰면 컴퓨터에 따라 안 눌립니다.
 # 창 메시지 클릭 → 실제 마우스 클릭 → Enter 순서로 해 보고, 창이 닫히면 성공입니다.
 # 미리보기 창의 [전송] 을 누릅니다.
-# 전송 단추는 창 아래쪽에 있는데, 그 자리는 화면 배율에 따라 달라집니다.
-# 100% 에서 아래로 24픽셀인 자리가 150% 에서는 36픽셀입니다.
-# 그래서 이 창이 놓인 화면의 배율을 물어 그만큼 늘려 잡고, 몇 군데를 차례로 눌러 봅니다.
-# 좌표를 못 맞혀도 Enter 가 남아 있습니다.
+# Enter 를 먼저 씁니다. 좌표를 몰라도 되고 거의 언제나 통합니다.
+# 안 되면 전송 단추 자리를 눌러 봅니다. 그 자리는 화면 배율에 따라 달라지므로
+# 이 창이 놓인 화면의 배율을 물어 그만큼 늘려 잡습니다.
+# 한 방법에 오래 매달리지 않습니다. 안 되면 빨리 다음 방법으로 넘어갑니다.
 function Submit-KakaoPreview([object]$Preview, [int]$TimeoutMs) {
     $window = [NativeKakao]::GetWindow($Preview.Handle)
     if ($null -eq $window -or $window.Width -le 0) { return '미리보기 창이 사라짐' }
+    $tune = Get-SpeedTuning
     $scale = 1.0
     try { $scale = [double]([NativeKakao]::WindowDpi($window.Handle)) / 96.0 } catch { $scale = 1.0 }
     if ($scale -lt 0.5 -or $scale -gt 5.0) { $scale = 1.0 }
     $midX = $window.Rect.Left + [int]($window.Width / 2)
     $rightX = $window.Rect.Right - [int](60 * $scale)
-    # 아래에서 얼마나 떨어진 자리를 누를지, 배율만큼 늘려 잡습니다.
-    $spots = @()
-    foreach ($up in @(24, 34, 18, 46)) {
-        $spots += ,@($midX, ($window.Rect.Bottom - [int]($up * $scale)))
-    }
-    $spots += ,@($rightX, ($window.Rect.Bottom - [int](24 * $scale)))
-    $each = [Math]::Max(1200, [int]($TimeoutMs / ($spots.Count + 2)))
+    $each = [Math]::Max(300, [Math]::Min($tune.PreviewEach, [int]($TimeoutMs / 4)))
     $lastReason = '전송을 눌렀지만 미리보기 창이 닫히지 않음'
 
     $ways = @()
-    foreach ($spot in $spots) {
-        $sx = $spot[0]; $sy = $spot[1]
-        $ways += [pscustomobject]@{ Name = "창 메시지 클릭 ($sx,$sy)"; Act = ([scriptblock]::Create(
-            "[NativeKakao]::ClickControl([IntPtr]$($window.Handle), $sx, $sy, `$false)")) }
-    }
+    # ① Enter 가 가장 싸고 잘 통합니다.
     $ways += [pscustomobject]@{ Name = 'Enter'; Act = {
         [NativeKakao]::PressKey($window.Handle, 0x0D) } }
+    # ② 전송 단추 자리 (배율만큼 늘려 잡습니다)
+    foreach ($up in @(24, 34, 18, 46)) {
+        $sx = $midX; $sy = $window.Rect.Bottom - [int]($up * $scale)
+        $ways += [pscustomobject]@{ Name = "클릭 ($sx,$sy)"; Act = ([scriptblock]::Create(
+            "[NativeKakao]::ClickControl([IntPtr]$($window.Handle), $sx, $sy, `$false)")) }
+    }
+    $sxr = $rightX; $syr = $window.Rect.Bottom - [int](24 * $scale)
+    $ways += [pscustomobject]@{ Name = "클릭 ($sxr,$syr)"; Act = ([scriptblock]::Create(
+        "[NativeKakao]::ClickControl([IntPtr]$($window.Handle), $sxr, $syr, `$false)")) }
+    # ③ 마지막으로 실제 마우스
     $ways += [pscustomobject]@{ Name = '실제 마우스 클릭'; Act = {
         if ([NativeKakao]::ForceForeground($window.Handle)) {
-            Start-Sleep -Milliseconds 250
+            [void](Wait-Until { [NativeKakao]::GetForegroundWindow() -eq $window.Handle } 400 1)
             if ([NativeKakao]::GetForegroundWindow() -eq $window.Handle) {
                 Invoke-PointClick ($window.Rect.Left + [int]($window.Width / 2)) ($window.Rect.Bottom - [int](24 * $scale)) $false
             }
         } } }
 
+    $deadline = (Get-Date).AddMilliseconds([Math]::Max(1500, $TimeoutMs))
     foreach ($way in $ways) {
+        if ((Get-Date) -ge $deadline) { break }
         try { & $way.Act } catch { $lastReason = $way.Name + ' 도중 문제: ' + $_.Exception.Message; continue }
-        # 눌렀으면 창이 닫히기를 기다립니다. 시간만 재고 넘어가지 않습니다.
-        $deadline = (Get-Date).AddMilliseconds($each)
-        while ((Get-Date) -lt $deadline) {
+        # 눌렀으면 창이 닫히기를 기다립니다. 닫히는 즉시 나갑니다.
+        $gone = Wait-Until {
             $still = [NativeKakao]::GetWindow($Preview.Handle)
-            if ($null -eq $still -or -not $still.Visible) { return '' }
-            Start-Sleep -Milliseconds (Get-WaitTick)
-        }
+            return ($null -eq $still -or -not $still.Visible)
+        } $each 1
+        if ($gone) { return '' }
         $lastReason = $way.Name + ' 으로는 닫히지 않음'
     }
     return $lastReason
@@ -4777,7 +4919,7 @@ function Invoke-ListPass([object]$Pending, [object]$Content, [int]$MaxPages,
 
             $script:strictTitleMatch = $true
             $ok = $false
-            try { $ok = [bool](Send-ToChatWindow $chat $openedName $Content) }
+            try { $ok = [bool](Send-ToChatWindow $chat $openedName $Content $true) }
             catch {
                 $ok = $false
                 $script:lastSendProblem = 'SEND_ERROR — ' + $_.Exception.Message
@@ -4859,7 +5001,8 @@ function Invoke-OpenWindowPass([object]$Pending, [object]$Content, [int]$Interva
 
         $script:strictTitleMatch = $true
         $ok = $false
-        try { $ok = [bool](Send-ToChatWindow $window $name $Content $false) }
+        $closeIt = (-not [bool]$script:config.KeepRoomsOpen)
+        try { $ok = [bool](Send-ToChatWindow $window $name $Content $closeIt) }
         catch {
             $ok = $false
             $script:lastSendProblem = 'SEND_ERROR — ' + $_.Exception.Message
@@ -5483,6 +5626,7 @@ function Invoke-Broadcast([string[]]$Targets = $null, [bool]$Resume = $false) {
     if ($failedRooms.Count -gt 0) {
         Write-RunLog "실패한 방: $((@($failedRooms) | Select-Object -First 10) -join ', ')"
     }
+    Write-StageSummary
     Write-RunLog '자세한 결과는 logs 폴더의 발송기록 파일에 표로 남았습니다.'
 
     if ($dryRun) {
@@ -5492,6 +5636,8 @@ function Invoke-Broadcast([string[]]$Targets = $null, [bool]$Resume = $false) {
     } elseif ($result.Sent -gt 0) {
         # 오늘 보냈다고 적어 둡니다. 공휴일에서 옮겨 온 날에 두 번 가지 않게 합니다.
         Add-SentDay (Get-Date)
+        # 마지막 성공 시각을 적어 둡니다. 예약을 켤 때 또 보내지 않도록 이 값을 봅니다.
+        Set-LastSuccessAt (Get-Date)
         try { Save-Config $script:config } catch { }
     }
     # 남김없이 끝났으면 이어서 할 것이 없습니다.
@@ -7901,13 +8047,19 @@ $script:lblHeaderPlan.Size = (New-UiSize 264 22)
 $script:lblHeaderPlan.Cursor = [System.Windows.Forms.Cursors]::Hand
 $header.Controls.Add($script:lblHeaderPlan)
 # 어느 화면에 있든 바로 누를 수 있게 위쪽에 둡니다.
-$btnHeaderEdit  = New-AppButton $header '내용 수정' 498 26 104 46
-$script:btnHeaderStart = New-AppButton $header '발송 시작' 610 26 132 46 'primary'
-# 예약 대기 중이거나 발송 중일 때 [발송 시작] 자리에 나타납니다.
-$script:btnHeaderStop = New-AppButton $header '중지' 610 26 132 46 'danger'
+$btnHeaderEdit  = New-AppButton $header '내용 수정' 396 26 96 46
+# 한 번 바로 보냅니다. 예약과는 아무 상관이 없습니다.
+$script:btnHeaderStart = New-AppButton $header '즉시발송' 500 26 116 46 'primary'
+# 예약을 켭니다. 누르는 순간 지금 설정이 저장되고 예약이 살아납니다.
+$script:btnHeaderArm = New-AppButton $header '예약 시작' 624 26 116 46
+# 예약이 켜져 있을 때 [예약 시작] 자리에 나타납니다.
+$script:btnHeaderDisarm = New-AppButton $header '예약 중지' 624 26 116 46 'danger'
+$script:btnHeaderDisarm.Visible = $false
+# 보내는 중일 때 [즉시발송] 자리에 나타납니다.
+$script:btnHeaderStop = New-AppButton $header '중지' 500 26 116 46 'danger'
 $script:btnHeaderStop.Visible = $false
 
-$btnHelp = New-AppButton $header '?' 750 26 36 46 'default'
+$btnHelp = New-AppButton $header '?' 748 26 38 46 'default'
 $btnHelp.Font = $FontStrong
 $tipHelp = New-Object System.Windows.Forms.ToolTip
 $tipHelp.SetToolTip($btnHelp, '사용 가이드 다시 보기')
@@ -8257,29 +8409,27 @@ $script:numSettle.BorderStyle = 'FixedSingle'
 $cardPace.Controls.Add($script:numSettle)
 [void](New-CardLabel $cardPace '초 동안 화면이 멈추기를 기다린 뒤 보냅니다 (오픈채팅은 늘리세요)' 234 166 520 24 $FontSmall $Theme.Muted)
 
-$script:chkPreload = New-Object System.Windows.Forms.CheckBox
-$script:chkPreload.Text = '보내기 전에 대상 방을 한 번씩 열어 두기'
-$script:chkPreload.Checked = [bool]$script:config.PreloadRooms
-$script:chkPreload.Location = (New-UiPoint 24 208)
-$script:chkPreload.Size = (New-UiSize 330 28)
-$script:chkPreload.BackColor = $Theme.Card
-$script:chkPreload.Font = $FontBase
-$cardPace.Controls.Add($script:chkPreload)
+$script:chkKeepOpen = New-Object System.Windows.Forms.CheckBox
+$script:chkKeepOpen.Text = '발송 뒤 채팅방을 열어 둡니다 (닫으면 다시 여느라 느려집니다)'
+$script:chkKeepOpen.Checked = [bool]$script:config.KeepRoomsOpen
+$script:chkKeepOpen.Location = (New-UiPoint 24 208)
+$script:chkKeepOpen.Size = (New-UiSize 500 28)
+$script:chkKeepOpen.BackColor = $Theme.Card
+$script:chkKeepOpen.Font = $FontBase
+$cardPace.Controls.Add($script:chkKeepOpen)
 
 # 한 방이 실패했을 때 몇 번까지 다시 해 볼지 정합니다.
-# 0 이면 한 번만 하고 실패로 둡니다. 3 이면 세 번 더 해 봅니다.
-[void](New-CardLabel $cardPace '실패 시 재시도' 364 212 96 24 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardPace '실패 시 재시도' 534 212 96 24 $FontSmall $Theme.Muted)
 $script:numRetry = New-Object System.Windows.Forms.NumericUpDown
 $script:numRetry.Minimum = 0
 $script:numRetry.Maximum = 5
 $script:numRetry.Value = [Math]::Max(0, [Math]::Min(5, [int]$script:config.RetryCount))
-$script:numRetry.Location = (New-UiPoint 466 208)
+$script:numRetry.Location = (New-UiPoint 636 208)
 $script:numRetry.Size = (New-UiSize 66 30)
 $script:numRetry.Font = $FontBase
 $script:numRetry.BorderStyle = 'FixedSingle'
 $cardPace.Controls.Add($script:numRetry)
-[void](New-CardLabel $cardPace '회' 538 212 26 24 $FontSmall $Theme.Muted)
-$btnPreloadNow = New-AppButton $cardPace '지금 미리 열기' 576 204 184 36
+[void](New-CardLabel $cardPace '회' 708 212 26 24 $FontSmall $Theme.Muted)
 
 # 발송 속도입니다. 자동이 기본이고, 대부분 손댈 일이 없습니다.
 [void](New-CardLabel $cardPace '발송 속도' 24 250 96 24 $FontSmall $Theme.Muted)
@@ -8288,10 +8438,11 @@ $script:cmbSpeed.DropDownStyle = 'DropDownList'
 $script:cmbSpeed.Font = $FontBase
 $script:cmbSpeed.Location = (New-UiPoint 124 246)
 $script:cmbSpeed.Size = (New-UiSize 130 30)
-foreach ($item in @('자동', '빠르게', '기본', '안정적')) { [void]$script:cmbSpeed.Items.Add($item) }
+foreach ($item in @('자동', '초고속', '빠름', '안정성 우선')) { [void]$script:cmbSpeed.Items.Add($item) }
 $script:cmbSpeed.SelectedItem = $(if ($script:cmbSpeed.Items.Contains([string]$script:config.SendSpeed)) { [string]$script:config.SendSpeed } else { '자동' })
 $cardPace.Controls.Add($script:cmbSpeed)
-[void](New-CardLabel $cardPace '자동은 카카오톡이 반응하는 속도를 보고 스스로 정합니다. 느린 PC 도 그냥 두시면 됩니다.' 264 250 496 24 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardPace '자동은 카카오톡 반응 속도를 보고 스스로 정합니다. 느린 PC 도 그냥 두시면 됩니다.' 264 250 300 24 $FontSmall $Theme.Muted)
+$btnPreloadNow = New-AppButton $cardPace '지금 미리 열기' 576 244 184 34
 $script:chkRepeat = New-Object System.Windows.Forms.CheckBox
 $script:chkRepeat.Text = '다 보낸 뒤 일정 시간마다 다시 보내기'
 $script:chkRepeat.Checked = [bool]$script:config.RepeatEnabled
@@ -8727,13 +8878,18 @@ function Update-HeaderSummary {
     } else {
         "간격 $([int]$script:numInterval.Value)초"
     }
-    # 확인 전용인지 실제 발송인지가 가장 중요합니다. 맨 앞에 둡니다.
+    # 예약이 켜져 있는지, 다음에 언제 보내는지가 가장 중요합니다. 맨 앞에 둡니다.
     $dry = $false
     try { $dry = [bool]$script:rdoDry.Checked } catch { }
     $modeText = if ($dry) { '확인 전용' } else { '실제 발송' }
-    $script:lblHeaderPlan.Text = "$modeText · $when · $repeat"
-    $script:lblHeaderPlan.ForeColor = if ($dry) { $Theme.Danger } elseif ($script:armed) { $Theme.Info } else { $Theme.Muted }
-
+    if ($script:armed) {
+        $gap = if ([bool]$script:chkRepeat.Checked) { "$([int]$script:numRepeatMinutes.Value)분 간격" } else { '한 번만' }
+        $script:lblHeaderPlan.Text = "예약 실행 중 · $gap · 다음 발송 $($script:dtSchedule.Value.ToString('MM-dd HH:mm')) · $modeText"
+        $script:lblHeaderPlan.ForeColor = if ($dry) { $Theme.Danger } else { $Theme.Info }
+    } else {
+        $script:lblHeaderPlan.Text = "예약 중지 · $modeText"
+        $script:lblHeaderPlan.ForeColor = if ($dry) { $Theme.Danger } else { $Theme.Muted }
+    }
     # [보내기] 화면의 요약도 같이 맞춥니다.
     # 설정은 [설정] 화면 한 곳에서만 바꾸고, 여기는 그 결과를 보여 주기만 합니다.
     # 확인 전용이면 단추 이름부터 다르게 해서 헷갈리지 않게 합니다.
@@ -8806,7 +8962,7 @@ function Sync-ConfigFromForm {
     $script:config.BatchRestMinutes = [int]$script:numBatchRest.Value
     $script:config.OpenTimeoutMs = [int]$script:numOpenTimeout.Value * 1000
     $script:config.SettleMs = [int]$script:numSettle.Value * 1000
-    $script:config.PreloadRooms = [bool]$script:chkPreload.Checked
+    $script:config.KeepRoomsOpen = [bool]$script:chkKeepOpen.Checked
     $script:config.RepeatEnabled = [bool]$script:chkRepeat.Checked
     $script:config.RepeatMinutes = [int]$script:numRepeatMinutes.Value
     $script:config.RepeatCount = [int]$script:numRepeatCount.Value
@@ -8869,7 +9025,7 @@ $script:numBatchSize.Add_ValueChanged({ Request-AutoSave })
 $script:numBatchRest.Add_ValueChanged({ Request-AutoSave })
 $script:numOpenTimeout.Add_ValueChanged({ Request-AutoSave })
 $script:numSettle.Add_ValueChanged({ Request-AutoSave })
-$script:chkPreload.Add_CheckedChanged({ Request-AutoSave })
+$script:chkKeepOpen.Add_CheckedChanged({ Sync-ConfigFromForm })
 $script:chkRepeat.Add_CheckedChanged({ Request-AutoSave })
 $script:numRepeatMinutes.Add_ValueChanged({ Request-AutoSave })
 $script:numRepeatCount.Add_ValueChanged({ Request-AutoSave })
@@ -9509,10 +9665,22 @@ $btnScanRooms.Add_Click({
         $readCount = @($scan.Rows).Count
         Write-RunLog "목록 새로고침 끝: 읽은 방 $($readCount)개 / 새로 생김 $(@($diff.Added).Count)개 / 없어짐 $(@($diff.Removed).Count)개 / 저장된 전체 $($diff.Total)개"
 
-        $result = "채팅방 $($readCount)개를 읽었습니다." + "`r`n`r`n" +
+        # 종류별로 몇 개인지 함께 보여 드립니다.
+        $countOpen = 0; $countGroup = 0; $countDirect = 0; $countUnknown = 0
+        foreach ($row in (Get-Roster)) {
+            switch ([string]$row.Kind) {
+                'open'   { $countOpen++ }
+                'group'  { $countGroup++ }
+                'direct' { $countDirect++ }
+                default  { $countUnknown++ }
+            }
+        }
+        $result = "총 $($diff.Total)개 채팅방을 찾았습니다." + "`r`n`r`n" +
+                  "일반채팅 $($countGroup + $countDirect + $countUnknown)개" + "`r`n" +
+                  "오픈채팅 $($countOpen)개" + "`r`n`r`n" +
+                  "이번에 읽은 방: $($readCount)개" + "`r`n" +
                   "· 새로 생긴 방: $(@($diff.Added).Count)개" + "`r`n" +
-                  "· 목록에서 없어진 방: $(@($diff.Removed).Count)개" + "`r`n" +
-                  "· 저장된 전체: $($diff.Total)개"
+                  "· 목록에서 없어진 방: $(@($diff.Removed).Count)개"
         if (@($diff.Added).Count -gt 0) {
             $result += "`r`n`r`n[새로 생긴 방]`r`n" + ((@($diff.Added) | Select-Object -First 8) -join "`r`n")
             if (@($diff.Added).Count -gt 8) { $result += "`r`n… 외 $((@($diff.Added).Count) - 8)개" }
@@ -9852,16 +10020,104 @@ function Wait-Interruptible([int]$Seconds) {
     return $false
 }
 
-function Update-RunButtons {
-    $busy = ($script:running -or $script:armed)
-    $script:btnHeaderStop.Visible = $busy
-    $btnHeaderStart.Visible = -not $busy
-    $script:btnHeaderStop.Tag.Label = if ($script:pauseRequested) { '계속하기' } else { '중지' }
-    $script:btnHeaderStop.Invalidate()
-    Update-HeaderSummary
+# ---------------------------------------------------------------------------
+# 예약 — 한 곳에서만 켜고 끕니다
+# ---------------------------------------------------------------------------
+# 어디서 눌러도 같은 일이 일어나야 합니다.
+#   ① 지금 설정을 저장한다
+#   ② 예약을 켠다
+#   ③ 다음 보낼 시각을 정한다
+#   ④ 화면에 상태를 보여 준다
+# 타이머는 하나뿐입니다. 여러 개가 생기는 일은 없습니다.
+
+# 마지막으로 실제 발송에 성공한 때입니다. 중복 발송을 막는 데 씁니다.
+function Get-LastSuccessAt {
+    $text = [string]$script:config.LastSuccessAt
+    if (-not $text) { return $null }
+    try { return [datetime]::ParseExact($text, 'yyyy-MM-dd HH:mm:ss', $null) } catch { return $null }
 }
 
-# 반복 발송이 켜져 있으면 다음 차례를 예약합니다.
+function Set-LastSuccessAt([datetime]$When) {
+    Set-ConfigValue 'LastSuccessAt' $When.ToString('yyyy-MM-dd HH:mm:ss')
+    try { Save-Config $script:config } catch { }
+}
+
+# 예약을 켭니다. 상단 단추와 예약 화면 어디서 눌러도 이 함수를 씁니다.
+function Start-Schedule([bool]$Confirm = $true) {
+    Sync-ConfigFromForm
+    $gap = [Math]::Max(1, [int]$script:numRepeatMinutes.Value)
+    $now = Get-Date
+
+    # 예약 시각이 이미 지났으면 지금부터로 봅니다.
+    if ($script:dtSchedule.Value -le $now) { $script:dtSchedule.Value = $now }
+
+    # 시작하자마자 한 번 보낼지 정합니다.
+    # 다만 방금 보낸 적이 있으면 또 보내지 않습니다. 같은 방에 도배가 됩니다.
+    $sendNow = [bool]$script:config.ScheduleSendAtStart
+    $skipWhy = ''
+    $last = Get-LastSuccessAt
+    if ($sendNow -and $null -ne $last) {
+        $since = ($now - $last).TotalMinutes
+        if ($since -lt $gap) {
+            $sendNow = $false
+            $next = $last.AddMinutes($gap)
+            $script:dtSchedule.Value = $next
+            $skipWhy = "최근 발송 {0} · 중복을 막으려고 지금은 보내지 않습니다" -f $last.ToString('HH:mm')
+        }
+    }
+    if ($sendNow) { $script:dtSchedule.Value = $now.AddSeconds(2) }
+    elseif ($script:dtSchedule.Value -le $now) { $script:dtSchedule.Value = $now.AddMinutes($gap) }
+
+    if ($Confirm) {
+        $lines = @()
+        $lines += '예약을 켭니다.'
+        $lines += ''
+        $lines += ("· 보낼 방: {0}개" -f @($script:config.Rooms).Count)
+        $lines += ("· 다음 발송: {0}" -f $script:dtSchedule.Value.ToString('yyyy-MM-dd HH:mm:ss'))
+        $lines += ("· 반복: {0}" -f $(if ([bool]$script:chkRepeat.Checked) { "$($gap)분마다" } else { '한 번만' }))
+        if ($skipWhy) { $lines += ''; $lines += ("· $skipWhy") }
+        if ([bool]$script:config.DryRun) { $lines += ''; $lines += '· 확인 전용입니다. 실제로 보내지 않습니다.' }
+        $lines += ''
+        $lines += '계속할까요?'
+        if ([System.Windows.Forms.MessageBox]::Show(($lines -join "`r`n"), '예약 시작', 'OKCancel', 'Question') -ne 'OK') { return $false }
+    }
+
+    $script:armed = $true
+    $script:overlapNoted = $false
+    $btnArm.Enabled = $false
+    $btnCancelArm.Enabled = $true
+    Write-RunLog ("예약 켬: 다음 발송 {0}{1}" -f $script:dtSchedule.Value.ToString('yyyy-MM-dd HH:mm:ss'), $(if ($skipWhy) { " ($skipWhy)" } else { '' }))
+    Update-RunButtons
+    Sync-ConfigFromForm
+    return $true
+}
+
+function Stop-Schedule {
+    $script:armed = $false
+    $script:overlapNoted = $false
+    $btnArm.Enabled = $true
+    $btnCancelArm.Enabled = $false
+    $script:lblCountdown.Text = '예약이 꺼져 있습니다.'
+    $script:lblCountdown.ForeColor = $Theme.Muted
+    Set-StatusPill '준비됨' 'idle'
+    Write-RunLog '예약 끔'
+    Update-RunButtons
+}
+function Update-RunButtons {
+    # 상단은 언제나 두 자리입니다.
+    #   왼쪽 : 보내는 중이면 [중지], 아니면 [즉시발송]
+    #   오른쪽: 예약이 켜져 있으면 [예약 중지], 아니면 [예약 시작]
+    $script:btnHeaderStop.Visible = $script:running
+    $btnHeaderStart.Visible = -not $script:running
+    $btnHeaderStart.Enabled = -not $script:running
+    $script:btnHeaderDisarm.Visible = $script:armed
+    $script:btnHeaderArm.Visible = -not $script:armed
+    $script:btnHeaderStop.Tag.Label = if ($script:pauseRequested) { '계속하기' } else { '중지' }
+    $script:btnHeaderStop.Invalidate()
+    $script:btnHeaderArm.Invalidate()
+    $script:btnHeaderDisarm.Invalidate()
+    Update-HeaderSummary
+}
 function Start-RepeatIfNeeded {
     if (-not [bool]$script:config.RepeatEnabled) { return }
     $limit = [int]$script:config.RepeatCount
@@ -9976,27 +10232,19 @@ $btnRunNow.Add_Click({
     } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '실행 실패') | Out-Null }
 })
 $btnArm.Add_Click({
-    try {
-        Sync-ConfigFromForm
-        if ($script:dtSchedule.Value -le (Get-Date)) { throw '예약 시각을 현재보다 뒤로 설정해 주세요.' }
-        if (-not (Confirm-LiveRun ("{0} 예약" -f $script:dtSchedule.Value.ToString('yyyy-MM-dd HH:mm:ss')))) { return }
-        $script:armed = $true
-        $btnArm.Enabled = $false
-        $btnCancelArm.Enabled = $true
-        Write-RunLog ("예약 시작: {0}" -f $script:dtSchedule.Value.ToString('yyyy-MM-dd HH:mm:ss'))
-        Update-RunButtons
-    } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '예약 실패') | Out-Null }
+    try { [void](Start-Schedule $true) }
+    catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '예약 시작 실패') | Out-Null }
 })
-$btnCancelArm.Add_Click({
-    $script:armed = $false
-    $script:repeatDone = 0
-    $btnArm.Enabled = $true
-    $btnCancelArm.Enabled = $false
-    $script:lblCountdown.Text = '예약이 취소되었습니다.'
-    Set-StatusPill '예약 취소됨' 'idle'
-    Write-RunLog '예약을 취소했습니다.'
-    Update-RunButtons
+
+# ----- 상단 단추 -----
+# 즉시발송 : 지금 한 번만 보냅니다. 예약과는 아무 상관이 없습니다.
+# 예약 시작 / 예약 중지 : 예약을 켜고 끕니다. 어디서 눌러도 같은 일이 일어납니다.
+$script:btnHeaderArm.Add_Click({
+    try { [void](Start-Schedule $true) }
+    catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '예약 시작 실패') | Out-Null }
 })
+$script:btnHeaderDisarm.Add_Click({ Stop-Schedule })
+$btnCancelArm.Add_Click({ Stop-Schedule })
 
 $btnTestSend.Add_Click({
     try {
