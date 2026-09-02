@@ -3,6 +3,7 @@
     [switch]$UiSmokeTest,
     [switch]$NoUpdateCheck,
     [switch]$ScanTest,
+    [switch]$ScanExact,
     [switch]$MaskNames,
     [switch]$SendBench,
     [int]$BenchCount = 3,
@@ -643,6 +644,25 @@ function New-DefaultConfig {
         PreloadRooms = $true
         PreloadDone = $false
         TruncatedRooms = @()
+        # ----- 채팅방 목록 (카카오톡에서 읽어 저장해 둔 것) -----
+        # 예전에는 방 이름을 쳐 넣고 검색해서 찾았습니다.
+        # 검색 결과를 글자로 읽다 보니 '뽀식'을 '포식'으로 읽는 일이 있었습니다.
+        # 이제는 카카오톡에 실제로 보이는 목록을 통째로 읽어 여기에 담아 둡니다.
+        #   { Name = '뽀식'; ListText = '뽀식'; Kind = 'group'; Order = 3;
+        #     Verified = $true; LastSeen = '2026-09-02 14:00:00' }
+        # Verified 는 방을 실제로 열어 창 제목으로 이름을 확인했다는 뜻입니다.
+        # 창 제목은 화면 글자 인식이 아니라 윈도우가 알려 주는 진짜 글자라 정확합니다.
+        Roster = @()
+        RosterScannedAt = ''
+        # 목록을 읽을 때 방을 하나씩 열어 창 제목으로 이름을 확정할지 정합니다.
+        # 느리지만 이름이 정확해집니다. 이름을 틀리게 읽는 문제가 여기서 사라집니다.
+        ScanExactNames = $true
+        # 자주 보내는 문구를 담아 둡니다.  { Name = '기본 안내문'; Text = '...' }
+        Templates = @()
+        # 한 방이 실패했을 때 몇 번까지 다시 해 볼지 정합니다.
+        RetryCount = 3
+        # 한 방을 끝내면 그 채팅창을 닫고 다음 방으로 갑니다.
+        CloseAfterSend = $true
         # 공휴일마다 어떻게 할지 하나씩 정합니다.
         #   { Date = '2026-09-24'; Name = '추석'; Action = 'move'; MoveTo = '2026-09-25' }
         #   Action: normal(그대로 보냄) / skip(그날은 안 보냄) / move(다른 날로 옮김)
@@ -1744,11 +1764,21 @@ function Set-ClipboardFileSafe([string]$Path) {
 # 목록에 보이는 이름은 길면 뒤가 잘립니다. 그래서 저장된 이름이 창 제목보다 짧을 수 있습니다.
 # 앞부분만 같으면 맞다고 볼 수도 있지만, 그러면 이름이 비슷한 다른 방에 보낼 위험이 있습니다.
 # 그래서 앞부분이 같은 방이 딱 하나일 때만 맞다고 봅니다. 둘 이상이면 보내지 않습니다.
+# 목록에서 창 제목으로 이름을 확정해 둔 방을 보낼 때는 이 표시를 켭니다.
+# 켜져 있으면 이름이 정확히 같을 때만 같은 방으로 봅니다.
+# 투투 와 토토, 뽀식 과 포식 은 서로 다른 방입니다. 비슷하다고 보내지 않습니다.
+# 마지막으로 불러온 저장 문구의 이름입니다. 발송 기록 표에 무엇을 보냈는지 적을 때 씁니다.
+$script:lastTemplateName = ''
+$script:strictTitleMatch = $false
 function Test-RoomTitle([string]$Actual, [string]$Expected) {
     $a = ([string]$Actual).Trim()
     $e = ([string]$Expected).Trim()
     if (-not $a -or -not $e) { return $false }
     if ($a -eq $e) { return $true }
+    if ($script:strictTitleMatch) {
+        # 정확히 같을 때만 맞다고 봅니다. 인원수만 떼어 내고 글자는 그대로 견줍니다.
+        return ((Get-RoomTitleName $a) -ceq (ConvertTo-ExactKey $e))
+    }
     # 카카오톡은 인원수를 붙여 "방이름 (12)" 형태로 창 제목을 표시하기도 합니다.
     if ($a -match ('^' + [regex]::Escape($e) + '\s*\(\d+\)$')) { return $true }
 
@@ -2465,136 +2495,378 @@ function Get-KakaoRoomNames([int]$MaxPages = 30) {
 # ---------------------------------------------------------------------------
 # 목록을 위에서부터 훑어 방을 찾아 엽니다.
 # 검색보다 느리지만, 검색창이 열리지 않는 환경에서도 확실히 동작합니다.
-function Open-RoomFromList([string]$Query, [object]$Layout, [int]$MaxPages = 40) {
-    $list = $Layout.List
-    if ($null -eq $list) { return $null }
-    $main = $Layout.Main
+# ---------------------------------------------------------------------------
+# 채팅방 목록 — 카카오톡에 보이는 그대로 읽어 저장합니다
+# ---------------------------------------------------------------------------
+# 예전 방식은 이랬습니다.
+#   방 이름을 쳐 넣는다 -> 검색한다 -> 검색 결과를 글자로 읽는다 -> 보낸다
+# 글자로 읽는 단계가 두 번 들어가서, '뽀식'을 '포식'으로 읽으면 그대로 틀렸습니다.
+#
+# 새 방식은 이렇습니다.
+#   카카오톡 목록을 통째로 읽는다 -> 방을 하나 열어 창 제목으로 이름을 확정한다
+#   -> 확정한 이름을 저장한다 -> 저장한 목록만 보고 보낸다
+# 창 제목은 화면 글자 인식이 아니라 윈도우가 알려 주는 진짜 글자입니다.
+# 그래서 뽀식은 언제나 뽀식입니다.
 
-    # 맨 위로 올립니다.
-    for ($i = 0; $i -lt ($MaxPages + 4); $i++) { Move-ListByWheel $list 'up' 8; Start-Sleep -Milliseconds 20 }
-    Start-Sleep -Milliseconds 250
+# 이름을 견줄 때 쓰는 열쇠입니다.
+# 앞뒤 빈칸과 사이의 겹친 빈칸만 정리하고, 글자는 하나도 바꾸지 않습니다.
+# 비슷한 정도로 견주지 않습니다. 투투 와 토토 는 다른 방입니다.
+function ConvertTo-ExactKey([string]$Text) {
+    $t = [string]$Text
+    if (-not $t) { return '' }
+    # 전각 빈칸과 눈에 안 보이는 빈칸을 보통 빈칸으로 맞춥니다.
+    $t = $t -replace '[​‌‍﻿]', ''
+    $t = ($t -replace '\s+', ' ').Trim()
+    return $t
+}
 
-    $existing = @{}
-    foreach ($process in (Get-KakaoProcesses)) {
-        foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
-            if ($window.Visible) { $existing[[string]$window.Handle] = $true }
-        }
+# 카카오톡은 단체방 창 제목 뒤에 인원수를 붙입니다.  예: 우리반 공지방 (24)
+# 인원수는 사람이 드나들면 바뀌므로 이름의 일부로 보지 않습니다.
+function Get-RoomTitleName([string]$Title) {
+    $t = ConvertTo-ExactKey $Title
+    if (-not $t) { return '' }
+    $t = $t -replace '\s*\(\s*\d{1,6}\s*\)\s*$', ''
+    return $t.Trim()
+}
+
+# 두 이름이 같은 방인지 봅니다. 정확히 같아야 같은 방입니다.
+function Test-SameRoomExact([string]$A, [string]$B) {
+    $x = ConvertTo-ExactKey $A
+    $y = ConvertTo-ExactKey $B
+    if (-not $x -or -not $y) { return $false }
+    return ($x -ceq $y)
+}
+
+# ---------------------------------------------------------------------------
+# 저장 메시지 — 자주 보내는 문구를 이름을 붙여 담아 둡니다
+# ---------------------------------------------------------------------------
+#   { Name = '기본 안내문'; Text = '...' }
+function Get-Templates {
+    $rows = @()
+    foreach ($item in @($script:config.Templates)) {
+        if ($null -eq $item) { continue }
+        $name = ([string]$item.Name).Trim()
+        if (-not $name) { continue }
+        $rows += [pscustomobject]@{ Name = $name; Text = [string]$item.Text }
     }
+    return @($rows)
+}
 
-    for ($page = 0; $page -lt $MaxPages; $page++) {
-        $lines = @(Get-OcrLines $list (Get-OcrScaleFor $list))
-        $matched = Find-SearchResultLine $lines $Query $list.Width
-        if ($null -ne $matched) {
-            $x = $list.Rect.Left + [int]($list.Width * 0.35)
-            $y = $list.Rect.Top + $matched.Top + 8
-            Invoke-ControlClick $list $x $y $true
-            $deadline = (Get-Date).AddMilliseconds(3500)
-            while ((Get-Date) -lt $deadline) {
-                foreach ($process in (Get-KakaoProcesses)) {
-                    foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
-                        if (-not $window.Visible -or $window.Handle -eq $main.Handle) { continue }
-                        if ($existing.ContainsKey([string]$window.Handle)) { continue }
-                        if ([string]::IsNullOrWhiteSpace($window.Title)) { continue }
-                        return $window
-                    }
-                }
-                Start-Sleep -Milliseconds 60
-            }
-            return $null
-        }
-        $names = @(Get-RoomNamesFromOcrLines $lines $list.Width)
-        $notches = [Math]::Max(3, [Math]::Min(8, $names.Count - 1))
-        Move-ListByWheel $list 'down' $notches
-        Start-Sleep -Milliseconds 170
-    }
+function Set-Templates([object[]]$Rows) {
+    Set-ConfigValue 'Templates' @($Rows)
+    try { Save-Config $script:config } catch { }
+}
+
+function Find-Template([string]$Name) {
+    $key = ([string]$Name).Trim()
+    if (-not $key) { return $null }
+    foreach ($row in (Get-Templates)) { if ($row.Name -eq $key) { return $row } }
     return $null
 }
 
-function Open-RoomBySearch([string]$Query, [string]$RoomType, [int]$TimeoutMs = 5000) {
-    $layout = Enter-KakaoTab $RoomType
-    if ($null -eq $layout.List) {
-        throw '채팅 목록을 찾지 못했습니다. 카카오톡 창을 조금 더 크게 하고, 목록이 보이게 해 주세요.'
+function Get-Roster {
+    $rows = @()
+    foreach ($item in @($script:config.Roster)) {
+        if ($null -eq $item) { continue }
+        $name = ConvertTo-ExactKey ([string]$item.Name)
+        if (-not $name) { continue }
+        $rows += [pscustomobject]@{
+            Name = $name
+            ListText = [string]$item.ListText
+            Kind = $(if ([string]$item.Kind) { [string]$item.Kind } else { 'unknown' })
+            Order = [int]$item.Order
+            Verified = [bool]$item.Verified
+            LastSeen = [string]$item.LastSeen
+        }
     }
+    return @($rows)
+}
+
+function Set-Roster([object[]]$Rows) {
+    Set-ConfigValue 'Roster' @($Rows)
+    Set-ConfigValue 'RosterScannedAt' (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+}
+
+function Find-RosterEntry([string]$Name) {
+    $key = ConvertTo-ExactKey $Name
+    if (-not $key) { return $null }
+    foreach ($row in (Get-Roster)) { if ($row.Name -ceq $key) { return $row } }
+    return $null
+}
+
+function Get-RosterKindText([string]$Kind) {
+    switch ([string]$Kind) {
+        'open'   { return '오픈채팅' }
+        'group'  { return '일반채팅(단체)' }
+        'direct' { return '일반채팅(1:1)' }
+        default  { return '일반채팅' }
+    }
+}
+
+# 방을 하나 열어 창 제목으로 이름을 확정하고 다시 닫습니다.
+# 목록을 글자로 읽은 이름은 틀릴 수 있지만, 창 제목은 틀리지 않습니다.
+function Read-RoomTitleAtRow([object]$List, [object]$Row, [IntPtr]$MainHandle) {
+    $chat = Get-SingleChatWindow (Open-RoomAtLine $List $Row $MainHandle)
+    if ($null -eq $chat) {
+        return [pscustomobject]@{ Ok = $false; Title = ''; Kind = 'unknown'; Reason = 'ROOM_OPEN_FAILED' }
+    }
+    $rawTitle = [string]$chat.Title
+    $name = Get-RoomTitleName $rawTitle
+    $kind = Get-RoomKindFromTitle $rawTitle ''
+    try { Close-ChatWindow $chat } catch { }
+    if (-not $name) {
+        return [pscustomobject]@{ Ok = $false; Title = ''; Kind = 'unknown'; Reason = 'TITLE_EMPTY' }
+    }
+    return [pscustomobject]@{ Ok = $true; Title = $name; Kind = $kind; Reason = '' }
+}
+
+$script:rosterCancel = $false
+function Stop-RosterScan { $script:rosterCancel = $true }
+
+# 카카오톡 목록을 위에서 끝까지 훑어 방을 모읍니다.
+#   Exact 가 참이면 방을 하나씩 열어 창 제목으로 이름을 확정합니다. 느리지만 정확합니다.
+#   Exact 가 거짓이면 화면 글자만 읽습니다. 빠르지만 이름이 틀릴 수 있습니다.
+# 같은 방은 한 번만 담습니다. 정확히 같은 이름일 때만 같은 방으로 봅니다.
+function Invoke-RosterScan([bool]$Exact, [int]$MaxPages) {
+    $script:rosterCancel = $false
+    $ready = Test-KakaoReady $true $false
+    if (-not $ready.Ok) { throw $ready.Reason }
+    $layout = $ready.Layout
     $main = $layout.Main
-    $existing = @{}
-    foreach ($process in (Get-KakaoProcesses)) {
-        foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
-            if ($window.Visible) { $existing[[string]$window.Handle] = $true }
-        }
+    if ($null -eq $layout.List) {
+        throw '채팅 목록을 찾지 못했습니다. 카카오톡 창을 조금 더 크게 하고 목록이 보이게 해 주세요.'
+    }
+    if (-not (Initialize-Ocr)) {
+        throw "화면의 글자를 읽을 수 없습니다.`r`n$($script:ocrError)"
     }
 
-    # 붙여넣기 직전에 포커스가 흔들리지 않도록 클립보드를 먼저 준비합니다.
-    Set-ClipboardTextSafe $Query
+    $viewType = Get-RoomTypeFromViewName $layout.ViewName
+    $fromOpenTab = ($viewType -eq $script:RoomTypeOpen)
+    $pageLimit = [Math]::Max(1, [Math]::Min(60, $MaxPages))
 
-    # 검색어를 넣고, 결과에서 검색어와 맞는 줄을 찾습니다. 한 번 실패하면 검색창을 새로 열어 다시 시도합니다.
-    $matchedLine = $null
-    $list = $layout.List
-    $searchUsable = $true
-    for ($attempt = 0; $attempt -lt 2; $attempt++) {
-        if (-not (Set-KakaoSearchQuery $layout $Query ($attempt -gt 0))) {
-            $searchUsable = $false
-            break
-        }
-        $current = Get-KakaoLayout (Get-MainKakaoWindow)
-        if ($null -ne $current.List) { $list = $current.List }
-        if ($null -eq $list) { continue }
-        $searchDeadline = (Get-Date).AddMilliseconds(2200)
-        while ((Get-Date) -lt $searchDeadline) {
-            Start-Sleep -Milliseconds 200
-            try {
-                $refreshed = Get-KakaoLayout (Get-MainKakaoWindow)
-                if ($null -ne $refreshed.List) { $list = $refreshed.List }
-                $lines = @(Get-OcrLines $list (Get-OcrScaleFor $list))
-                $matchedLine = Find-SearchResultLine $lines $Query $list.Width
-                if ($null -ne $matchedLine) { break }
-            } catch { }
-        }
-        if ($null -ne $matchedLine) { break }
-    }
+    # 담은 방들입니다. 열쇠는 정확한 이름입니다.
+    $found = New-Object System.Collections.Specialized.OrderedDictionary
+    # 이미 열어 본 줄입니다. 같은 줄을 두 번 열지 않으려고 적어 둡니다.
+    $openedRows = @{}
+    $openFailures = 0
+    $titleFailures = 0
+    $pages = 0
+    $noChange = 0
 
-    if ($null -eq $matchedLine) {
-        # 검색이 안 되는 환경이면 목록을 훑어 찾습니다.
-        Close-KakaoSearchBox
-        Start-Sleep -Milliseconds 200
-        if (-not $searchUsable) { Write-RunLog "검색창을 쓸 수 없어 목록에서 찾습니다: '$Query'" }
+    Move-ListToTop $layout.List $pageLimit
+    $howText = if ($Exact) { '방을 열어 이름 확정 (정확)' } else { '화면 글자만 읽기 (빠름)' }
+    Write-RunLog ("목록 읽기 시작: {0} / {1}" -f $layout.ViewName, $howText)
+
+    for ($page = 0; $page -lt $pageLimit; $page++) {
+        if ($script:rosterCancel) { Write-RunLog '목록 읽기를 멈췄습니다.'; break }
         $fresh = Get-KakaoLayout (Get-MainKakaoWindow)
-        return (Open-RoomFromList $Query $fresh)
-    }
+        if ($null -eq $fresh.List) { break }
+        $list = $fresh.List
+        $before = $found.Count
 
-    $resultX = $list.Rect.Left + [int]($list.Width * 0.35)
-    $resultY = $list.Rect.Top + $matchedLine.Top + 8
-    Invoke-PointClick $resultX $resultY $true
+        $rows = @(Get-ChatRoomRowsFromOcr (Get-OcrLines $list (Get-OcrScaleFor $list)) $list.Width)
+        if ($rows.Count -eq 0) { break }
+        $pages++
 
-    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
-    while ((Get-Date) -lt $deadline) {
-        foreach ($process in (Get-KakaoProcesses)) {
-            foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
-                if (-not $window.Visible -or $window.Handle -eq $main.Handle) { continue }
-                if ($existing.ContainsKey([string]$window.Handle)) { continue }
-                if ([string]::IsNullOrWhiteSpace($window.Title)) { continue }
-                Close-KakaoSearchBox
-                return $window
+        foreach ($row in $rows) {
+            if ($script:rosterCancel) { break }
+            $ocrName = ConvertTo-ExactKey ([string]$row.Title)
+
+            if (-not $Exact) {
+                # 빠른 방식입니다. 제목을 못 읽은 줄은 담지 않습니다.
+                # 대화내용을 이름 대신 쓰지 않습니다. 없는 것이 틀린 것보다 낫습니다.
+                if (-not $row.Ok -or -not $ocrName) { $titleFailures++; continue }
+                if (-not $found.Contains($ocrName)) {
+                    $kindGuess = if ($fromOpenTab) { 'open' } else { 'unknown' }
+                    $found.Add($ocrName, [pscustomobject]@{
+                        Name = $ocrName; ListText = $ocrName; Kind = $kindGuess; Verified = $false
+                    })
+                }
+                continue
             }
+
+            # 정확한 방식입니다. 줄을 열어 창 제목을 읽습니다.
+            # 제목을 못 읽은 줄도 엽니다. 위치만 알면 되기 때문입니다.
+            $rowKey = if ($ocrName) { $ocrName } else { ('행' + [string]$row.Top) }
+            if ($openedRows.ContainsKey($rowKey)) { continue }
+            if ($ocrName -and $found.Contains($ocrName)) { continue }
+
+            $result = Read-RoomTitleAtRow $list $row $main.Handle
+            $openedRows[$rowKey] = $true
+            if (-not $result.Ok) {
+                $openFailures++
+                if ($script:debugTitleRead) {
+                    Write-RunLog ("  [줄] 화면글자='{0}' -> 열지 못했습니다 ({1})" -f $ocrName, $result.Reason)
+                }
+                continue
+            }
+            $name = $result.Title
+            $kind = $result.Kind
+            if ($fromOpenTab) { $kind = 'open' }
+            if ($found.Contains($name)) { continue }
+            $found.Add($name, [pscustomobject]@{
+                Name = $name
+                ListText = $(if ($ocrName) { $ocrName } else { $name })
+                Kind = $kind
+                Verified = $true
+            })
+            if ($ocrName -and $ocrName -cne $name) {
+                Write-RunLog ("  이름 바로잡음: 화면에는 '{0}' 으로 읽혔지만 실제 이름은 '{1}' 입니다." -f $ocrName, $name)
+            }
+            Set-StatusPill ("목록 읽는 중 — $($found.Count)개") 'run'
+            [System.Windows.Forms.Application]::DoEvents()
         }
-        Start-Sleep -Milliseconds 80
+
+        if ($found.Count -eq $before) { $noChange++ } else { $noChange = 0 }
+        if ($noChange -ge 2) { break }
+
+        $notches = [Math]::Max(3, [Math]::Min(8, $rows.Count - 1))
+        Move-ListByWheel $list 'down' $notches
+        Start-Sleep -Milliseconds 200
     }
 
-    Close-KakaoSearchBox
-    # 이미 열려 있던 창이면 제목으로 찾습니다.
-    return (Find-ChatWindow $Query $main.Handle)
+    Move-ListToTop $layout.List $pages
+
+    $out = @()
+    $order = 0
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    foreach ($key in @($found.Keys)) {
+        $item = $found[$key]
+        $out += [pscustomobject]@{
+            Name = $item.Name
+            ListText = $item.ListText
+            Kind = $item.Kind
+            Order = $order
+            Verified = $item.Verified
+            LastSeen = $stamp
+        }
+        $order++
+    }
+    return [pscustomobject]@{
+        Rows = @($out)
+        Pages = $pages
+        ViewName = $layout.ViewName
+        FromOpenTab = $fromOpenTab
+        OpenFailures = $openFailures
+        TitleFailures = $titleFailures
+        Cancelled = [bool]$script:rosterCancel
+    }
 }
 
-# 읽어온 이름을 실제 채팅창 제목으로 교정합니다.
-function Resolve-RoomName([string]$Query, [string]$RoomType) {
-    $chat = Open-RoomBySearch $Query $RoomType
-    if ($null -eq $chat) { return $null }
-    $title = ([string]$chat.Title).Trim()
-    Close-ChatWindow $chat
-    if (-not $title) { return $null }
-    return ($title -replace '\s*\(\d+\)$', '')
+# 새로 읽은 목록을 저장된 목록과 견주어 무엇이 달라졌는지 알려 줍니다.
+# 오픈채팅 탭만 읽었다면 일반채팅 방은 지우지 않습니다. 안 본 것이지 없어진 것이 아닙니다.
+function Merge-RosterScan([object]$Scan, [bool]$ReplaceAll) {
+    $old = @(Get-Roster)
+    $oldByName = @{}
+    foreach ($row in $old) { $oldByName[$row.Name] = $row }
+
+    $new = @($Scan.Rows)
+    $newByName = @{}
+    foreach ($row in $new) { $newByName[$row.Name] = $row }
+
+    $added = @()
+    foreach ($row in $new) { if (-not $oldByName.ContainsKey($row.Name)) { $added += $row.Name } }
+
+    # 이번에 본 종류의 방 가운데 안 보인 것만 없어진 것으로 봅니다.
+    $scanKinds = @{}
+    foreach ($row in $new) { $scanKinds[$row.Kind] = $true }
+    $sawOpen = ([bool]$Scan.FromOpenTab -or $scanKinds.ContainsKey('open'))
+    $removed = @()
+    foreach ($row in $old) {
+        if ($newByName.ContainsKey($row.Name)) { continue }
+        if ($ReplaceAll) { $removed += $row.Name; continue }
+        $isOpen = ($row.Kind -eq 'open')
+        if ($isOpen -eq $sawOpen) { $removed += $row.Name }
+    }
+
+    # 합칩니다. 새로 읽은 것을 앞에 두고, 이번에 안 본 방은 뒤에 그대로 둡니다.
+    $merged = @()
+    $order = 0
+    foreach ($row in $new) {
+        $row.Order = $order; $order++
+        $merged += $row
+    }
+    if (-not $ReplaceAll) {
+        foreach ($row in $old) {
+            if ($newByName.ContainsKey($row.Name)) { continue }
+            if (@($removed) -contains $row.Name) { continue }
+            $row.Order = $order; $order++
+            $merged += $row
+        }
+    }
+    Set-Roster $merged
+    return [pscustomobject]@{
+        Total = @($merged).Count
+        Added = @($added)
+        Removed = @($removed)
+        Kept = (@($merged).Count - @($added).Count)
+    }
 }
+
+# ---------------------------------------------------------------------------
+# 검색으로 방을 찾던 옛 방식은 없앴습니다.
+# ---------------------------------------------------------------------------
+# 예전에는 이렇게 했습니다.
+#   방 이름을 검색창에 넣는다 -> 검색 결과를 화면 글자로 읽는다 -> 그 줄을 연다
+# 글자로 읽는 단계에서 '뽀식'이 '포식'으로 읽히면 그대로 엉뚱한 방이 열렸습니다.
+# 이제는 카카오톡 목록을 그대로 훑어 줄을 열고, 창 제목으로 방을 확인합니다.
+#   목록 읽기  : Invoke-RosterScan
+#   한 방 열기 : Open-RoomFromRoster
+#   발송       : Invoke-RosterSend
 
 # 첨부가 실제로 붙는지만 확인합니다.
+
+# 방 하나를 목록에서 찾아 엽니다. 검색은 쓰지 않습니다.
+# 열고 나서 창 제목이 정확히 같을 때만 그 창을 돌려줍니다.
+# 다른 방이 열리면 닫고 계속 찾습니다. 그래서 엉뚱한 방이 돌아오지 않습니다.
+function Open-RoomFromRoster([string]$Name, [int]$MaxPages = 0) {
+    $want = ConvertTo-ExactKey $Name
+    if (-not $want) { return $null }
+    if ($MaxPages -le 0) { $MaxPages = [Math]::Max(1, [int]$script:config.ScanPages) }
+    $listText = $want
+    $entry = Find-RosterEntry $want
+    if ($null -ne $entry -and $entry.ListText) { $listText = $entry.ListText }
+
+    $ready = Test-KakaoReady $true $false
+    if (-not $ready.Ok) { return $null }
+    $main = $ready.Layout.Main
+    Move-ListToTop $ready.Layout.List $MaxPages
+    $notTarget = @{}
+
+    for ($page = 0; $page -lt $MaxPages; $page++) {
+        $donePage = @{}
+        $guard = 0
+        $rowsSeen = 0
+        while ($guard -lt 20) {
+            $guard++
+            $fresh = Get-KakaoLayout (Get-MainKakaoWindow)
+            if ($null -eq $fresh.List) { return $null }
+            $list = $fresh.List
+            $rows = @(Get-ChatRoomRowsFromOcr (Get-OcrLines $list (Get-OcrScaleFor $list)) $list.Width)
+            if ($rows.Count -eq 0) { break }
+            $rowsSeen = $rows.Count
+            $pick = $null
+            foreach ($row in $rows) {
+                $posKey = 'P:' + [string]([int]([Math]::Round(([double]$row.Top) / 6.0)))
+                if ($donePage.ContainsKey($posKey)) { continue }
+                if ($notTarget.ContainsKey((Get-RowKey $row))) { continue }
+                if (Test-RowLooksLike $row $want $listText) { $pick = $row; break }
+            }
+            if ($null -eq $pick) { break }
+            $donePage['P:' + [string]([int]([Math]::Round(([double]$pick.Top) / 6.0)))] = $true
+            $chat = Get-SingleChatWindow (Open-RoomAtLine $list $pick $main.Handle)
+            if ($null -eq $chat) { $notTarget[(Get-RowKey $pick)] = $true; continue }
+            if ((Get-RoomTitleName ([string]$chat.Title)) -ceq $want) { return $chat }
+            try { Close-ChatWindow $chat } catch { }
+            $notTarget[(Get-RowKey $pick)] = $true
+        }
+        $fresh = Get-KakaoLayout (Get-MainKakaoWindow)
+        if ($null -eq $fresh.List) { return $null }
+        Move-ListByWheel $fresh.List 'down' ([Math]::Max(3, [Math]::Min(8, $rowsSeen - 1)))
+        Start-Sleep -Milliseconds 200
+    }
+    return $null
+}
 # 붙여 본 뒤 바로 치우고 보내지 않습니다.
 # 카카오톡 판이나 화면 배율이 사람마다 달라서, 실제로 보내기 전에
 # 이 확인을 한 번 해 보면 첨부가 될 환경인지 미리 알 수 있습니다.
@@ -2602,7 +2874,7 @@ function Invoke-AttachmentCheck([string]$Room, [string]$Path) {
     $report = @()
     $ready = Test-KakaoReady $true $false
     if (-not $ready.Ok) { return [pscustomobject]@{ Ok = $false; Text = [string]$ready.Reason } }
-    $chat = Get-SingleChatWindow (Open-RoomBySearch $Room (Get-RoomType $Room))
+    $chat = Open-RoomFromRoster $Room
     if ($null -eq $chat) {
         return [pscustomobject]@{ Ok = $false; Text = "'$Room' 채팅창을 열지 못했습니다." }
     }
@@ -2630,24 +2902,39 @@ function Invoke-AttachmentCheck([string]$Room, [string]$Path) {
     }
 }
 
-function Invoke-OneRoom([string]$Room, [string]$RoomType, [object]$Content) {
-    $chat = Get-SingleChatWindow (Open-RoomBySearch $Room $RoomType)
-    if ($null -eq $chat) {
-        Write-RunLog "건너뜀: '$Room' — 채팅창을 열지 못했습니다."
-        return $false
+
+
+# 방 하나가 어디까지 갔는지 적어 둡니다.
+# 첨부가 실패해서 다시 할 때, 이미 보낸 문구를 또 보내면 안 되기 때문입니다.
+#   { MessageSent = $false; SentFiles = @{} }
+$script:deliveryState = @{}
+$script:trackDelivery = $false
+
+function Reset-DeliveryState { $script:deliveryState = @{} }
+
+function Get-DeliveryState([string]$Room) {
+    if (-not $script:trackDelivery) {
+        return [pscustomobject]@{ MessageSent = $false; SentFiles = @{} }
     }
-    return (Send-ToChatWindow $chat $Room $Content)
+    if (-not $script:deliveryState.ContainsKey($Room)) {
+        $script:deliveryState[$Room] = [pscustomobject]@{ MessageSent = $false; SentFiles = @{} }
+    }
+    return $script:deliveryState[$Room]
 }
 
-# 이미 열린 채팅창에 보냅니다. 제목이 정확히 일치할 때만 전송합니다.
+# 이미 열린 채팅창에 보냅니다. 제목이 목표 방과 맞을 때만 전송합니다.
+# 차례는 이렇습니다.  확인 -> 첨부 -> 첨부 전송 -> 문구 입력 -> 문구 전송 -> 확인 -> 닫기
+# 하나라도 실패하면 이 방은 실패입니다. 보내지 못한 것을 완료라고 하지 않습니다.
 function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
     # 대화가 많이 쌓인 방은 창이 뜬 뒤에도 한참 뒤에야 내용이 채워집니다.
     # 그 사이에 판단하면 제목이 아직 이전 방이거나 입력칸이 준비되지 않은 상태라
     # 엉뚱한 방에 보내거나, 보내지도 않고 보낸 것으로 착각합니다.
     # 그래서 방이 완전히 열릴 때까지 기다린 뒤에만 손을 댑니다.
+    Set-SendProgress $Room '채팅방 확인' ''
     $ready = Wait-ChatWindowReady $Chat $Room ([int]$Content.OpenTimeoutMs)
     if ($null -eq $ready) {
-        Write-RunLog "건너뜀: '$Room' — ROOM_OPEN_FAILED 방이 다 열리지 않았습니다. (대화가 많으면 오래 걸립니다)"
+        $script:lastSendProblem = 'ROOM_OPEN_FAILED — 방이 다 열리지 않았거나 창 제목이 이 방과 달랐습니다.'
+        Write-RunLog "건너뜀: '$Room' — $($script:lastSendProblem)"
         Close-ChatWindow $Chat
         return $false
     }
@@ -2660,45 +2947,64 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
     }
 
     $inputBox = $ready.InputBox
+    $state = Get-DeliveryState $Room
+    $problems = @()
 
-    $message = [string]$Content.Message
-    if (-not [string]::IsNullOrWhiteSpace($message)) {
-        $how = Send-ChatText $chat $inputBox $message ([int]$Content.SettleMs)
-        if (-not $how) {
-            $why = $script:lastSendProblem
-            if (-not $why) { $why = '까닭을 알 수 없습니다.' }
-            Write-RunLog "실패: '$Room' — $why 입력칸을 비우고 넘어갑니다."
-            Clear-ChatInput $inputBox
-            Close-ChatWindow $chat
-            return $false
-        }
-        if ($script:sendMethodLogged -ne $how) {
-            $script:sendMethodLogged = $how
-            Write-RunLog "전송 방식: $how"
-        }
-    }
-
+    # ----- 1) 첨부 파일 -----
     $waitMs = [Math]::Max(500, [int]$Content.AttachmentWaitMs)
-    foreach ($attachment in @($Content.Attachments)) {
+    $files = @($Content.Attachments)
+    if ($files.Count -gt 0) { Set-SendProgress $Room '파일 첨부 중' '' }
+    foreach ($attachment in $files) {
         $path = [string]$attachment
+        if ($state.SentFiles.ContainsKey($path)) { continue }
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            Write-RunLog "첨부 건너뜀: 파일 없음 — $path"
+            $problems += "ATTACH_MISSING 파일이 없습니다: $path"
+            Write-RunLog "첨부 실패: 파일 없음 — $path"
             continue
         }
         $name = [System.IO.Path]::GetFileName($path)
         $outcome = $null
         try { $outcome = Send-ChatAttachment $chat $inputBox $path $waitMs $true } catch { $outcome = $null }
         if ($null -eq $outcome) {
+            $problems += "ATTACH_FAILED '$name' 을(를) 보내지 못했습니다."
             Write-RunLog "첨부 실패: '$name' — 알 수 없는 문제가 생겨 보내지 않았습니다."
         } elseif ($outcome.Sent) {
+            $state.SentFiles[$path] = $true
             Write-RunLog "첨부 보냄: $name  [$($outcome.Method) / $($outcome.SendWay)]"
         } else {
+            $problems += "ATTACH_FAILED '$name' — $($outcome.Reason)"
             Write-RunLog "첨부 실패: '$name' — $($outcome.Reason) (보내지 않았습니다)"
         }
     }
 
-    Write-RunLog "발송 완료: '$Room'"
+    # ----- 2) 문구 -----
+    $message = [string]$Content.Message
+    if ((-not [string]::IsNullOrWhiteSpace($message)) -and (-not $state.MessageSent)) {
+        Set-SendProgress $Room '메시지 전송 중' ''
+        $how = Send-ChatText $chat $inputBox $message ([int]$Content.SettleMs)
+        if (-not $how) {
+            $why = $script:lastSendProblem
+            if (-not $why) { $why = 'SEND_FAILED 까닭을 알 수 없습니다.' }
+            Write-RunLog "실패: '$Room' — $why 입력칸을 비우고 넘어갑니다."
+            Clear-ChatInput $inputBox
+            Close-ChatWindow $chat
+            $script:lastSendProblem = $why
+            return $false
+        }
+        $state.MessageSent = $true
+        if ($script:sendMethodLogged -ne $how) {
+            $script:sendMethodLogged = $how
+            Write-RunLog "전송 방식: $how"
+        }
+    }
+
     Close-ChatWindow $chat
+    if ($problems.Count -gt 0) {
+        $script:lastSendProblem = ($problems -join ' / ')
+        Write-RunLog "실패: '$Room' — 첨부를 다 보내지 못했습니다. $($script:lastSendProblem)"
+        return $false
+    }
+    Write-RunLog "발송 완료: '$Room'"
     return $true
 }
 
@@ -3570,199 +3876,286 @@ function Open-RoomAtLine([object]$List, [object]$Line, [IntPtr]$MainHandle, [int
     return $null
 }
 
-# 목록을 훑어 대상 방들을 처리합니다. 결과를 돌려줍니다.
-# 목록에서 이름으로 찾는 방식은 한계가 있습니다.
-# 목록에 보이는 이름은 길면 잘리고, 화면 글자 인식도 가끔 틀립니다.
-#   저장된 '스마트스토어 불로'  <->  실제 '스마트스토어 블로그 인스타그램 홍보방'
-# 그래서 비슷한 다른 줄이 걸려 엉뚱한 방이 열리곤 했습니다.
+# ---------------------------------------------------------------------------
+# 발송 — 저장된 목록을 기준으로 한 방씩 끝까지 처리합니다
+# ---------------------------------------------------------------------------
+# 한 방의 차례:  열기 -> 확인 -> 첨부 -> 첨부 전송 -> 문구 -> 문구 전송 -> 확인 -> 닫기
+# 한 방을 완전히 끝낸 뒤에 다음 방으로 갑니다. 창을 여러 개 열어 두지 않습니다.
 #
-# 창을 열고 나면 제목은 정확한 글자로 읽을 수 있습니다. 그것을 기준으로 삼습니다.
-# 열린 방이 우리가 보내려던 방 중 어느 것인지 다시 정하고, 맞으면 그 방으로 보냅니다.
-function Resolve-OpenedRoom([string]$Title, [object]$Pending) {
-    $title = ([string]$Title).Trim()
-    if (-not $title) { return '' }
-    $keyTitle = ConvertTo-CompareKey $title
-    if (-not $keyTitle) { return '' }
-    $best = ''
-    $bestScore = 0.0
-    $secondScore = 0.0
-    foreach ($candidate in @($Pending)) {
-        $name = [string]$candidate
-        if (-not $name) { continue }
-        $keyName = ConvertTo-CompareKey $name
-        if (-not $keyName) { continue }
-        $score = 0.0
-        try { $score = [double](Get-NameSimilarity $title $name) } catch { $score = 0.0 }
-        # 저장된 이름이 잘려 있으면 제목의 앞부분과 같습니다.
-        if ($keyName.Length -ge 4 -and $keyTitle.StartsWith($keyName)) { $score = [Math]::Max($score, 0.95) }
-        if ($keyTitle.Length -ge 4 -and $keyName.StartsWith($keyTitle)) { $score = [Math]::Max($score, 0.90) }
-        # 화면 글자 인식이 한 글자쯤 틀리는 일이 있습니다. (블 -> 불)
-        # 앞부분을 글자 단위로 견주어, 거의 같으면 같은 방으로 봅니다.
-        $shorter = [Math]::Min($keyName.Length, $keyTitle.Length)
-        if ($shorter -ge 6) {
-            $same = 0
-            for ($i = 0; $i -lt $shorter; $i++) { if ($keyName[$i] -eq $keyTitle[$i]) { $same++ } }
-            $ratio = [double]$same / [double]$shorter
-            if ($ratio -ge 0.8) { $score = [Math]::Max($score, 0.85) }
-        }
-        if ($score -gt $bestScore) { $secondScore = $bestScore; $bestScore = $score; $best = $name }
-        elseif ($score -gt $secondScore) { $secondScore = $score }
-    }
-    if ($bestScore -lt 0.62) { return '' }
-    # 두 방이 비슷하게 걸리면 어느 쪽인지 알 수 없습니다. 그때는 보내지 않습니다.
-    if (($bestScore - $secondScore) -lt 0.06) {
-        Write-RunLog "지나감: 열린 방 '$title' 이 보낼 목록의 여러 방과 비슷해 어느 쪽인지 정할 수 없습니다."
-        return ''
-    }
-    return $best
+# 지켜야 할 것이 하나 있습니다.
+#   고른 방은 반드시 '발송 완료' 아니면 '실패' 로 끝납니다.
+#   아무 상태 없이 목록에서 사라지는 방은 없습니다.
+#   그래서 고른 수 = 완료 + 실패 가 언제나 맞아떨어집니다.
+
+# 줄 하나를 가리키는 열쇠입니다. 같은 줄을 두 번 열지 않으려고 씁니다.
+function Get-RowKey([object]$Row) {
+    $name = ConvertTo-ExactKey ([string]$Row.Title)
+    if ($name) { return 'N:' + $name }
+    return 'Y:' + [string]([int]([Math]::Round(([double]$Row.Top) / 6.0)))
 }
 
-# 다음부터는 헤매지 않도록, 저장된 이름을 실제 창 제목으로 바꿔 둡니다.
-# 목록에서 찾을 때 쓰던 글자는 따로 기억해 둡니다.
-function Update-RoomRealName([string]$OldName, [string]$RealTitle, [string]$ListText) {
-    if (-not $OldName -or -not $RealTitle) { return $OldName }
-    if ($OldName -eq $RealTitle) { return $OldName }
+# 이 줄이 찾는 방일 것 같은지 봅니다.
+# 여기는 관대해도 됩니다. 어느 줄을 열어 볼지 고르는 것뿐입니다.
+# 실제로 보낼지는 방을 연 뒤 창 제목이 정확히 같은지로 정합니다.
+function Test-RowLooksLike([object]$Row, [string]$Name, [string]$ListText) {
+    $rowText = ConvertTo-CompareKey ([string]$Row.Title)
+    if (-not $rowText) { return $false }
+    foreach ($candidate in @($Name, $ListText)) {
+        $key = ConvertTo-CompareKey $candidate
+        if (-not $key) { continue }
+        if ($rowText -eq $key) { return $true }
+        if ($key.Length -ge 3 -and $rowText.StartsWith($key)) { return $true }
+        if ($rowText.Length -ge 3 -and $key.StartsWith($rowText)) { return $true }
+        if ((Get-NameSimilarity $rowText $key) -ge 0.7) { return $true }
+    }
+    return $false
+}
+
+# 발송 결과를 표로 남깁니다. 시간 / 채팅방 / 문구 / 첨부 / 결과 / 사유
+function Add-SendLogRow([string]$Room, [object]$Content, [bool]$Ok, [string]$Reason) {
     try {
-        $type = Get-RoomType $OldName
-        Set-RoomType $RealTitle $type
-        if ($ListText) { Set-RoomListName $RealTitle $ListText }
-        Rename-RoomInGroups $OldName $RealTitle
-        $script:config.Rooms = @(@($script:config.Rooms) | ForEach-Object { if ([string]$_ -eq $OldName) { $RealTitle } else { [string]$_ } } | Select-Object -Unique)
-        $script:config.KnownRooms = @(@($script:config.KnownRooms) | ForEach-Object { if ([string]$_ -eq $OldName) { $RealTitle } else { [string]$_ } } | Select-Object -Unique)
-        Write-RunLog "이름 바로잡음: '$OldName' → '$RealTitle'"
+        $path = Join-Path $LogDir ('발송기록-' + (Get-Date -Format 'yyyy-MM') + '.csv')
+        if (-not (Test-Path -LiteralPath $path)) {
+            Set-Content -LiteralPath $path -Value '시간,채팅방,메시지,첨부,결과,사유' -Encoding UTF8
+        }
+        $files = @()
+        foreach ($item in @($Content.Attachments)) {
+            try { $files += [System.IO.Path]::GetFileName([string]$item) } catch { $files += [string]$item }
+        }
+        $title = [string]$Content.TemplateName
+        if (-not $title) {
+            $body = ([string]$Content.Message) -replace '\s+', ' '
+            if ($body.Length -gt 20) { $body = $body.Substring(0, 20) + '…' }
+            $title = $body
+        }
+        $cells = @(
+            (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),
+            $Room,
+            $title,
+            ($files -join ' '),
+            $(if ($Ok) { '성공' } else { '실패' }),
+            ([string]$Reason)
+        )
+        $line = ($cells | ForEach-Object { '"' + (([string]$_) -replace '"', '""') + '"' }) -join ','
+        Add-Content -LiteralPath $path -Value $line -Encoding UTF8
     } catch { }
-    return $RealTitle
 }
 
-function Invoke-SweepOverList([string[]]$Targets, [object]$Content, [int]$MaxPages, [int]$IntervalSeconds, [int]$BatchSize, [int]$BatchRestMinutes) {
-    $remaining = @{}
-    foreach ($name in $Targets) { $remaining[[string]$name] = $true }
-    # 열어 봤더니 보낼 목록에 없던 줄입니다. 같은 줄을 되풀이해 고르지 않도록 기억합니다.
-    $rejected = @{}
+# 목록을 한 번 훑으면서 처리할 수 있는 방을 모두 처리합니다.
+#   Exhaustive 가 참이면 아직 정체를 모르는 줄을 모두 열어 봅니다.
+#   이름으로 못 찾은 방을 끝까지 찾아내기 위한 방식입니다. 느리지만 빠뜨리지 않습니다.
+# 보낸 방만 Pending 에서 뺍니다. 실패한 방은 남겨 두어 다음 회차에 다시 해 봅니다.
+function Invoke-ListPass([object]$Pending, [object]$Content, [int]$MaxPages,
+                         [int]$IntervalSeconds, [int]$BatchSize, [int]$BatchRestMinutes,
+                         [hashtable]$NotTarget, [hashtable]$Reasons, [bool]$Exhaustive,
+                         [int]$Total, [object]$Counter) {
     $sent = 0
-    $failed = 0
-    $processed = 0
+    $tried = 0
+    $interrupted = $false
 
     $ready = Test-KakaoReady $true $false
     if (-not $ready.Ok) { throw $ready.Reason }
-    $layout = $ready.Layout
-    $main = $layout.Main
-    Move-ListToTop $layout.List $MaxPages
+    $main = $ready.Layout.Main
+    Move-ListToTop $ready.Layout.List $MaxPages
 
     for ($page = 0; $page -lt $MaxPages; $page++) {
-        if ($remaining.Count -eq 0) { break }
+        if ($Pending.Count -eq 0) { break }
+        if (Test-RunInterrupted) { $interrupted = $true; break }
 
-        # 한 화면에서 처리할 수 있는 방을 모두 처리한 뒤 다음 화면으로 넘어갑니다.
+        # 이 화면에서 이미 열어 본 줄입니다. 화면을 내리기 전까지만 씁니다.
+        $donePage = @{}
         $guard = 0
-        while ($remaining.Count -gt 0 -and $guard -lt 30) {
+        $rowsSeen = 0
+
+        while ($guard -lt 40) {
             $guard++
+            if ($Pending.Count -eq 0) { break }
+            if (Test-RunInterrupted) { $interrupted = $true; break }
+
             $fresh = Get-KakaoLayout (Get-MainKakaoWindow)
             if ($null -eq $fresh.List) { break }
             $list = $fresh.List
-            $nameLines = @(Get-ListNameLines $list)
-            if ($nameLines.Count -eq 0) { break }
+            $rows = @(Get-ChatRoomRowsFromOcr (Get-OcrLines $list (Get-OcrScaleFor $list)) $list.Width)
+            if ($rows.Count -eq 0) { break }
+            $rowsSeen = $rows.Count
 
-            $hit = $null
-            $hitName = ''
-            foreach ($line in $nameLines) {
-                if ($rejected.ContainsKey((ConvertTo-CompareKey ([string]$line.Text)))) { continue }
-                foreach ($candidate in @($remaining.Keys)) {
-                    # 저장된 이름과, 목록에서 글자로 읽히던 이름 둘 다로 찾습니다.
-                    $listName = Get-RoomListName $candidate
-                    $matchedHere = ($null -ne (Find-SearchResultLine @($line) $candidate $list.Width))
-                    if (-not $matchedHere -and $listName -ne $candidate) {
-                        $matchedHere = ($null -ne (Find-SearchResultLine @($line) $listName $list.Width))
-                    }
-                    if ($matchedHere) {
-                        $hit = $line
-                        $hitName = [string]$candidate
-                        break
-                    }
+            # 열어 볼 줄을 하나 고릅니다.
+            # 여기는 관대해도 됩니다. 어느 줄을 열지 고르는 것뿐입니다.
+            $pick = $null
+            foreach ($row in $rows) {
+                $posKey = 'P:' + [string]([int]([Math]::Round(([double]$row.Top) / 6.0)))
+                if ($donePage.ContainsKey($posKey)) { continue }
+                if ($NotTarget.ContainsKey((Get-RowKey $row))) { continue }
+                if ($Exhaustive) { $pick = $row; break }
+                foreach ($key in @($Pending.Keys)) {
+                    $listText = [string]$key
+                    $entry = Find-RosterEntry ([string]$key)
+                    if ($null -ne $entry -and $entry.ListText) { $listText = $entry.ListText }
+                    if (Test-RowLooksLike $row ([string]$key) $listText) { $pick = $row; break }
                 }
-                if ($null -ne $hit) { break }
+                if ($null -ne $pick) { break }
             }
-            if ($null -eq $hit) { break }
+            if ($null -eq $pick) { break }
+            $donePage['P:' + [string]([int]([Math]::Round(([double]$pick.Top) / 6.0)))] = $true
 
-            if (Test-RunInterrupted) { break }
-
-            Set-SendProgress $hitName '채팅방 여는 중' ''
-            $chat = Get-SingleChatWindow (Open-RoomAtLine $list $hit $main.Handle)
+            # 줄을 엽니다. 여기서 처음으로 정확한 이름을 알게 됩니다.
+            $chat = Get-SingleChatWindow (Open-RoomAtLine $list $pick $main.Handle)
             if ($null -eq $chat) {
-                # 이 줄로는 열리지 않습니다. 다시 고르지 않도록 기억해 둡니다.
-                $rejected[(ConvertTo-CompareKey ([string]$hit.Text))] = $true
-                $remaining.Remove($hitName)
-                $processed++
-                $failed++
-                Set-SendProgress $hitName '실패' '채팅방을 열지 못했습니다'
-                Write-RunLog "건너뜀: '$hitName' — ROOM_NOT_FOUND 채팅창을 열지 못했습니다."
-            } else {
-                # 열린 창 제목이 정답입니다. 목록에서 읽은 이름보다 정확합니다.
-                $openedTitle = ([string]$chat.Title).Trim()
-                $realName = Resolve-OpenedRoom $openedTitle @($remaining.Keys)
-                if (-not $realName) {
-                    # 보내려던 방이 아닙니다. 닫고 이 줄은 다시 고르지 않습니다.
-                    Write-RunLog "지나감: ROOM_TYPE_MISMATCH 열린 방 '$openedTitle' 은(는) 보낼 목록에 없습니다."
-                    Close-ChatWindow $chat
-                    $rejected[(ConvertTo-CompareKey ([string]$hit.Text))] = $true
-                    continue
-                }
-                if ($realName -ne $hitName) {
-                    Write-RunLog "바로잡음: '$hitName' 로 찾았는데 실제로 열린 방은 '$realName' 입니다."
-                }
-                $remaining.Remove($realName)
-                $processed++
-                Set-StatusPill ("발송 중 $($processed)/$($Targets.Count) — $($realName)") 'run'
-                # 다음부터 정확히 찾도록 저장된 이름을 실제 제목으로 바꿔 둡니다.
-                $realName = Update-RoomRealName $realName $openedTitle ([string]$hit.Text)
-                # 창 제목에 인원수가 붙어 있으면 단체방입니다. 이름으로 짐작하지 않습니다.
-                Set-RoomKind $realName (Get-RoomKindFromTitle $openedTitle (Get-RoomType $realName))
-                Set-SendProgress $realName '전송 중' ''
-                if (Send-ToChatWindow $chat $realName $Content) {
-                    $sent++
-                    Set-SendProgress $realName '완료' ''
+                $NotTarget[(Get-RowKey $pick)] = $true
+                continue
+            }
+            $openedName = Get-RoomTitleName ([string]$chat.Title)
+            $openedKey = ConvertTo-ExactKey $openedName
+
+            # 보낼 목록에 정확히 같은 이름이 있어야 보냅니다.
+            # 비슷하다고 보내지 않습니다. 투투 를 찾다가 토토 가 열리면 그냥 닫습니다.
+            if (-not $openedKey -or -not $Pending.Contains($openedKey)) {
+                if ($openedKey) {
+                    Write-RunLog "지나감: 열린 방 '$openedName' 은(는) 보낼 목록에 없습니다."
+                    Set-StatusPill ("남은 방 찾는 중 — 방금 '$openedName' 확인") 'run'
                 } else {
-                    $failed++
-                    $why = $script:lastSendProblem
-                    if (-not $why) { $why = '까닭을 알 수 없습니다' }
-                    Set-SendProgress $realName '실패' $why
+                    Write-RunLog '지나감: 열린 창의 제목을 읽지 못했습니다.'
                 }
+                try { Close-ChatWindow $chat } catch { }
+                $NotTarget[(Get-RowKey $pick)] = $true
+                if ($openedKey) { $NotTarget['N:' + $openedKey] = $true }
+                continue
             }
 
-            # 방 간격
-            if ($remaining.Count -gt 0) {
-                if ($BatchSize -gt 0 -and $BatchRestMinutes -gt 0 -and ($processed % $BatchSize) -eq 0) {
+            # 여기서부터 이 방을 끝까지 처리합니다. 끝나기 전에는 다음 방으로 가지 않습니다.
+            $tried++
+            $Counter.Value = $Total - $Pending.Count + 1
+            Set-StatusPill ("발송 중 $($Counter.Value)/$Total — $openedName") 'run'
+            Set-SendProgress $openedName '채팅방 여는 중' ''
+            Set-RoomKind $openedName (Get-RoomKindFromTitle ([string]$chat.Title) (Get-RoomType $openedName))
+
+            $script:strictTitleMatch = $true
+            $ok = $false
+            try { $ok = [bool](Send-ToChatWindow $chat $openedName $Content) }
+            catch {
+                $ok = $false
+                $script:lastSendProblem = 'SEND_ERROR — ' + $_.Exception.Message
+            }
+            finally { $script:strictTitleMatch = $false }
+
+            if ($ok) {
+                $Pending.Remove($openedKey)
+                $NotTarget['N:' + $openedKey] = $true
+                $NotTarget[(Get-RowKey $pick)] = $true
+                $sent++
+                Set-SendProgress $openedName '발송 완료' ''
+                if ($Reasons.ContainsKey($openedKey)) { $Reasons.Remove($openedKey) }
+            } else {
+                # 실패한 방은 목록에 남겨 둡니다. 다음 회차에 다시 해 봅니다.
+                $why = $script:lastSendProblem
+                if (-not $why) { $why = 'SEND_FAILED 까닭을 알 수 없습니다.' }
+                $Reasons[$openedKey] = $why
+                Set-SendProgress $openedName '재시도' $why
+            }
+
+            # 방 사이 간격
+            if ($Pending.Count -gt 0) {
+                if ($BatchSize -gt 0 -and $BatchRestMinutes -gt 0 -and $sent -gt 0 -and ($sent % $BatchSize) -eq 0) {
                     Write-RunLog "묶음 $($BatchSize)개를 처리했습니다. $($BatchRestMinutes)분 쉽니다."
-                    Set-StatusPill "$($BatchRestMinutes)분 쉬는 중 — $($processed)/$($Targets.Count)" 'wait'
-                    if (Wait-Interruptible ($BatchRestMinutes * 60)) { break }
+                    Set-StatusPill "$($BatchRestMinutes)분 쉬는 중 — $($Counter.Value)/$Total" 'wait'
+                    if (Wait-Interruptible ($BatchRestMinutes * 60)) { $interrupted = $true; break }
                 } elseif ($IntervalSeconds -gt 0) {
-                    if (Wait-Interruptible $IntervalSeconds) { break }
-                } else {
-                    if (Test-RunInterrupted) { break }
-                }
+                    if (Wait-Interruptible $IntervalSeconds) { $interrupted = $true; break }
+                } elseif (Test-RunInterrupted) { $interrupted = $true; break }
             }
         }
 
-        if ($remaining.Count -eq 0) { break }
+        if ($interrupted -or $Pending.Count -eq 0) { break }
         $fresh = Get-KakaoLayout (Get-MainKakaoWindow)
         if ($null -eq $fresh.List) { break }
-        $names = @(Get-RoomNamesFromOcrLines (Get-OcrLines $fresh.List (Get-OcrScaleFor $fresh.List)) $fresh.List.Width)
-        $notches = [Math]::Max(3, [Math]::Min(8, $names.Count - 1))
+        $notches = [Math]::Max(3, [Math]::Min(8, $rowsSeen - 1))
         Move-ListByWheel $fresh.List 'down' $notches
         Start-Sleep -Milliseconds 200
     }
 
     return [pscustomobject]@{
         Sent = $sent
-        Failed = $failed
-        NotFound = @($remaining.Keys)
+        Tried = $tried
+        Interrupted = $interrupted
     }
 }
+# 고른 방을 모두 처리합니다.
+#   1회차: 이름으로 줄을 찾아 엽니다. 빠릅니다.
+#   2회차부터: 아직 정체를 모르는 줄을 모두 열어 봅니다. 느리지만 빠뜨리지 않습니다.
+#   끝까지 못 보낸 방은 실패로 마무리합니다. 조용히 사라지는 방은 없습니다.
+# 그래서 언제나  고른 수 = 성공 + 실패  입니다.
+function Invoke-RosterSend([string[]]$Targets, [object]$Content, [int]$MaxPages,
+                           [int]$IntervalSeconds, [int]$BatchSize, [int]$BatchRestMinutes,
+                           [int]$RetryCount) {
+    $pending = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($name in $Targets) {
+        $key = ConvertTo-ExactKey ([string]$name)
+        if (-not $key) { continue }
+        if (-not $pending.Contains($key)) { $pending.Add($key, $true) }
+    }
+    $total = $pending.Count
+    if ($total -eq 0) { throw '보낼 채팅방을 한 개 이상 골라 주세요.' }
 
-# 카카오톡을 막 켰거나 이 프로그램을 처음 쓰는 경우,
-# 채팅방마다 대화를 처음부터 새로 불러옵니다. 방에 따라 12초까지 걸립니다.
-# 다 불러오기 전에는 Enter 를 눌러도 전송이 되지 않습니다.
-# 그래서 보내기 전에 대상 방을 한 번씩 열어 두면 이후가 훨씬 안정적입니다.
-# 한 번 열어 둔 방은 카카오톡이 기억하고 있어서 다음부터는 금방 열립니다.
+    $sent = 0
+    $reasons = @{}
+    $notTarget = @{}
+    $counter = [ref]0
+    $rounds = [Math]::Max(1, [Math]::Min(6, $RetryCount + 1))
+    $interrupted = $false
+
+    for ($round = 1; $round -le $rounds; $round++) {
+        if ($pending.Count -eq 0) { break }
+        if (Test-RunInterrupted) { $interrupted = $true; break }
+        $exhaustive = ($round -gt 1)
+        $howText = if ($exhaustive) { '아직 못 찾은 방을 위해 목록의 모든 줄을 하나씩 열어 확인합니다 (오래 걸립니다)' } else { '이름으로 찾아 열기' }
+        Write-RunLog ("{0}회차: 남은 방 {1}개 / {2}" -f $round, $pending.Count, $howText)
+
+        $before = $pending.Count
+        $pass = Invoke-ListPass $pending $Content $MaxPages $IntervalSeconds $BatchSize $BatchRestMinutes $notTarget $reasons $exhaustive $total $counter
+        $sent += $pass.Sent
+        Write-RunLog ("{0}회차 결과: 보냄 {1} / 남음 {2}" -f $round, $pass.Sent, $pending.Count)
+
+        if ($pass.Interrupted) { $interrupted = $true; break }
+        if ($pending.Count -eq 0) { break }
+        # 훑었는데 하나도 줄지 않고 열어 본 방도 없으면 더 해도 같습니다.
+        if ($exhaustive -and $pending.Count -eq $before -and $pass.Tried -eq 0) { break }
+        if ($round -lt $rounds) {
+            foreach ($key in @($pending.Keys)) { Set-SendProgress ([string]$key) '재시도' ("$($round + 1)회차를 기다리는 중") }
+            Start-Sleep -Milliseconds 800
+        }
+    }
+
+    # 남은 방을 실패로 마무리합니다. 이 줄이 있어야 숫자가 맞아떨어집니다.
+    $failed = 0
+    foreach ($key in @($pending.Keys)) {
+        $name = [string]$key
+        $why = 'ROOM_NOT_FOUND — 카카오톡 채팅 목록에서 이 방을 찾지 못했습니다.'
+        if ($interrupted) { $why = 'STOPPED — 사용자가 멈춰서 이 방은 처리하지 못했습니다.' }
+        if ($reasons.ContainsKey($key)) { $why = [string]$reasons[$key] }
+        $failed++
+        Set-SendProgress $name '실패' $why
+        Write-RunLog "실패: '$name' — $why"
+        Add-SendLogRow $name $Content $false $why
+    }
+    # 성공한 방을 기록에 남깁니다.
+    foreach ($name in $Targets) {
+        $key = ConvertTo-ExactKey ([string]$name)
+        if (-not $key -or $pending.Contains($key)) { continue }
+        Add-SendLogRow $key $Content $true ''
+    }
+
+    # 숫자가 맞는지 스스로 확인합니다. 안 맞으면 그대로 알려 드립니다.
+    $handled = $sent + $failed
+    if ($handled -ne $total) {
+        Write-RunLog "COUNT_MISMATCH — 고른 방 $total 개인데 처리한 방은 $handled 개입니다. 기록을 확인해 주세요."
+    }
+    return [pscustomobject]@{
+        Total = $total
+        Sent = $sent
+        Failed = $failed
+        Interrupted = $interrupted
+    }
+}
 # 이 컴퓨터가 어떤 환경인지 기록에 남깁니다.
 # PC 마다 되고 안 되고가 갈릴 때, 이 기록이 있어야 원인을 짚을 수 있습니다.
 # 대화 내용은 남기지 않습니다. 화면과 창 정보만 남깁니다.
@@ -3877,25 +4270,33 @@ function Update-ProgressView {
         foreach ($name in $script:progressOrder) {
             $row = $script:progressRows[$name]
             $status = [string]$row.Status
+            # 상태는 여덟 가지입니다.
+            #   대기 / 채팅방 여는 중 / 채팅방 확인 / 파일 첨부 중 /
+            #   메시지 전송 중 / 발송 완료 / 재시도 / 실패
             switch ($status) {
-                '완료' { $done++ }
-                '실패' { $failed++ }
-                '대기' { $waiting++ }
-                default  { $running++ }
+                '발송 완료' { $done++ }
+                '실패'      { $failed++ }
+                '대기'      { $waiting++ }
+                default     { $running++ }
             }
             $item = New-Object System.Windows.Forms.ListViewItem($name)
-            [void]$item.SubItems.Add((Get-RoomKindText $name))
+            $kindText = '일반채팅'
+            $entry = Find-RosterEntry $name
+            if ($null -ne $entry) { $kindText = Get-RosterKindText $entry.Kind }
+            else { $kindText = Get-RoomKindText $name }
+            [void]$item.SubItems.Add($kindText)
             [void]$item.SubItems.Add($status)
             [void]$item.SubItems.Add([string]$row.Note)
-            if ($status -eq '완료') { $item.ForeColor = $Theme.Success }
+            if ($status -eq '발송 완료') { $item.ForeColor = $Theme.Success }
             elseif ($status -eq '실패') { $item.ForeColor = $Theme.Danger }
+            elseif ($status -eq '재시도') { $item.ForeColor = $Theme.Warning }
             elseif ($status -eq '대기') { $item.ForeColor = $Theme.Muted }
             else { $item.ForeColor = $Theme.Info }
             [void]$script:lstProgress.Items.Add($item)
         }
     } finally { $script:lstProgress.EndUpdate() }
     if ($null -ne $script:lblProgressCount) {
-        $script:lblProgressCount.Text = "전체 $total    완료 $done    진행중 $running    대기 $waiting    실패 $failed"
+        $script:lblProgressCount.Text = "전체 $total    발송 완료 $done    진행중 $running    대기 $waiting    실패 $failed"
     }
     if ($null -ne $script:barProgress) {
         $script:barProgress.Maximum = [Math]::Max(1, $total)
@@ -3904,8 +4305,145 @@ function Update-ProgressView {
     try { [System.Windows.Forms.Application]::DoEvents() } catch { }
 }
 
+
+# 체크한 방의 이름이 맞는지 하나씩 열어 확인하고, 틀렸으면 바로잡습니다.
+# 검색은 쓰지 않습니다. 목록을 훑어 줄을 열고 창 제목을 읽습니다.
+# 창 제목은 화면 글자 인식이 아니라 윈도우가 알려 주는 진짜 글자라 틀리지 않습니다.
+function Invoke-RoomNameVerify([string[]]$Names, [int]$MaxPages) {
+    $pending = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($name in $Names) {
+        $key = ConvertTo-ExactKey ([string]$name)
+        if ($key -and -not $pending.Contains($key)) { $pending.Add($key, $true) }
+    }
+    $confirmed = @()
+    $renamed = @()
+    $notTarget = @{}
+
+    $ready = Test-KakaoReady $true $false
+    if (-not $ready.Ok) { throw $ready.Reason }
+    $main = $ready.Layout.Main
+    Move-ListToTop $ready.Layout.List $MaxPages
+
+    for ($page = 0; $page -lt $MaxPages; $page++) {
+        if ($pending.Count -eq 0) { break }
+        $donePage = @{}
+        $guard = 0
+        $rowsSeen = 0
+        while ($guard -lt 40 -and $pending.Count -gt 0) {
+            $guard++
+            $fresh = Get-KakaoLayout (Get-MainKakaoWindow)
+            if ($null -eq $fresh.List) { break }
+            $list = $fresh.List
+            $rows = @(Get-ChatRoomRowsFromOcr (Get-OcrLines $list (Get-OcrScaleFor $list)) $list.Width)
+            if ($rows.Count -eq 0) { break }
+            $rowsSeen = $rows.Count
+
+            $pick = $null
+            $pickedFor = ''
+            foreach ($row in $rows) {
+                $posKey = 'P:' + [string]([int]([Math]::Round(([double]$row.Top) / 6.0)))
+                if ($donePage.ContainsKey($posKey)) { continue }
+                if ($notTarget.ContainsKey((Get-RowKey $row))) { continue }
+                foreach ($key in @($pending.Keys)) {
+                    $listText = [string]$key
+                    $entry = Find-RosterEntry ([string]$key)
+                    if ($null -ne $entry -and $entry.ListText) { $listText = $entry.ListText }
+                    if (Test-RowLooksLike $row ([string]$key) $listText) { $pick = $row; $pickedFor = [string]$key; break }
+                }
+                if ($null -ne $pick) { break }
+            }
+            if ($null -eq $pick) { break }
+            $donePage['P:' + [string]([int]([Math]::Round(([double]$pick.Top) / 6.0)))] = $true
+
+            $chat = Get-SingleChatWindow (Open-RoomAtLine $list $pick $main.Handle)
+            if ($null -eq $chat) { $notTarget[(Get-RowKey $pick)] = $true; continue }
+            $rawTitle = [string]$chat.Title
+            $title = Get-RoomTitleName $rawTitle
+            $kind = Get-RoomKindFromTitle $rawTitle ''
+            try { Close-ChatWindow $chat } catch { }
+            $notTarget[(Get-RowKey $pick)] = $true
+            if (-not $title) { continue }
+
+            if ($pending.Contains($title)) {
+                # 이름이 이미 맞습니다.
+                $pending.Remove($title)
+                $confirmed += $title
+                Set-RosterVerified $title $kind $title
+                Write-RunLog "이름 확인: '$title' 맞습니다."
+                continue
+            }
+            # 이름이 다릅니다. 우리가 찾던 그 방이 맞는지 조심스럽게 봅니다.
+            #   비슷하고, 다른 대상과 헷갈리지 않을 때만 바로잡습니다.
+            $looksLikeTarget = ((Get-NameSimilarity $title $pickedFor) -ge 0.6)
+            $clashes = 0
+            foreach ($key in @($pending.Keys)) {
+                if ((Get-NameSimilarity $title ([string]$key)) -ge 0.6) { $clashes++ }
+            }
+            if ($looksLikeTarget -and $clashes -eq 1) {
+                $pending.Remove($pickedFor)
+                $renamed += ("$pickedFor -> $title")
+                Set-RosterVerified $title $kind $pickedFor
+                Write-RunLog "이름 바로잡음: '$pickedFor' → '$title'"
+            } else {
+                Write-RunLog "지나감: 열린 방 '$title' 은(는) 확인하려던 방이 아닙니다."
+                $notTarget['N:' + $title] = $true
+            }
+        }
+        if ($pending.Count -eq 0) { break }
+        $fresh = Get-KakaoLayout (Get-MainKakaoWindow)
+        if ($null -eq $fresh.List) { break }
+        Move-ListByWheel $fresh.List 'down' ([Math]::Max(3, [Math]::Min(8, $rowsSeen - 1)))
+        Start-Sleep -Milliseconds 200
+    }
+
+    return [pscustomobject]@{
+        Confirmed = @($confirmed)
+        Renamed = @($renamed)
+        NotFound = @($pending.Keys)
+    }
+}
+
+# 확인한 이름을 저장된 목록에 적어 둡니다. 예전 이름이 있으면 바꿔치웁니다.
+function Set-RosterVerified([string]$Name, [string]$Kind, [string]$OldName) {
+    $name = ConvertTo-ExactKey $Name
+    if (-not $name) { return }
+    $old = ConvertTo-ExactKey $OldName
+    $rows = @()
+    $found = $false
+    foreach ($row in (Get-Roster)) {
+        if ($row.Name -ceq $name -or ($old -and $row.Name -ceq $old)) {
+            if ($found) { continue }
+            $found = $true
+            $rows += [pscustomobject]@{
+                Name = $name
+                ListText = $(if ($old -and $old -cne $name) { $old } else { $row.ListText })
+                Kind = $(if ($Kind -and $Kind -ne 'unknown') { $Kind } else { $row.Kind })
+                Order = $row.Order
+                Verified = $true
+                LastSeen = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            }
+            continue
+        }
+        $rows += $row
+    }
+    if (-not $found) {
+        $rows += [pscustomobject]@{
+            Name = $name; ListText = $(if ($old) { $old } else { $name })
+            Kind = $(if ($Kind) { $Kind } else { 'unknown' })
+            Order = @($rows).Count; Verified = $true
+            LastSeen = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        }
+    }
+    Set-Roster $rows
+    if ($old -and $old -cne $name) { Rename-RoomInGroups $old $name }
+}
+# 대상 방을 한 번씩 열어만 봅니다. 아무것도 보내지 않습니다.
+# 카카오톡은 방을 처음 열 때 대화를 통째로 불러옵니다. 방에 따라 12초까지 걸립니다.
+# 다 불러오기 전에는 Enter 를 눌러도 전송이 되지 않습니다.
+# 한 번 열어 둔 방은 카카오톡이 기억해서 다음부터 금방 열립니다.
+# [채팅방 목록 새로고침]을 정확 방식으로 하면 이 일이 이미 되어 있습니다.
 function Invoke-RoomPreload([string[]]$Rooms) {
-    $targets = @($Rooms | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
+    $targets = @($Rooms | ForEach-Object { ConvertTo-ExactKey ([string]$_) } | Where-Object { $_ } | Select-Object -Unique)
     if ($targets.Count -eq 0) { return $false }
     Write-RunLog "방 미리 열기: $($targets.Count)개를 한 번씩 열어 대화가 다 불러와지는지 봅니다."
     Write-RunLog '보내지 않습니다. 처음 한 번만 하면 되고, 이후 발송이 훨씬 안정적입니다.'
@@ -3913,25 +4451,24 @@ function Invoke-RoomPreload([string[]]$Rooms) {
     # 미리 열 때는 넉넉히 기다립니다. 여기서 오래 걸려도 실제 발송이 빨라집니다.
     $content.OpenTimeoutMs = [Math]::Max(12000, [int]$content.OpenTimeoutMs)
     $content.SettleMs = [Math]::Max(8000, [int]$content.SettleMs)
+    Reset-SendProgress $targets
+    Reset-DeliveryState
     $outcome = $null
     try {
-        $outcome = Invoke-SweepOverList $targets $content ([int]$script:config.ScanPages) 0 0 0
+        $outcome = Invoke-RosterSend $targets $content ([int]$script:config.ScanPages) 0 0 0 1
     } catch {
         Write-RunLog "방 미리 열기 중단: $($_.Exception.Message)"
         return $false
     }
     if ($null -eq $outcome) { return $false }
-    $missed = @($outcome.NotFound)
-    Write-RunLog "방 미리 열기 끝: 확인 $($outcome.Sent)개 / 열지 못함 $($outcome.Failed)개 / 목록에서 못 찾음 $($missed.Count)개"
-    if ($missed.Count -gt 0) {
-        Write-RunLog "  못 찾은 방: $(($missed | Select-Object -First 5) -join ', ')$(if ($missed.Count -gt 5) { ' 외 ' + ($missed.Count - 5) + '개' } else { '' })"
-    }
+    Write-RunLog "방 미리 열기 끝: 열림 $($outcome.Sent)개 / 열지 못함 $($outcome.Failed)개 (전체 $($outcome.Total)개)"
     return $true
 }
 
 function New-SendContent([bool]$DryRun) {
     return [pscustomobject]@{
         Message = [string]$script:config.Message
+        TemplateName = [string]$script:lastTemplateName
         Attachments = @($script:config.Attachments)
         AttachmentWaitMs = [int]$script:config.AttachmentWaitMs
         OpenTimeoutMs = [Math]::Max(3000, [int]$script:config.OpenTimeoutMs)
@@ -3945,9 +4482,13 @@ function Get-TabLabelForType([string]$Type) {
     return '채팅'
 }
 
+# 고른 방에 모두 보냅니다.
+# PC 카카오톡의 [채팅] 목록에는 일반 채팅방과 오픈채팅방이 함께 들어 있습니다.
+# 그래서 종류로 나누지 않고 한 목록을 훑습니다. 보낼 때도 종류를 가리지 않습니다.
+# 시작한 뒤에는 사용자가 다시 누를 것이 없습니다. 끝까지 알아서 갑니다.
 function Invoke-Broadcast {
-    $rooms = @($script:config.Rooms | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
-    if ($rooms.Count -eq 0) { throw '보낼 채팅방을 한 개 이상 선택해 주세요.' }
+    $rooms = @($script:config.Rooms | ForEach-Object { ConvertTo-ExactKey ([string]$_) } | Where-Object { $_ } | Select-Object -Unique)
+    if ($rooms.Count -eq 0) { throw '보낼 채팅방을 한 개 이상 골라 주세요.' }
     if ($rooms.Count -gt 500) { throw '안전을 위해 한 번에 최대 500개 방까지만 처리합니다.' }
     $dryRun = [bool]$script:config.DryRun
     if (-not $dryRun) {
@@ -3959,6 +4500,7 @@ function Invoke-Broadcast {
     $content = New-SendContent $dryRun
     $mode = if ($dryRun) { '확인 전용' } else { '실제 발송' }
     $interval = Get-EffectiveInterval (Get-Date)
+    $retry = [Math]::Max(0, [Math]::Min(5, [int]$script:config.RetryCount))
     $holiday = Get-HolidayName (Get-Date)
     if ($holiday) { Write-RunLog "오늘은 $holiday 입니다. 방 간격 $($interval)초로 진행합니다." }
     $batchSize = [int]$script:config.BatchSize
@@ -3966,125 +4508,77 @@ function Invoke-Broadcast {
     if ($batchSize -gt 0 -and $batchRest -gt 0) {
         Write-RunLog "묶음 발송: $($batchSize)개마다 $($batchRest)분 쉽니다."
     }
-    Write-RunLog ("작업 시작: 방 {0}개 / 모드={1} / 간격 {2}초" -f $rooms.Count, $mode, $interval)
+    Write-RunLog ("작업 시작: 방 {0}개 / 모드={1} / 간격 {2}초 / 재시도 {3}회" -f $rooms.Count, $mode, $interval, $retry)
     if (-not $dryRun) {
         Write-RunLog ("보낼 문구 {0}자 / 첨부 {1}개" -f ([string]$script:config.Message).Length, @($script:config.Attachments).Count)
     }
-    # 글을 붙여넣으려면 클립보드를 써야 합니다.
-    # 사용자가 복사해 두었던 것이 날아가지 않도록 챙겨 두었다가 끝나면 되돌립니다.
-    $script:savedClipboard = $null
-    try { $script:savedClipboard = [string][System.Windows.Forms.Clipboard]::GetText() } catch { }
-    if (-not $dryRun) {
-        Write-RunLog ("보낼 문구 {0}자 / 첨부 {1}개" -f ([string]$script:config.Message).Length, @($script:config.Attachments).Count)
-    }
-    # 글을 붙여넣으려면 클립보드를 써야 합니다.
-    # 사용자가 복사해 두었던 것이 날아가지 않도록 미리 챙겨 두었다가 끝나면 되돌립니다.
-    $script:savedClipboard = $null
-    try { $script:savedClipboard = [string][System.Windows.Forms.Clipboard]::GetText() } catch { }
 
-    # PC 카카오톡의 [채팅] 목록에는 일반 채팅방과 오픈채팅방이 함께 들어 있습니다.
-    # 그래서 종류로 나누지 않고, 지금 보이는 목록을 한 번 훑어 찾을 수 있는 방을 모두 처리합니다.
-    # 그러고도 못 찾은 방이 있으면 다른 탭으로 바꿔 한 번 더 훑습니다.
+    # 저장된 목록에 없는 방이 섞여 있으면 미리 알려 드립니다.
+    $unknown = @()
+    foreach ($room in $rooms) { if ($null -eq (Find-RosterEntry $room)) { $unknown += $room } }
+    if ($unknown.Count -gt 0) {
+        Write-RunLog "저장된 목록에 없는 방 $($unknown.Count)개가 있습니다: $(($unknown | Select-Object -First 5) -join ', ')"
+        Write-RunLog '  [2. 받을 채팅방] 화면에서 [채팅방 목록 새로고침]을 한 번 해 주시면 정확해집니다.'
+    }
+
     $ready = Test-KakaoReady $true $false
     if (-not $ready.Ok) { throw $ready.Reason }
 
-    # 방마다 어디까지 갔는지 보여 줄 표를 채웁니다.
+    # 방마다 어디까지 갔는지 보여 줄 표를 채웁니다. 고른 방이 모두 여기 들어갑니다.
     Reset-SendProgress $rooms
+    Reset-DeliveryState
+    $script:trackDelivery = $true
 
     # 어떤 환경인지 남겨 둡니다. PC 마다 결과가 다를 때 짚어 보기 위해서입니다.
     Write-EnvironmentLog $ready.Layout.Main
 
-    # 보낼 방 종류와 지금 열려 있는 탭이 맞는지 먼저 봅니다.
-    # 안 맞으면 전부 실패하므로 시작하지 않고 알려 드립니다.
-    if (-not $dryRun) {
-        $tabProblem = Test-SendTabReady $rooms $ready.Layout
-        if ($tabProblem) {
-            Write-RunLog 'WRONG_TAB — 보낼 방 종류와 카카오톡에 열린 탭이 다릅니다. 시작하지 않았습니다.'
-            throw $tabProblem
+    # 글을 붙여넣으려면 클립보드를 써야 합니다.
+    # 사용자가 복사해 두었던 것이 날아가지 않도록 챙겨 두었다가 끝나면 되돌립니다.
+    $script:savedClipboard = $null
+    try { $script:savedClipboard = [string][System.Windows.Forms.Clipboard]::GetText() } catch { }
+
+    $result = $null
+    try {
+        $result = Invoke-RosterSend $rooms $content ([int]$script:config.ScanPages) $interval $batchSize $batchRest $retry
+    } finally {
+        $script:trackDelivery = $false
+        if ($null -ne $script:savedClipboard -and $script:savedClipboard -ne '') {
+            try {
+                if (-not (Test-ClipboardHasText $script:savedClipboard)) {
+                    [System.Windows.Forms.Clipboard]::SetText($script:savedClipboard)
+                }
+            } catch { }
         }
     }
 
-    # 처음 보내는 경우에는 대상 방을 먼저 한 번씩 열어 둡니다.
-    # 대화를 불러오는 중에는 전송이 먹지 않기 때문입니다.
-    if ((-not $dryRun) -and [bool]$script:config.PreloadRooms -and (-not [bool]$script:config.PreloadDone)) {
-        [void](Invoke-RoomPreload $rooms)
-        $script:config.PreloadDone = $true
-        try { Save-Config $script:config } catch { }
-        Write-RunLog '이제 실제 발송을 시작합니다.'
+    if ($null -eq $result) { return 0 }
+    $handled = $result.Sent + $result.Failed
+    Write-RunLog '─────────────────────────────'
+    Write-RunLog ("전체 발송 대상: {0}개" -f $result.Total)
+    Write-RunLog ("발송 성공: {0}개" -f $result.Sent)
+    Write-RunLog ("발송 실패: {0}개" -f $result.Failed)
+    Write-RunLog ("총 처리:   {0}개" -f $handled)
+    if ($handled -eq $result.Total) {
+        Write-RunLog '숫자가 맞습니다. 빠진 방은 없습니다.'
+    } else {
+        Write-RunLog "숫자가 맞지 않습니다. 고른 $($result.Total)개 중 $handled 개만 처리했습니다."
     }
+    Write-RunLog "자세한 결과는 logs 폴더의 발송기록 파일에 표로 남았습니다."
 
-    $totalSent = 0
-    $totalFailed = 0
-    $pending = @($rooms)
-
-    for ($round = 1; $round -le 3; $round++) {
-        if (@($pending).Count -eq 0) { break }
-
-        if ($round -gt 1) {
-            $nowTab = ''
-            try { $nowTab = Get-ActiveKakaoTab (Test-KakaoReady $false $false).Layout } catch { }
-            $nowText = if (-not $nowTab -or $nowTab -eq $script:RoomTypeUnknown) { '알 수 없음' } else { "$nowTab 탭" }
-            $otherText = if ($nowTab -eq $script:RoomTypeOpen) { '[채팅]' } else { '[오픈채팅]' }
-            $ask = "아직 못 찾은 방이 $(@($pending).Count)개 있습니다.`r`n`r`n지금 카카오톡은 $nowText 을(를) 보고 있습니다.`r`n$otherText 탭으로 바꾸거나, 목록 위 분류를 [전체]로 바꿔 주신 뒤 [확인]을 눌러 주세요.`r`n`r`n[취소]를 누르면 남은 방은 건너뜁니다."
-            if ([System.Windows.Forms.MessageBox]::Show($ask, '남은 방을 다른 목록에서 찾기', 'OKCancel', 'Information') -ne 'OK') {
-                Write-RunLog "남은 $(@($pending).Count)개는 사용자가 건너뛰었습니다."
-                break
-            }
-            $check = Test-KakaoReady $true $false
-            if (-not $check.Ok) { Write-RunLog "중단: $($check.Reason)"; break }
-        }
-
-        if (-not $dryRun) {
-            $blocked = Get-SendBlockReason (Get-Date)
-            if ($blocked) { Write-RunLog "발송 중단: $blocked"; break }
-        }
-
-        $layoutNow = (Test-KakaoReady $false $false).Layout
-        $tabNow = Get-ActiveKakaoTab $layoutNow
-        Write-RunLog "$($round)회차: 방 $(@($pending).Count)개 찾기 (현재 탭 $tabNow / 화면 $($layoutNow.ViewName))"
-        $result = Invoke-SweepOverList @($pending) $content ([int]$script:config.ScanPages) $interval $batchSize $batchRest
-        $totalSent += $result.Sent
-        $totalFailed += $result.Failed
-        $pending = @($result.NotFound)
-        Write-RunLog "$($round)회차 결과: 성공 $($result.Sent) / 실패 $($result.Failed) / 못 찾음 $(@($pending).Count)"
-    }
-
-    if (@($pending).Count -gt 0) {
-        Write-RunLog "처리하지 못한 방 $(@($pending).Count)개: 이름이 카카오톡 표시와 다를 수 있습니다. 체크한 뒤 [이름 확인·보정]을 실행해 보세요."
-    }
-    # 챙겨 두었던 클립보드를 되돌립니다.
-    if ($null -ne $script:savedClipboard -and $script:savedClipboard -ne '') {
-        try {
-            if (-not (Test-ClipboardHasText $script:savedClipboard)) {
-                [System.Windows.Forms.Clipboard]::SetText($script:savedClipboard)
-            }
-        } catch { }
-    }
-    # 챙겨 두었던 클립보드를 되돌립니다.
-    if ($null -ne $script:savedClipboard -and $script:savedClipboard -ne '') {
-        try {
-            if (-not (Test-ClipboardHasText $script:savedClipboard)) {
-                [System.Windows.Forms.Clipboard]::SetText($script:savedClipboard)
-            }
-        } catch { }
-    }
     if ($dryRun) {
         # 확인 전용은 아무것도 보내지 않습니다. 완료라고 하면 보낸 줄 알게 됩니다.
-        Write-RunLog ("확인 전용으로 끝났습니다: 방 {0}개를 열어 보았고, 실제로 보낸 메시지는 없습니다." -f $totalSent)
-        Write-RunLog "실제로 보내시려면 [3. 보내기] 화면에서 [실제 발송] 을 고르세요."
-    } else {
-        Write-RunLog ("작업 종료: 성공 {0} / 실패 {1} / 미처리 {2} (전체 {3})" -f $totalSent, $totalFailed, @($pending).Count, $rooms.Count)
+        Write-RunLog ("확인 전용으로 끝났습니다: 방 {0}개를 열어 보았고, 실제로 보낸 메시지는 없습니다." -f $result.Sent)
+        Write-RunLog '실제로 보내시려면 [3. 보내기] 화면에서 [실제 발송] 을 고르세요.'
+    } elseif ($result.Sent -gt 0) {
         # 오늘 보냈다고 적어 둡니다. 공휴일에서 옮겨 온 날에 두 번 가지 않게 합니다.
-        if ($totalSent -gt 0) {
-            Add-SentDay (Get-Date)
-            try { Save-Config $script:config } catch { }
-        }
+        Add-SentDay (Get-Date)
+        try { Save-Config $script:config } catch { }
     }
-    return $totalSent
+    return $result.Sent
 }
 
 function Invoke-TestSend([bool]$DryRun) {
-    $room = ([string]$script:config.TestRoom).Trim()
+    $room = ConvertTo-ExactKey ([string]$script:config.TestRoom)
     if (-not $room) { throw '테스트 채팅방 이름을 입력해 주세요.' }
     if (-not $DryRun) {
         foreach ($attachment in @($script:config.Attachments)) {
@@ -4093,10 +4587,16 @@ function Invoke-TestSend([bool]$DryRun) {
     }
     $label = if ($DryRun) { '테스트(확인만)' } else { '테스트 발송' }
     Write-RunLog "$label 시작: '$room'"
-    $result = Invoke-SweepOverList @($room) (New-SendContent $DryRun) ([int]$script:config.ScanPages) 5 0 0
-    $ok = ($result.Sent -gt 0)
-    if (-not $ok -and @($result.NotFound).Count -gt 0) {
-        Write-RunLog "'$room' 을(를) 목록에서 찾지 못했습니다. 카카오톡에 보이는 이름과 정확히 같은지 확인해 주세요."
+    Reset-SendProgress @($room)
+    Reset-DeliveryState
+    $script:trackDelivery = $true
+    $result = $null
+    try {
+        $result = Invoke-RosterSend @($room) (New-SendContent $DryRun) ([int]$script:config.ScanPages) 0 0 0 1
+    } finally { $script:trackDelivery = $false }
+    $ok = ($null -ne $result -and $result.Sent -gt 0)
+    if (-not $ok) {
+        Write-RunLog "'$room' 에 보내지 못했습니다. 카카오톡에 보이는 이름과 정확히 같은지 확인해 주세요."
     }
     Write-RunLog ("$label 종료: {0}" -f $(if ($ok) { '성공' } else { '실패' }))
     return $ok
@@ -4262,7 +4762,7 @@ $script:TourSteps = @(
     @{
         Page = 'rooms'
         Title = '1단계 · 보낼 채팅방 가져오기'
-        Body  = "먼저 카카오톡에서 [채팅] 탭을 눌러 채팅방 목록이 보이게 해 주세요. 최소화되어 있으면 안 됩니다.`r`n`r`n그 상태로 [카카오톡에서 읽기]를 누르면, 지금 보고 있는 목록이 일반 채팅인지 오픈채팅인지 물어봅니다. 답하면 목록을 훑어 방 이름을 가져옵니다.`r`n`r`n오픈채팅방은 카카오톡에서 [오픈채팅] 탭으로 바꾼 뒤 한 번 더 읽으면 됩니다.`r`n`r`n읽는 동안에는 마우스와 키보드를 사용하지 마세요."
+        Body  = "먼저 카카오톡에서 [채팅] 탭을 눌러 채팅방 목록이 보이게 해 주세요. 최소화되어 있으면 안 됩니다.`r`n`r`n그 상태로 [채팅방 목록 새로고침]을 누르면 카카오톡에 있는 방을 그대로 읽어 옵니다. 이름을 직접 치지 않습니다.`r`n`r`n[방을 열어 이름 확인]을 켜 두면 방을 하나씩 열어 창 제목으로 이름을 확정합니다. 느리지만 이름이 틀리지 않습니다.`r`n`r`n읽는 동안에는 마우스와 키보드를 사용하지 마세요."
     },
     @{
         Page = 'rooms'
@@ -4272,12 +4772,12 @@ $script:TourSteps = @(
     @{
         Page = 'rooms'
         Title = '2단계 · 이름 정확하게 맞추기'
-        Body  = "방 이름은 화면의 글자를 읽어 오기 때문에 가끔 틀리게 들어옵니다.`r`n`r`n보낼 방만 체크한 다음 [이름 확인·보정]을 누르세요. 체크한 방을 하나씩 열어 실제 이름으로 자동으로 고쳐 줍니다.`r`n`r`n안 잡히는 방은 [직접 추가]로 카카오톡에 보이는 이름 그대로 입력하면 됩니다."
+        Body  = "이름 옆에 [확인됨] 이라고 적힌 방은 창 제목으로 이름을 확정한 방입니다. 틀릴 일이 없습니다.`r`n`r`n[화면 글자] 라고 적힌 방은 화면을 읽은 것이라 틀릴 수 있습니다. 그 방들을 체크하고 [이름 확인·보정]을 누르면 하나씩 열어 바로잡습니다.`r`n`r`n[전체 선택] [일반채팅만] [오픈채팅만] 으로 한 번에 고를 수 있습니다."
     },
     @{
         Page = 'compose'
         Title = '3단계 · 문구와 사진 준비'
-        Body  = "[1. 보낼 내용] 화면에 보낼 문구를 적고, 사진이나 파일을 추가합니다.`r`n`r`n문구가 먼저 한 개의 메시지로 전송되고, 그다음 첨부가 목록 순서대로 하나씩 전송됩니다. 순서는 [위로] [아래로] 버튼으로 바꿀 수 있습니다.`r`n`r`n입력한 내용은 자동으로 저장되니 따로 저장하지 않아도 됩니다."
+        Body  = "[1. 보낼 내용] 화면에 보낼 문구를 적고, 사진이나 파일을 추가합니다.`r`n`r`n첨부가 먼저 목록 순서대로 하나씩 전송되고, 그다음 문구가 한 개의 메시지로 전송됩니다. 순서는 [위로] [아래로] 버튼으로 바꿀 수 있습니다.`r`n`r`n자주 쓰는 문구는 [저장 메시지]에 이름을 붙여 담아 두고 골라 쓸 수 있습니다."
     },
     @{
         Page = 'run'
@@ -4307,7 +4807,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'AutoCheckUpdate', 'TourDone', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'Roster', 'RosterScannedAt', 'ScanExactNames', 'Templates', 'RetryCount', 'CloseAfterSend', 'AutoCheckUpdate', 'TourDone', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -4492,14 +4992,240 @@ if ($SelfTest) {
         Set-ConfigValue 'SentDays' @($savedDays)
     }
     if ((Get-OcrScaleFor $probeWide) -lt 2) { throw '넓은 목록에서 확대 배율이 너무 작습니다' }
-    # 열린 창 제목으로 어느 방인지 다시 정하는 기능입니다.
-    # 목록에서 읽은 이름은 잘리거나 틀릴 수 있지만 창 제목은 정확합니다.
-    $probePending = @('자유홍보 광고/마', '스마트스토어 불로', '전혀 다른 방 이름')
-    if ((Resolve-OpenedRoom '자유홍보 광고/마케팅 공유방' $probePending) -ne '자유홍보 광고/마') { throw '잘린 이름을 제목으로 찾지 못합니다' }
-    if ((Resolve-OpenedRoom '스마트스토어 블로그 인스타그램 홍보방' $probePending) -ne '스마트스토어 불로') { throw '글자 인식이 틀린 이름을 찾지 못합니다' }
-    if ((Resolve-OpenedRoom '무한,광고,홍보,유통,제조,소통,' $probePending) -ne '') { throw '보낼 목록에 없는 방을 같다고 합니다' }
-    # 비슷한 방이 둘이면 어느 쪽인지 알 수 없으므로 보내면 안 됩니다.
-    if ((Resolve-OpenedRoom '홍보방 하나' @('홍보방 하나', '홍보방 하나')) -ne '') { throw '헷갈리는데도 한쪽을 골랐습니다' }
+    # ----- 이름을 정확히 견주는지 -----
+    # 여기가 이번 고침의 핵심입니다. 비슷한 이름을 같은 방으로 보면 안 됩니다.
+    if (-not (Test-SameRoomExact '뽀식' '뽀식')) { throw '같은 이름을 다르다고 합니다' }
+    if (Test-SameRoomExact '뽀식' '포식') { throw '뽀식 과 포식 을 같은 방이라고 합니다' }
+    if (Test-SameRoomExact '투투' '토토') { throw '투투 와 토토 를 같은 방이라고 합니다' }
+    if (Test-SameRoomExact '우리반 공지방' '우리반 공지방 2기') { throw '앞부분만 같은 방을 같다고 합니다' }
+    if (-not (Test-SameRoomExact ' 뽀식  방 ' '뽀식 방')) { throw '빈칸 차이를 다른 방으로 봅니다' }
+    if ((Get-RoomTitleName '우리반 공지방 (24)') -ne '우리반 공지방') { throw '인원수를 떼어 내지 못합니다' }
+    if ((Get-RoomTitleName '뽀식') -ne '뽀식') { throw '인원수가 없는 제목을 바꿔 버립니다' }
+    if ((Get-RoomTitleName '(24)명 모임') -ne '(24)명 모임') { throw '이름 앞의 괄호를 잘못 떼어 냅니다' }
+
+    # 엄격 비교를 켰을 때 창 제목이 정확히 같아야만 통과해야 합니다.
+    $script:strictTitleMatch = $true
+    try {
+        if (-not (Test-RoomTitle '우리반 공지방 (24)' '우리반 공지방')) { throw '인원수가 붙은 제목을 못 알아봅니다' }
+        if (Test-RoomTitle '우리반 공지방 2기' '우리반 공지방') { throw '엄격 비교인데 다른 방을 같다고 합니다' }
+        if (Test-RoomTitle '포식' '뽀식') { throw '엄격 비교인데 글자가 다른 방을 같다고 합니다' }
+    } finally { $script:strictTitleMatch = $false }
+
+    # ----- 저장된 목록 -----
+    $savedRoster = @($script:config.Roster)
+    try {
+        Set-Roster @(
+            [pscustomobject]@{ Name = '뽀식'; ListText = '포식'; Kind = 'group'; Order = 0; Verified = $true; LastSeen = '' },
+            [pscustomobject]@{ Name = '토토'; ListText = '토토'; Kind = 'open';  Order = 1; Verified = $true; LastSeen = '' }
+        )
+        if (@(Get-Roster).Count -ne 2) { throw '목록을 저장하고 다시 읽지 못합니다' }
+        if ($null -eq (Find-RosterEntry '뽀식')) { throw '저장한 방을 찾지 못합니다' }
+        if ($null -ne (Find-RosterEntry '포식')) { throw '없는 방을 찾았다고 합니다' }
+        if ((Find-RosterEntry '뽀식').ListText -ne '포식') { throw '목록에 보이던 글자를 잃어버렸습니다' }
+        # 새로 읽었더니 토토 가 사라지고 투투 가 생긴 상황입니다.
+        $fakeScan = [pscustomobject]@{
+            Rows = @(
+                [pscustomobject]@{ Name = '뽀식'; ListText = '포식'; Kind = 'group'; Order = 0; Verified = $true; LastSeen = '' },
+                [pscustomobject]@{ Name = '투투'; ListText = '투투'; Kind = 'open';  Order = 1; Verified = $true; LastSeen = '' }
+            )
+            FromOpenTab = $false
+        }
+        $diff = Merge-RosterScan $fakeScan $true
+        if (@($diff.Added) -notcontains '투투') { throw '새로 생긴 방을 못 알아봅니다' }
+        if (@($diff.Removed) -notcontains '토토') { throw '없어진 방을 못 알아봅니다' }
+        if ($diff.Total -ne 2) { throw '새로고침 뒤 방 수가 맞지 않습니다' }
+    } finally {
+        Set-ConfigValue 'Roster' @($savedRoster)
+    }
+
+
+    # ----- 저장 메시지 -----
+    $savedTemplates = @($script:config.Templates)
+    try {
+        Set-Templates @()
+        if (@(Get-Templates).Count -ne 0) { throw '저장 문구를 비우지 못합니다' }
+        Set-Templates @(
+            [pscustomobject]@{ Name = '기본 안내문'; Text = "안녕하세요.`r`n오늘도 좋은 하루 되세요." },
+            [pscustomobject]@{ Name = '점검 안내';   Text = '오늘 밤 점검이 있습니다.' }
+        )
+        if (@(Get-Templates).Count -ne 2) { throw '저장 문구를 담지 못합니다' }
+        if ((Find-Template '기본 안내문').Text -notmatch '좋은 하루') { throw '저장 문구를 다시 읽지 못합니다' }
+        if ($null -ne (Find-Template '없는 문구')) { throw '없는 문구를 찾았다고 합니다' }
+        # 줄바꿈이 그대로 남아야 합니다.
+        if ((Find-Template '기본 안내문').Text -notmatch "`r`n") { throw '줄바꿈이 사라졌습니다' }
+        # 덮어쓰기
+        $edited = @()
+        foreach ($row in (Get-Templates)) {
+            if ($row.Name -eq '점검 안내') { $edited += [pscustomobject]@{ Name = '점검 안내'; Text = '바뀐 내용' } }
+            else { $edited += $row }
+        }
+        Set-Templates $edited
+        if ((Find-Template '점검 안내').Text -ne '바뀐 내용') { throw '저장 문구를 덮어쓰지 못합니다' }
+        # 삭제
+        Set-Templates @(Get-Templates | Where-Object { $_.Name -ne '점검 안내' })
+        if ($null -ne (Find-Template '점검 안내')) { throw '저장 문구를 지우지 못합니다' }
+        if (@(Get-Templates).Count -ne 1) { throw '지운 뒤 개수가 맞지 않습니다' }
+    } finally {
+        Set-ConfigValue 'Templates' @($savedTemplates)
+    }
+    # ----- 발송 전체 흐름 모의 시험 -----
+    # 카카오톡 없이 가짜 채팅 목록을 만들어 발송 흐름을 그대로 돌려 봅니다.
+    # 확인하려는 것은 두 가지입니다.
+    #   1) 고른 방 수 = 발송 완료 + 실패   (조용히 빠지는 방이 없어야 합니다)
+    #   2) 이름이 비슷한 다른 방에는 절대 보내지 않는다
+    # 가짜 목록에는 일부러 어려운 경우를 넣었습니다.
+    #   뽀식  -> 화면에는 '포식' 으로 잘못 읽힙니다
+    #   업체B -> 화면 글자를 아예 못 읽습니다
+    #   우리반 공지방 2기 -> '우리반 공지방' 을 찾을 때 먼저 걸립니다
+    #   토토  -> 첫 번째 전송은 실패하고 다시 하면 성공합니다
+    #   없는방 -> 목록에 아예 없습니다
+    $script:fakeRooms = @(
+        @{ Title = '뽀식';                            Ocr = '포식' },
+        @{ Title = '투투';                            Ocr = '투투' },
+        @{ Title = '토토';                            Ocr = '토토' },
+        @{ Title = '업체A';                           Ocr = '업체A' },
+        @{ Title = '업체B';                           Ocr = '' },
+        @{ Title = '우리반 공지방 2기 (7)';            Ocr = '우리반 공지방 2기' },
+        @{ Title = '우리반 공지방 (24)';               Ocr = '우리반 공지방' },
+        @{ Title = '스마트스토어 블로그 홍보방 (91)';  Ocr = '스마트스토어 불로그 홍보방' }
+    )
+    $script:fakeTop = 0
+    $script:fakePageSize = 4
+    $script:fakeSendLog = @()
+    $script:fakeFail = @{ '토토' = 1 }
+
+    # 가짜 기능은 이 묶음 안에서만 살아 있습니다.
+    # 밖으로 새어 나가면 뒤에 오는 검사들이 가짜를 쓰게 됩니다.
+    & {
+    function Test-KakaoReady([bool]$Restore = $false, [bool]$NeedSearch = $false) {
+        return [pscustomobject]@{ Ok = $true; Reason = ''; Layout = (Get-KakaoLayout $null) }
+    }
+    function Get-MainKakaoWindow([bool]$Restore = $false) {
+        return [pscustomobject]@{ Handle = [IntPtr]1; Title = 'KakaoTalk' }
+    }
+    function Get-KakaoLayout([object]$MainWindow) {
+        return [pscustomobject]@{
+            Main = [pscustomobject]@{ Handle = [IntPtr]1 }
+            List = [pscustomobject]@{ Width = 320; Height = 400; Rect = [pscustomobject]@{ Left = 0; Top = 0 } }
+            ViewName = 'ChatRoomListView'
+        }
+    }
+    function Move-ListToTop([object]$List, [int]$Pages) { $script:fakeTop = 0 }
+    function Move-ListByWheel([object]$L, [string]$D, [int]$N = 4) {
+        if ($D -eq 'down') {
+            $script:fakeTop = [Math]::Min($script:fakeRooms.Count, $script:fakeTop + $script:fakePageSize - 1)
+        } else { $script:fakeTop = 0 }
+    }
+    function Get-OcrLines([object]$W, [int]$S = 2) { return @() }
+    function Get-OcrScaleFor([object]$W) { return 2 }
+    function Get-ChatRoomRowsFromOcr([object[]]$Lines, [int]$Width) {
+        $out = @()
+        for ($i = 0; $i -lt $script:fakePageSize; $i++) {
+            $index = $script:fakeTop + $i
+            if ($index -ge $script:fakeRooms.Count) { break }
+            $room = $script:fakeRooms[$index]
+            $out += [pscustomobject]@{
+                Title = [string]$room.Ocr
+                RawTitle = [string]$room.Ocr
+                LastMessage = ''
+                Time = '오전 11:00'
+                TimeReadable = '오전 11:00'
+                Top = ($i * 60)
+                Confidence = $(if ($room.Ocr) { 'high' } else { 'low' })
+                Ok = [bool]$room.Ocr
+                FakeIndex = $index
+            }
+        }
+        return @($out)
+    }
+    function Open-RoomAtLine([object]$List, [object]$Row, [IntPtr]$MainHandle, [int]$TimeoutMs = 0) {
+        $index = [int]$Row.FakeIndex
+        if ($index -lt 0 -or $index -ge $script:fakeRooms.Count) { return $null }
+        return [pscustomobject]@{
+            Handle = [IntPtr](100 + $index)
+            Title = [string]$script:fakeRooms[$index].Title
+            Visible = $true
+        }
+    }
+    function Get-SingleChatWindow([object]$Value) { return $Value }
+    function Close-ChatWindow([object]$Window) { }
+    function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content) {
+        if ($script:fakeFail.ContainsKey($Room) -and $script:fakeFail[$Room] -gt 0) {
+            $script:fakeFail[$Room] = $script:fakeFail[$Room] - 1
+            $script:lastSendProblem = 'SEND_VERIFY_FAILED — 모의 실패'
+            return $false
+        }
+        $script:fakeSendLog = @($script:fakeSendLog) + $Room
+        return $true
+    }
+    function Test-RunInterrupted { return $false }
+    function Wait-Interruptible([int]$Seconds) { return $false }
+    function Add-SendLogRow([string]$Room, [object]$Content, [bool]$Ok, [string]$Reason) { }
+    function Set-StatusPill([string]$Text, [string]$Kind) { }
+    function Write-RunLog([string]$Text) { }
+
+    $simRoster = @()
+    $simOrder = 0
+    foreach ($fake in $script:fakeRooms) {
+        $simName = Get-RoomTitleName ([string]$fake.Title)
+        $simRoster += [pscustomobject]@{
+            Name = $simName
+            ListText = [string]$fake.Ocr
+            Kind = 'group'
+            Order = $simOrder
+            Verified = $true
+            LastSeen = ''
+        }
+        $simOrder++
+    }
+    $simSavedRoster = @($script:config.Roster)
+    $simSavedKinds = $script:config.RoomKinds
+    try {
+        Set-Roster $simRoster
+        $simTargets = @('뽀식', '투투', '토토', '업체B', '우리반 공지방', '스마트스토어 블로그 홍보방', '없는방')
+        Reset-SendProgress $simTargets
+        Reset-DeliveryState
+        $simContent = [pscustomobject]@{
+            Message = '모의 시험'
+            TemplateName = ''
+            Attachments = @()
+            AttachmentWaitMs = 500
+            OpenTimeoutMs = 1000
+            SettleMs = 0
+            DryRun = $false
+        }
+        $simResult = Invoke-RosterSend $simTargets $simContent 12 0 0 0 2
+
+        if ($simResult.Total -ne 7) { throw "고른 방 수가 7이 아닙니다: $($simResult.Total)" }
+        if (($simResult.Sent + $simResult.Failed) -ne $simResult.Total) {
+            throw "숫자가 맞지 않습니다: 고른 $($simResult.Total) / 완료 $($simResult.Sent) / 실패 $($simResult.Failed)"
+        }
+        if ($simResult.Sent -ne 6) { throw "보낸 방이 6개가 아닙니다: $($simResult.Sent)" }
+        if ($simResult.Failed -ne 1) { throw "실패한 방이 1개가 아닙니다: $($simResult.Failed)" }
+        # 보낸 곳을 하나하나 확인합니다.
+        foreach ($mustSend in @('뽀식', '투투', '토토', '업체B', '우리반 공지방', '스마트스토어 블로그 홍보방')) {
+            if (@($script:fakeSendLog) -notcontains $mustSend) { throw "'$mustSend' 에 보내지 못했습니다" }
+        }
+        foreach ($mustNot in @('우리반 공지방 2기', '업체A', '포식', '없는방')) {
+            if (@($script:fakeSendLog) -contains $mustNot) { throw "'$mustNot' 에는 보내면 안 되는데 보냈습니다" }
+        }
+        if (@($script:fakeSendLog).Count -ne 6) { throw "보낸 횟수가 6번이 아닙니다: $(@($script:fakeSendLog).Count)" }
+        # 방마다 상태가 하나씩 남아 있어야 합니다.
+        $simDone = 0; $simFail = 0
+        foreach ($simName in $script:progressOrder) {
+            $simStatus = [string]$script:progressRows[$simName].Status
+            if ($simStatus -eq '발송 완료') { $simDone++ }
+            elseif ($simStatus -eq '실패') { $simFail++ }
+            else { throw "'$simName' 이(가) '$simStatus' 상태로 끝났습니다. 완료나 실패여야 합니다." }
+        }
+        if (($simDone + $simFail) -ne 7) { throw "상태표의 방 수가 7이 아닙니다: $($simDone + $simFail)" }
+        if ($simDone -ne 6 -or $simFail -ne 1) { throw "상태표가 결과와 다릅니다: 완료 $simDone / 실패 $simFail" }
+        if ([string]$script:progressRows['없는방'].Note -notmatch 'ROOM_NOT_FOUND') { throw '못 찾은 방에 까닭이 적히지 않았습니다' }
+    } finally {
+        Set-ConfigValue 'RoomKinds' $simSavedKinds
+        Reset-SendProgress @()
+    }
+    }
     foreach ($fn in @('Wait-ChatContentSettled', 'Get-ChatListControl', 'Get-ChatInputState')) {
         if (-not (Get-Command $fn -ErrorAction SilentlyContinue)) { throw "필수 기능 누락: $fn" }
     }
@@ -4651,31 +5377,39 @@ if ($SelfTest) {
     exit 0
 }
 
+# 목록 읽기를 눈으로 확인하는 진단 모드입니다.
+# 아무것도 보내지 않고, 저장도 하지 않습니다.
+#   -ScanTest             화면 글자만 읽습니다. 방을 열지 않습니다.
+#   -ScanTest -ScanExact  방을 하나씩 열어 창 제목으로 이름을 확정합니다.
 if ($ScanTest) {
     Write-Output ("문자 인식 사용 가능: {0}" -f (Initialize-Ocr))
     if ($script:ocrError) { Write-Output ("메모: {0}" -f $script:ocrError) }
     $ready = Test-KakaoReady
     Write-Output ("카카오톡 준비 상태: {0} {1}" -f $ready.Ok, $ready.Reason)
     if ($ready.Ok) {
-        Write-Output ("현재 화면: {0} / 목록 {1}x{2} / 검색줄 {3}x{4}" -f `
-            $ready.Layout.ViewName, $ready.Layout.List.Width, $ready.Layout.List.Height, `
-            $ready.Layout.SearchRow.Width, $ready.Layout.SearchRow.Height)
+        Write-Output ("현재 화면: {0} / 목록 {1}x{2}" -f $ready.Layout.ViewName, $ready.Layout.List.Width, $ready.Layout.List.Height)
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $scan = Get-KakaoRoomNames ([int]$script:config.ScanPages)
+    $scan = Invoke-RosterScan ([bool]$ScanExact) ([int]$script:config.ScanPages)
     $watch.Stop()
-    Write-Output ("종류: {0} / 화면 {1}개 / 후보 {2}개 / {3:N1}초" -f $scan.Type, $scan.Pages, @($scan.Names).Count, ($watch.ElapsedMilliseconds / 1000))
-    foreach ($name in $scan.Names) {
+    Write-Output ("방식: {0} / 화면 {1}개 / 읽은 방 {2}개 / {3:N1}초" -f `
+        $(if ($ScanExact) { '방을 열어 이름 확정' } else { '화면 글자만' }), `
+        $scan.Pages, @($scan.Rows).Count, ($watch.ElapsedMilliseconds / 1000))
+    if ([int]$scan.OpenFailures -gt 0) { Write-Output ("  열지 못한 줄: {0}개" -f $scan.OpenFailures) }
+    if ([int]$scan.TitleFailures -gt 0) { Write-Output ("  제목을 못 읽은 줄: {0}개" -f $scan.TitleFailures) }
+    foreach ($row in $scan.Rows) {
+        $name = [string]$row.Name
+        $mark = if ($row.Verified) { '확인됨' } else { '화면글자' }
         if ($MaskNames -and $name.Length -gt 2) {
-            Write-Output ("  - {0}{1} [{2}자]" -f $name.Substring(0, 2), ('*' * [Math]::Min(10, $name.Length - 2)), $name.Length)
+            Write-Output ("  - {0}{1} [{2}자] ({3}/{4})" -f $name.Substring(0, 2), ('*' * [Math]::Min(10, $name.Length - 2)), $name.Length, (Get-RosterKindText $row.Kind), $mark)
         } else {
-            Write-Output "  - $name"
+            Write-Output ("  - {0}  ({1}/{2})" -f $name, (Get-RosterKindText $row.Kind), $mark)
         }
     }
+    Write-Output '저장하지 않았습니다. 저장하려면 프로그램에서 [채팅방 목록 새로고침]을 눌러 주세요.'
     Write-Output 'SCANTEST_OK'
     exit 0
 }
-
 # 발송 한 건당 걸리는 시간을 단계별로 재는 진단 모드입니다.
 # 메시지는 보내지 않고 '나와의 채팅' 창을 열고 닫기만 반복합니다.
 if ($SendBench) {
@@ -4687,7 +5421,7 @@ if ($SendBench) {
     $closeTimes = @()
     for ($i = 1; $i -le $BenchCount; $i++) {
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
-        $chat = Open-RoomBySearch $room $script:RoomTypeNormal
+        $chat = Open-RoomFromRoster $room
         $watch.Stop()
         $openMs = $watch.ElapsedMilliseconds
         if ($null -eq $chat) { Write-Output ("  {0}회: 창을 열지 못했습니다 ({1}ms)" -f $i, $openMs); continue }
@@ -4781,6 +5515,7 @@ $Theme = @{
     Success    = (New-Rgb 22 120 70)
     Danger     = (New-Rgb 198 55 60)
     Info       = (New-Rgb 37 88 200)
+    Warning    = (New-Rgb 176 106 12)
     FieldEdge  = (New-Rgb 227 231 237)
     Soft       = (New-Rgb 243 245 248)
     SoftHover  = (New-Rgb 234 238 243)
@@ -5299,7 +6034,21 @@ $script:txtMessage = New-AppTextBox $cardMessage 24 78 736 158 $true
 $script:txtMessage.Text = [string]$script:config.Message
 $script:lblMessageCount = New-CardLabel $cardMessage '' 24 240 736 20 $FontSmall $Theme.Muted
 
-$cardFiles = New-Card $pageCompose 28 292 784 312 '첨부 사진 · 파일' '문구를 보낸 뒤 아래 순서대로 하나씩 전송합니다. [첨부 시험]은 붙는지만 확인하고 보내지 않습니다.'
+# 자주 보내는 문구를 이름을 붙여 담아 둡니다. 다시 칠 필요가 없습니다.
+$cardTemplates = New-Card $pageCompose 28 292 784 152 '저장 메시지' '자주 쓰는 문구에 이름을 붙여 두고 골라서 불러옵니다.'
+$script:cmbTemplate = New-Object System.Windows.Forms.ComboBox
+$script:cmbTemplate.DropDownStyle = 'DropDownList'
+$script:cmbTemplate.Font = $FontBase
+$script:cmbTemplate.Location = (New-UiPoint 24 78)
+$script:cmbTemplate.Size = (New-UiSize 300 32)
+$cardTemplates.Controls.Add($script:cmbTemplate)
+$btnTplLoad   = New-AppButton $cardTemplates '불러오기' 334 76 108 36 'strong'
+$btnTplSave   = New-AppButton $cardTemplates '새로 저장' 450 76 108 36
+$btnTplUpdate = New-AppButton $cardTemplates '덮어쓰기' 566 76 100 36
+$btnTplDelete = New-AppButton $cardTemplates '삭제' 674 76 86 36 'danger'
+$script:lblTemplateState = New-CardLabel $cardTemplates '' 24 118 736 24 $FontSmall $Theme.Muted
+
+$cardFiles = New-Card $pageCompose 28 456 784 312 '첨부 사진 · 파일' '첨부를 먼저 보내고 그다음 문구를 보냅니다. [첨부 시험]은 붙는지만 확인하고 보내지 않습니다.'
 $frameFiles = New-FieldFrame $cardFiles 24 78 576 212
 $script:lstFiles = New-Object System.Windows.Forms.ListBox
 $script:lstFiles.BorderStyle = 'None'
@@ -5317,19 +6066,30 @@ $btnFileDown   = New-AppButton $cardFiles '아래로' 616 170 144 36
 $btnRemoveFile = New-AppButton $cardFiles '선택 제거' 616 218 144 36 'danger'
 $btnCheckAttach = New-AppButton $cardFiles '첨부 시험' 616 262 144 36
 
-$lblComposeHint = New-CardLabel $pageCompose '내용은 자동 저장됩니다. 실제 발송 전에 [3. 보내기] 화면에서 테스트 발송으로 결과를 먼저 확인하세요.' 28 618 784 30 $FontSmall $Theme.Muted
+$lblComposeHint = New-CardLabel $pageCompose '내용은 자동 저장됩니다. 실제 발송 전에 [3. 보내기] 화면에서 테스트 발송으로 결과를 먼저 확인하세요.' 28 782 784 30 $FontSmall $Theme.Muted
 $lblComposeHint.BackColor = $Theme.Bg
 
 # ===========================================================================
 # 페이지 2 — 채팅방 선택
 # ===========================================================================
 $pageRooms = New-Page 'rooms'
-$cardRooms = New-Card $pageRooms 28 12 784 700 '발송 대상 채팅방' '[오픈채팅] 탭을 먼저 읽고 그다음 [채팅] 탭을 읽으면 종류가 정확히 나뉩니다.'
+$cardRooms = New-Card $pageRooms 28 12 784 700 '발송 대상 채팅방' '카카오톡에 실제로 보이는 목록을 그대로 읽어 옵니다. 이름을 직접 입력하지 않습니다.'
 
-$btnScanRooms  = New-AppButton $cardRooms '카카오톡에서 읽기' 24 80 170 38 'strong'
-$btnVerifyRoom = New-AppButton $cardRooms '이름 확인·보정' 202 80 140 38
-$btnAddRoom    = New-AppButton $cardRooms '직접 추가' 350 80 90 38
-$btnEditRoom   = New-AppButton $cardRooms '이름 수정' 448 80 84 38
+$btnScanRooms  = New-AppButton $cardRooms '채팅방 목록 새로고침' 24 80 190 38 'strong'
+$btnVerifyRoom = New-AppButton $cardRooms '이름 확인·보정' 222 80 130 38
+$btnAddRoom    = New-AppButton $cardRooms '직접 추가' 360 80 90 38
+$btnEditRoom   = New-AppButton $cardRooms '이름 수정' 458 80 84 38
+
+# 방을 하나씩 열어 창 제목으로 이름을 확정할지 정합니다.
+# 창 제목은 화면 글자 인식이 아니라 윈도우가 알려 주는 진짜 글자라 틀리지 않습니다.
+$script:chkExactScan = New-Object System.Windows.Forms.CheckBox
+$script:chkExactScan.Text = '방을 열어 이름 확인 (정확·느림)'
+$script:chkExactScan.Location = (New-UiPoint 552 84)
+$script:chkExactScan.Size = (New-UiSize 208 30)
+$script:chkExactScan.BackColor = $Theme.Card
+$script:chkExactScan.Font = $FontSmall
+$script:chkExactScan.Checked = [bool]$script:config.ScanExactNames
+$cardRooms.Controls.Add($script:chkExactScan)
 
 # 방이 많을 때를 위한 검색칸
 [void](New-CardLabel $cardRooms '검색' 24 134 38 26 $FontSmall $Theme.Muted)
@@ -5338,8 +6098,8 @@ $btnSearchClear = New-AppButton $cardRooms '지우기' 306 128 74 36 'ghost'
 
 [void](New-CardLabel $cardRooms '보기' 392 134 40 26 $FontSmall $Theme.Muted)
 $btnFilterAll    = New-AppButton $cardRooms '전체' 436 128 58 36
-$btnFilterPerson = New-AppButton $cardRooms '개인' 500 128 58 36
-$btnFilterChat   = New-AppButton $cardRooms '그룹' 564 128 58 36
+$btnFilterPerson = New-AppButton $cardRooms '1:1' 500 128 58 36
+$btnFilterChat   = New-AppButton $cardRooms '단체' 564 128 58 36
 $btnFilterOpen   = New-AppButton $cardRooms '오픈채팅' 628 128 84 36
 $script:lblRoomCount = New-CardLabel $cardRooms '선택 0 / 전체 0' 24 172 480 24 $FontStrong $Theme.Ink
 $script:lblSearchState = New-CardLabel $cardRooms '' 24 196 736 22 $FontSmall $Theme.Info
@@ -5354,24 +6114,26 @@ $script:lstRooms.BorderStyle = 'None'
 $script:lstRooms.Font = $FontBase
 $script:lstRooms.Location = (New-UiPoint 12 12)
 $script:lstRooms.Size = (New-UiSize 712 300)
-[void]$script:lstRooms.Columns.Add('채팅방 이름', 560)
+[void]$script:lstRooms.Columns.Add('채팅방 이름', 470)
 [void]$script:lstRooms.Columns.Add('종류', 130)
+[void]$script:lstRooms.Columns.Add('이름 확인', 108)
 $frameRooms.Controls.Add($script:lstRooms)
 
-$btnCheckAll  = New-AppButton $cardRooms '보이는 항목 모두 체크' 24 560 168 34
-$btnCheckNone = New-AppButton $cardRooms '체크 모두 해제' 200 560 130 34
-$btnDeleteRoom = New-AppButton $cardRooms '체크한 항목 삭제' 338 560 140 34 'danger'
-[void](New-CardLabel $cardRooms '최대 탐색 화면 수' 542 566 118 22 $FontSmall $Theme.Muted)
+$btnCheckAll   = New-AppButton $cardRooms '전체 선택' 24 560 92 34
+$btnCheckNone  = New-AppButton $cardRooms '전체 해제' 124 560 92 34
+$btnPickNormal = New-AppButton $cardRooms '일반채팅만' 224 560 104 34
+$btnPickOpen   = New-AppButton $cardRooms '오픈채팅만' 336 560 104 34
+$btnDeleteRoom = New-AppButton $cardRooms '체크 삭제' 448 560 96 34 'danger'
+[void](New-CardLabel $cardRooms '최대 탐색 화면 수' 552 566 116 22 $FontSmall $Theme.Muted)
 $script:numScanPages = New-Object System.Windows.Forms.NumericUpDown
 $script:numScanPages.Minimum = 1
 $script:numScanPages.Maximum = 60
 $script:numScanPages.Value = [Math]::Max(1, [Math]::Min(60, [int]$script:config.ScanPages))
-$script:numScanPages.Location = (New-UiPoint 666 562)
-$script:numScanPages.Size = (New-UiSize 94 30)
+$script:numScanPages.Location = (New-UiPoint 672 562)
+$script:numScanPages.Size = (New-UiSize 88 30)
 $script:numScanPages.Font = $FontBase
 $script:numScanPages.BorderStyle = 'FixedSingle'
 $cardRooms.Controls.Add($script:numScanPages)
-
 # ----- 그룹 -----
 [void](New-CardLabel $cardRooms '그룹' 24 606 42 26 $FontSmall $Theme.Muted)
 $script:cmbGroup = New-Object System.Windows.Forms.ComboBox
@@ -5385,7 +6147,7 @@ $btnGroupNew    = New-AppButton $cardRooms '새 그룹 만들기' 374 602 130 32
 $btnGroupAdd    = New-AppButton $cardRooms '체크한 방 넣기' 512 602 130 32
 $btnGroupDelete = New-AppButton $cardRooms '그룹 삭제' 650 602 110 32 'danger'
 
-[void](New-CardLabel $cardRooms '이름이 틀려도 안전합니다. 발송 직전에 채팅창 제목이 정확히 같은지 다시 확인하고, 다르면 보내지 않고 건너뜁니다.' 24 644 736 24 $FontSmall $Theme.Muted)
+[void](New-CardLabel $cardRooms '방을 연 뒤 창 제목이 정확히 같을 때만 보냅니다. 비슷한 이름이면 보내지 않고 닫습니다. 투투 와 토토 는 다른 방입니다.' 24 644 736 24 $FontSmall $Theme.Muted)
 
 # ===========================================================================
 # 페이지 3 — 실행 · 예약
@@ -5565,15 +6327,28 @@ $cardPace.Controls.Add($script:numSettle)
 [void](New-CardLabel $cardPace '초 동안 화면이 멈추기를 기다린 뒤 보냅니다 (오픈채팅은 늘리세요)' 234 166 520 24 $FontSmall $Theme.Muted)
 
 $script:chkPreload = New-Object System.Windows.Forms.CheckBox
-$script:chkPreload.Text = '처음 보내기 전에 대상 채팅방을 모두 한 번씩 열어 둡니다'
+$script:chkPreload.Text = '보내기 전에 대상 방을 한 번씩 열어 두기'
 $script:chkPreload.Checked = [bool]$script:config.PreloadRooms
 $script:chkPreload.Location = (New-UiPoint 24 208)
-$script:chkPreload.Size = (New-UiSize 500 28)
+$script:chkPreload.Size = (New-UiSize 330 28)
 $script:chkPreload.BackColor = $Theme.Card
 $script:chkPreload.Font = $FontBase
 $cardPace.Controls.Add($script:chkPreload)
-$btnPreloadNow = New-AppButton $cardPace '지금 미리 열기' 576 204 184 36
 
+# 한 방이 실패했을 때 몇 번까지 다시 해 볼지 정합니다.
+# 0 이면 한 번만 하고 실패로 둡니다. 3 이면 세 번 더 해 봅니다.
+[void](New-CardLabel $cardPace '실패 시 재시도' 364 212 96 24 $FontSmall $Theme.Muted)
+$script:numRetry = New-Object System.Windows.Forms.NumericUpDown
+$script:numRetry.Minimum = 0
+$script:numRetry.Maximum = 5
+$script:numRetry.Value = [Math]::Max(0, [Math]::Min(5, [int]$script:config.RetryCount))
+$script:numRetry.Location = (New-UiPoint 466 208)
+$script:numRetry.Size = (New-UiSize 66 30)
+$script:numRetry.Font = $FontBase
+$script:numRetry.BorderStyle = 'FixedSingle'
+$cardPace.Controls.Add($script:numRetry)
+[void](New-CardLabel $cardPace '회' 538 212 26 24 $FontSmall $Theme.Muted)
+$btnPreloadNow = New-AppButton $cardPace '지금 미리 열기' 576 204 184 36
 $script:chkRepeat = New-Object System.Windows.Forms.CheckBox
 $script:chkRepeat.Text = '다 보낸 뒤 일정 시간마다 다시 보내기'
 $script:chkRepeat.Checked = [bool]$script:config.RepeatEnabled
@@ -5698,6 +6473,24 @@ $script:txtLog.Size = (New-UiSize 708 446)
 $frameLog.Controls.Add($script:txtLog)
 $btnOpenLogDir = New-AppButton $cardLog '로그 폴더 열기' 24 566 170 40
 $btnClearLog   = New-AppButton $cardLog '화면 지우기' 204 566 140 40 'ghost'
+$btnOpenSendLog = New-AppButton $cardLog '발송 기록 표 열기' 354 566 190 40 'strong'
+
+# ===========================================================================
+# 저장 메시지 고르기 상자
+# ===========================================================================
+function Update-TemplateCombo([string]$Select = '') {
+    if ($null -eq $script:cmbTemplate) { return }
+    $keep = if ($Select) { $Select } else { [string]$script:cmbTemplate.SelectedItem }
+    $script:cmbTemplate.Items.Clear()
+    foreach ($row in (Get-Templates)) { [void]$script:cmbTemplate.Items.Add($row.Name) }
+    if ($script:cmbTemplate.Items.Count -eq 0) {
+        $script:lblTemplateState.Text = '아직 저장한 문구가 없습니다. 위에 문구를 쓰고 [새로 저장]을 눌러 보세요.'
+        return
+    }
+    $index = $script:cmbTemplate.Items.IndexOf($keep)
+    $script:cmbTemplate.SelectedIndex = $(if ($index -ge 0) { $index } else { 0 })
+    $script:lblTemplateState.Text = "저장된 문구 $($script:cmbTemplate.Items.Count)개"
+}
 
 # ===========================================================================
 # 채팅방 목록 상태 관리
@@ -5707,10 +6500,10 @@ $script:roomFilter = '전체'
 $script:suppressRoomEvents = $false
 
 function Add-RoomEntry([string]$Name, [string]$Type, [bool]$Checked) {
-    $clean = ([string]$Name).Trim()
+    $clean = ConvertTo-ExactKey $Name
     if (-not $clean) { return $false }
     foreach ($entry in $script:roomEntries) {
-        if ($entry.Name -eq $clean) {
+        if ($entry.Name -ceq $clean) {
             # [채팅] 목록에는 오픈채팅방도 함께 들어 있습니다.
             # 그래서 이미 오픈채팅으로 확인된 방을 일반채팅으로 덮어쓰지 않습니다.
             if ($Type -and $Type -ne $script:RoomTypeUnknown) {
@@ -5721,8 +6514,42 @@ function Add-RoomEntry([string]$Name, [string]$Type, [bool]$Checked) {
             return $false
         }
     }
-    $script:roomEntries.Add([pscustomobject]@{ Name = $clean; Type = $Type; Checked = $Checked })
+    $kind = Get-RoomKind $clean
+    $verified = $false
+    $found = Find-RosterEntry $clean
+    if ($null -ne $found) { $kind = $found.Kind; $verified = $found.Verified }
+    $script:roomEntries.Add([pscustomobject]@{
+        Name = $clean; Type = $Type; Checked = $Checked; Kind = $kind; Verified = $verified
+    })
     return $true
+}
+
+# 저장된 채팅방 목록을 화면 목록에 그대로 옮깁니다.
+# 체크해 둔 것은 그대로 두고, 목록에서 사라진 방은 화면에서도 뺍니다.
+function Sync-RoomEntriesFromRoster {
+    $checked = @{}
+    foreach ($entry in $script:roomEntries) { if ($entry.Checked) { $checked[$entry.Name] = $true } }
+    $roster = @(Get-Roster)
+    $byName = @{}
+    foreach ($row in $roster) { $byName[$row.Name] = $row }
+
+    $fresh = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $roster) {
+        $type = if ($row.Kind -eq 'open') { $script:RoomTypeOpen } else { $script:RoomTypeNormal }
+        $fresh.Add([pscustomobject]@{
+            Name = $row.Name
+            Type = $type
+            Checked = [bool]$checked[$row.Name]
+            Kind = $row.Kind
+            Verified = [bool]$row.Verified
+        })
+    }
+    # 직접 넣은 방은 목록에 없어도 남겨 둡니다. 사용자가 일부러 넣은 것이기 때문입니다.
+    foreach ($entry in $script:roomEntries) {
+        if ($byName.ContainsKey($entry.Name)) { continue }
+        $fresh.Add($entry)
+    }
+    $script:roomEntries = $fresh
 }
 
 function Update-RoomCountLabel {
@@ -5731,6 +6558,8 @@ function Update-RoomCountLabel {
     $shown = $script:lstRooms.Items.Count
     $text = "선택 $($checked) / 전체 $($total)"
     if ($shown -ne $total) { $text += "   ·   보이는 것 $($shown)" }
+    $stamp = [string]$script:config.RosterScannedAt
+    if ($stamp) { $text += "   ·   읽은 때 $stamp" }
     $script:lblRoomCount.Text = $text
 }
 
@@ -5741,7 +6570,7 @@ function Test-RoomMatchesSearch([string]$Name, [string]$Key) {
 }
 
 function Update-FilterButtons {
-    foreach ($pair in @(@($btnFilterAll, '전체'), @($btnFilterPerson, $script:RoomTypePersonal), @($btnFilterChat, $script:RoomTypeGroup), @($btnFilterOpen, $script:RoomTypeOpen))) {
+    foreach ($pair in @(@($btnFilterAll, '전체'), @($btnFilterPerson, 'direct'), @($btnFilterChat, 'group'), @($btnFilterOpen, 'open'))) {
         $button = $pair[0]
         if ($script:roomFilter -eq $pair[1]) {
             $button.BackColor = $Theme.Ink
@@ -5765,12 +6594,17 @@ function Update-RoomListView {
     $script:lstRooms.Items.Clear()
     $items = New-Object System.Collections.Generic.List[object]
     foreach ($entry in ($script:roomEntries | Sort-Object -Property Name)) {
-        if ($script:roomFilter -ne '전체' -and $entry.Type -ne $script:roomFilter) { continue }
+        $kind = [string]$entry.Kind
+        if (-not $kind) { $kind = 'unknown' }
+        if ($script:roomFilter -eq 'open' -and $kind -ne 'open') { continue }
+        if ($script:roomFilter -eq 'direct' -and $kind -ne 'direct') { continue }
+        if ($script:roomFilter -eq 'group' -and $kind -ne 'group') { continue }
         if (-not (Test-RoomMatchesSearch $entry.Name $key)) { continue }
         $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Name)
-        [void]$item.SubItems.Add([string]$entry.Type)
+        [void]$item.SubItems.Add((Get-RosterKindText $kind))
+        [void]$item.SubItems.Add($(if ($entry.Verified) { '확인됨' } else { '화면 글자' }))
         $item.Checked = [bool]$entry.Checked
-        if ($entry.Type -eq $script:RoomTypeUnknown) { $item.ForeColor = $Theme.Muted }
+        if (-not $entry.Verified) { $item.ForeColor = $Theme.Muted }
         $items.Add($item)
     }
     if ($items.Count -gt 0) { $script:lstRooms.Items.AddRange($items.ToArray()) }
@@ -5780,7 +6614,7 @@ function Update-RoomListView {
     Update-RoomCountLabel
     if ($null -ne $script:lblSearchState) {
         if ($key) {
-            $script:lblSearchState.Text = "'$query' 검색 결과 $($items.Count)개 — [보이는 항목 모두 체크]로 한 번에 고를 수 있습니다"
+            $script:lblSearchState.Text = "'$query' 검색 결과 $($items.Count)개 — [전체 선택]으로 보이는 것을 한 번에 고를 수 있습니다"
             $script:lblSearchState.ForeColor = if ($items.Count -gt 0) { $Theme.Info } else { $Theme.Danger }
         } else {
             $script:lblSearchState.Text = ''
@@ -5789,10 +6623,20 @@ function Update-RoomListView {
 }
 
 function Get-RoomEntry([string]$Name) {
-    foreach ($entry in $script:roomEntries) { if ($entry.Name -eq $Name) { return $entry } }
+    foreach ($entry in $script:roomEntries) { if ($entry.Name -ceq $Name) { return $entry } }
     return $null
 }
 
+# 종류로 한 번에 고릅니다. 고른 것 말고는 모두 풉니다.
+function Select-RoomsByKind([string[]]$Kinds) {
+    foreach ($entry in $script:roomEntries) {
+        $kind = [string]$entry.Kind
+        if (-not $kind) { $kind = 'unknown' }
+        $entry.Checked = (@($Kinds) -contains $kind)
+    }
+    Update-RoomListView
+    Sync-ConfigFromForm
+}
 function Update-GroupCombo {
     $script:suppressRoomEvents = $true
     $current = [string]$script:cmbGroup.SelectedItem
@@ -5982,6 +6826,8 @@ function Sync-ConfigFromForm {
     $script:config.IntervalSeconds = [int]$script:numInterval.Value
     $script:config.DryRun = [bool]$script:rdoDry.Checked
     $script:config.ScanPages = [int]$script:numScanPages.Value
+    $script:config.ScanExactNames = [bool]$script:chkExactScan.Checked
+    $script:config.RetryCount = [int]$script:numRetry.Value
     $script:config.TestRoom = $script:txtTestRoom.Text.Trim()
     $script:config.AutoCheckUpdate = [bool]$script:chkAutoUpdate.Checked
     $script:config.AutoDownloadUpdate = [bool]$script:chkAutoDownload.Checked
@@ -6014,13 +6860,20 @@ $autoSaveTimer.Add_Tick({
 function Request-AutoSave { $autoSaveTimer.Stop(); $autoSaveTimer.Start() }
 
 # 저장된 방 목록 채우기
+# 저장된 채팅방 목록(Roster)이 먼저입니다. 여기에 종류와 이름 확인 여부가 들어 있습니다.
 $selectedSet = @{}
-foreach ($room in @($script:config.Rooms)) { $selectedSet[[string]$room] = $true }
-foreach ($room in @(@($script:config.KnownRooms) + @($script:config.Rooms) | ForEach-Object { [string]$_ } | Where-Object { $_ } | Sort-Object -Unique)) {
+foreach ($room in @($script:config.Rooms)) { $selectedSet[(ConvertTo-ExactKey ([string]$room))] = $true }
+foreach ($row in (Get-Roster)) {
+    $rowType = if ($row.Kind -eq 'open') { $script:RoomTypeOpen } else { $script:RoomTypeNormal }
+    [void](Add-RoomEntry $row.Name $rowType ($selectedSet.ContainsKey($row.Name)))
+}
+# 예전 버전에서 넘어온 방도 빠뜨리지 않고 넣습니다.
+foreach ($room in @(@($script:config.KnownRooms) + @($script:config.Rooms) | ForEach-Object { ConvertTo-ExactKey ([string]$_) } | Where-Object { $_ } | Sort-Object -Unique)) {
     [void](Add-RoomEntry $room (Get-RoomType $room) ($selectedSet.ContainsKey($room)))
 }
 Update-RoomListView
 Update-GroupCombo
+Update-TemplateCombo
 Update-LimitStateLabel
 Update-HeaderSummary
 $script:lblMessageCount.Text = "$($script:txtMessage.Text.Length)자"
@@ -6412,11 +7265,88 @@ $btnGroupDelete.Add_Click({
     Write-RunLog "그룹 '$group' 을(를) 지웠습니다."
 })
 
-$btnFilterAll.Add_Click({ $script:roomFilter = '전체'; Update-RoomListView })
-$btnFilterPerson.Add_Click({ $script:roomFilter = $script:RoomTypePersonal; Update-RoomListView })
-$btnFilterChat.Add_Click({ $script:roomFilter = $script:RoomTypeGroup; Update-RoomListView })
-$btnFilterOpen.Add_Click({ $script:roomFilter = $script:RoomTypeOpen; Update-RoomListView })
 
+# ----- 저장 메시지 -----
+$btnTplLoad.Add_Click({
+    $name = [string]$script:cmbTemplate.SelectedItem
+    if (-not $name) {
+        [System.Windows.Forms.MessageBox]::Show('불러올 문구를 골라 주세요.', '저장 메시지') | Out-Null
+        return
+    }
+    $row = Find-Template $name
+    if ($null -eq $row) { return }
+    if ($script:txtMessage.Text.Trim() -and $script:txtMessage.Text -ne $row.Text) {
+        $ask = "지금 쓰던 문구를 '$name' 으로 바꿉니다.`r`n`r`n계속할까요?"
+        if ([System.Windows.Forms.MessageBox]::Show($ask, '저장 메시지 불러오기', 'YesNo', 'Question') -ne 'Yes') { return }
+    }
+    $script:txtMessage.Text = $row.Text
+    $script:lastTemplateName = $name
+    $script:lblTemplateState.Text = "'$name' 을(를) 불러왔습니다."
+    Sync-ConfigFromForm
+})
+
+$btnTplSave.Add_Click({
+    $body = [string]$script:txtMessage.Text
+    if (-not $body.Trim()) {
+        [System.Windows.Forms.MessageBox]::Show('먼저 위에 보낼 문구를 써 주세요.', '저장 메시지') | Out-Null
+        return
+    }
+    $name = ([string][Microsoft.VisualBasic.Interaction]::InputBox('이 문구에 붙일 이름을 적어 주세요. 예: 기본 안내문', '저장 메시지 — 새로 저장', '')).Trim()
+    if (-not $name) { return }
+    if ($null -ne (Find-Template $name)) {
+        $ask = "'$name' 이(가) 이미 있습니다.`r`n`r`n덮어쓸까요?"
+        if ([System.Windows.Forms.MessageBox]::Show($ask, '저장 메시지', 'YesNo', 'Question') -ne 'Yes') { return }
+    }
+    $rows = @(Get-Templates | Where-Object { $_.Name -ne $name })
+    $rows += [pscustomobject]@{ Name = $name; Text = $body }
+    Set-Templates $rows
+    $script:lastTemplateName = $name
+    Update-TemplateCombo $name
+    $script:lblTemplateState.Text = "'$name' 으로 저장했습니다."
+})
+
+$btnTplUpdate.Add_Click({
+    $name = [string]$script:cmbTemplate.SelectedItem
+    if (-not $name) {
+        [System.Windows.Forms.MessageBox]::Show('덮어쓸 문구를 골라 주세요.', '저장 메시지') | Out-Null
+        return
+    }
+    $body = [string]$script:txtMessage.Text
+    if (-not $body.Trim()) {
+        [System.Windows.Forms.MessageBox]::Show('위에 쓴 문구가 비어 있습니다.', '저장 메시지') | Out-Null
+        return
+    }
+    $ask = "'$name' 에 지금 쓴 문구를 덮어씁니다.`r`n`r`n계속할까요?"
+    if ([System.Windows.Forms.MessageBox]::Show($ask, '저장 메시지 덮어쓰기', 'YesNo', 'Warning') -ne 'Yes') { return }
+    $rows = @()
+    foreach ($row in (Get-Templates)) {
+        if ($row.Name -eq $name) { $rows += [pscustomobject]@{ Name = $name; Text = $body } }
+        else { $rows += $row }
+    }
+    Set-Templates $rows
+    $script:lastTemplateName = $name
+    Update-TemplateCombo $name
+    $script:lblTemplateState.Text = "'$name' 을(를) 새 내용으로 바꿨습니다."
+})
+
+$btnTplDelete.Add_Click({
+    $name = [string]$script:cmbTemplate.SelectedItem
+    if (-not $name) { return }
+    $ask = "'$name' 을(를) 지웁니다.`r`n`r`n지운 문구는 되돌릴 수 없습니다. 계속할까요?"
+    if ([System.Windows.Forms.MessageBox]::Show($ask, '저장 메시지 삭제', 'YesNo', 'Warning') -ne 'Yes') { return }
+    Set-Templates @(Get-Templates | Where-Object { $_.Name -ne $name })
+    if ($script:lastTemplateName -eq $name) { $script:lastTemplateName = '' }
+    Update-TemplateCombo
+    $script:lblTemplateState.Text = "'$name' 을(를) 지웠습니다."
+})
+$btnFilterAll.Add_Click({ $script:roomFilter = '전체'; Update-RoomListView })
+$btnFilterPerson.Add_Click({ $script:roomFilter = 'direct'; Update-RoomListView })
+$btnFilterChat.Add_Click({ $script:roomFilter = 'group'; Update-RoomListView })
+$btnFilterOpen.Add_Click({ $script:roomFilter = 'open'; Update-RoomListView })
+
+# 일반채팅은 1:1 과 단체를 모두 뜻합니다. 종류를 아직 모르는 방도 일반채팅으로 봅니다.
+$btnPickNormal.Add_Click({ Select-RoomsByKind @('direct', 'group', 'unknown') })
+$btnPickOpen.Add_Click({ Select-RoomsByKind @('open') })
 $btnCheckAll.Add_Click({
     foreach ($item in $script:lstRooms.Items) {
         $entry = Get-RoomEntry ([string]$item.Text)
@@ -6472,152 +7402,127 @@ $btnDeleteRoom.Add_Click({
     Write-RunLog "목록에서 $($names.Count)개 항목을 지웠습니다."
 })
 
+# 카카오톡에 보이는 채팅방 목록을 통째로 읽어 저장합니다.
+# 사용자가 이름을 치는 방식은 쓰지 않습니다. 카카오톡에 있는 그대로를 가져옵니다.
 $btnScanRooms.Add_Click({
     try {
         Sync-ConfigFromForm
         $ready = Test-KakaoReady $true $false
         if (-not $ready.Ok) {
-            [System.Windows.Forms.MessageBox]::Show("$($ready.Reason)`r`n`r`n카카오톡에서 [채팅] 또는 [오픈채팅] 탭을 눌러 목록이 보이게 한 뒤 다시 눌러 주세요.", '먼저 확인해 주세요') | Out-Null
+            [System.Windows.Forms.MessageBox]::Show("$($ready.Reason)`r`n`r`n카카오톡에서 [채팅] 탭을 눌러 목록이 보이게 한 뒤 다시 눌러 주세요.", '먼저 확인해 주세요') | Out-Null
             return
         }
-
-        # 카카오톡 위쪽에서 지금 선택된 탭이 [채팅] 인지 [오픈채팅] 인지 직접 확인합니다.
-        Set-StatusPill '어떤 탭인지 확인 중' 'run'
-        $detected = Get-ActiveKakaoTab $ready.Layout
-        Set-StatusPill '준비됨' 'idle'
-        # 종류는 카카오톡 위쪽 탭을 보고 알아서 정합니다.
-        # 예/아니오로 매번 고르게 하면 번거롭기만 하고 잘못 고르기도 쉽습니다.
-        $type = if ($detected -eq $script:RoomTypeUnknown) { $script:RoomTypeNormal } else { $detected }
-        $guess = if ($detected -eq $script:RoomTypeUnknown) { "판별하지 못해 $type 으로 저장합니다" } else { "$detected 으로 저장합니다" }
-        $ask = "지금 카카오톡에서 보고 있는 목록을 읽습니다." + "`r`n`r`n" +
-               "· 읽을 종류: $guess" + "`r`n" +
-               "· 카카오톡 화면: $($ready.Layout.ViewName)" + "`r`n`r`n" +
-               "카카오톡에서 오픈채팅을 따로 보고 계시면, 그 설정을 끄면" + "`r`n" +
-               "[채팅] 목록 하나에서 전부 읽을 수 있어 편합니다." + "`r`n" +
+        $exact = [bool]$script:chkExactScan.Checked
+        $before = @(Get-Roster).Count
+        $howText = if ($exact) {
+            "방을 하나씩 열어 창 제목으로 이름을 확인합니다." + "`r`n" +
+            "이름이 정확해지는 대신 시간이 걸립니다. (방 하나에 2~3초)" + "`r`n" +
+            "여는 방은 읽음으로 표시됩니다."
+        } else {
+            "화면 글자만 읽습니다. 빠르지만 이름을 틀리게 읽을 수 있습니다." + "`r`n" +
+            "정확하게 하시려면 [방을 열어 이름 확인]을 켜 주세요."
+        }
+        $ask = "지금 카카오톡에 보이는 채팅방 목록을 읽습니다." + "`r`n`r`n" +
+               $howText + "`r`n`r`n" +
+               "· 카카오톡 화면: $($ready.Layout.ViewName)" + "`r`n" +
+               "· 지금 저장된 방: $($before)개" + "`r`n`r`n" +
+               "오픈채팅을 따로 보고 계시면 그 설정을 끄면 한 번에 다 읽습니다." + "`r`n" +
                "  카카오톡 설정 → 채팅 → 오픈채팅 분리해서 보기 → 끄기" + "`r`n`r`n" +
                "[확인] 읽기 시작    [취소] 그만두기"
-        $answer = [System.Windows.Forms.MessageBox]::Show($ask, "목록 읽기 — $type", 'OKCancel', 'Information')
-        if ($answer -ne 'OK') { return }
-        if ($detected -ne $script:RoomTypeUnknown -and $detected -ne $type) {
-            Write-RunLog "주의: 화면은 $detected 로 보였는데 $type 으로 저장합니다."
-        }
+        if ([System.Windows.Forms.MessageBox]::Show($ask, '채팅방 목록 새로고침', 'OKCancel', 'Information') -ne 'OK') { return }
 
-        Set-StatusPill "$type 목록 읽는 중" 'run'
         $script:form.Enabled = $false
-        Write-RunLog "카카오톡 $type 목록을 읽는 중입니다. (화면: $($ready.Layout.ViewName))"
-        $scan = Get-KakaoRoomNames ([int]$script:config.ScanPages)
-        $script:form.Enabled = $true
-        $script:form.Activate()
+        Set-StatusPill '목록 읽는 중' 'run'
+        $scan = $null
+        try {
+            $scan = Invoke-RosterScan $exact ([int]$script:config.ScanPages)
+        } finally {
+            $script:form.Enabled = $true
+            $script:form.Activate()
+        }
+        if ($null -eq $scan) { Set-StatusPill '준비됨' 'idle'; return }
 
-        $added = 0
-        foreach ($name in @($scan.Names)) { if (Add-RoomEntry $name $type $false) { $added++ } }
+        $diff = Merge-RosterScan $scan $false
+        Sync-RoomEntriesFromRoster
         Update-RoomListView
         Sync-ConfigFromForm
+        try { Save-Config $script:config } catch { }
         Set-StatusPill '준비됨' 'idle'
-        Write-RunLog "목록 읽기 완료: $($type) / 화면 $($scan.Pages)개 / 후보 $(@($scan.Names).Count)개 중 새 항목 $($added)개"
 
-        $readCount = @($scan.Names).Count
-        $result = "$($type) 방 $($readCount)개를 읽었습니다. (새로 추가 $($added)개)"
-        $titleFailed = 0
-        try { $titleFailed = [int]$scan.TitleFailures } catch { }
-        if ($titleFailed -gt 0) {
-            $result = "채팅방 $($readCount + $titleFailed)개 중 $($readCount)개를 정상적으로 읽었습니다. (새로 추가 $($added)개)"
-            $result += "`r`n`r`n$($titleFailed)개 채팅방은 제목을 정확하게 확인할 수 없어"
-            $result += "`r`n발송 대상에서 제외했습니다."
-            $result += "`r`n`r`n대화내용을 이름으로 쓰면 엉뚱한 방에 갈 수 있어 일부러 뺐습니다."
-            $result += "`r`n`r`n카카오톡 창을 조금 크게 한 뒤"
-            $result += "`r`n[카카오톡에서 읽기]를 다시 눌러 주세요."
+        $readCount = @($scan.Rows).Count
+        Write-RunLog "목록 새로고침 끝: 읽은 방 $($readCount)개 / 새로 생김 $(@($diff.Added).Count)개 / 없어짐 $(@($diff.Removed).Count)개 / 저장된 전체 $($diff.Total)개"
+
+        $result = "채팅방 $($readCount)개를 읽었습니다." + "`r`n`r`n" +
+                  "· 새로 생긴 방: $(@($diff.Added).Count)개" + "`r`n" +
+                  "· 목록에서 없어진 방: $(@($diff.Removed).Count)개" + "`r`n" +
+                  "· 저장된 전체: $($diff.Total)개"
+        if (@($diff.Added).Count -gt 0) {
+            $result += "`r`n`r`n[새로 생긴 방]`r`n" + ((@($diff.Added) | Select-Object -First 8) -join "`r`n")
+            if (@($diff.Added).Count -gt 8) { $result += "`r`n… 외 $((@($diff.Added).Count) - 8)개" }
         }
-        # 카카오톡에 방이 많이 쌓여 있으면 처음에 목록이 제대로 안 그려지는 일이 있습니다.
-        # 예전에 알던 개수보다 크게 적으면 그 상황일 수 있어 알려 드립니다.
-        $knownBefore = @($script:config.KnownRooms).Count
-        if ($readCount -gt 0 -and $knownBefore -ge 20 -and $readCount -lt ($knownBefore * 0.5)) {
-            Write-RunLog "주의: 예전에 알던 $($knownBefore)개보다 훨씬 적은 $($readCount)개만 읽혔습니다."
-            $result += "`r`n`r`n[목록이 적게 읽혔습니다]"
-            $result += "`r`n예전에는 $($knownBefore)개였는데 이번에는 $($readCount)개만 읽혔습니다."
-            $result += "`r`n카카오톡에 방이 많이 쌓여 있으면 처음에 목록이 다 그려지지 않는 일이 있습니다."
-            $result += "`r`n`r`n카카오톡 채팅 화면을 한 번 닫았다가 다시 열고, 목록을 맨 위까지 올린 뒤"
-            $result += "`r`n[카카오톡에서 읽기]를 한 번 더 눌러 주세요."
+        if (@($diff.Removed).Count -gt 0) {
+            $result += "`r`n`r`n[없어진 방]`r`n" + ((@($diff.Removed) | Select-Object -First 8) -join "`r`n")
+            if (@($diff.Removed).Count -gt 8) { $result += "`r`n… 외 $((@($diff.Removed).Count) - 8)개" }
         }
-        if (@($scan.Names).Count -eq 0) {
-            $result += "`r`n`r`n한 개도 읽지 못했습니다. 카카오톡에서 목록이 실제로 보이는 상태인지 확인하고, 창을 조금 크게 한 뒤 다시 시도해 보세요."
+        if ([int]$scan.OpenFailures -gt 0) {
+            $result += "`r`n`r`n$([int]$scan.OpenFailures)개 줄은 방을 열지 못해 목록에 넣지 못했습니다."
+            $result += "`r`n카카오톡 창을 조금 크게 한 뒤 다시 해 보세요."
+        }
+        if ([int]$scan.TitleFailures -gt 0) {
+            $result += "`r`n`r`n$([int]$scan.TitleFailures)개 줄은 제목을 못 읽어 넣지 않았습니다."
+            $result += "`r`n대화내용을 이름으로 쓰면 엉뚱한 방에 갈 수 있어 일부러 뺐습니다."
+            $result += "`r`n[방을 열어 이름 확인]을 켜고 다시 하시면 이 줄들도 읽힙니다."
+        }
+        if ([bool]$scan.Cancelled) { $result += "`r`n`r`n도중에 멈췄습니다. 읽은 데까지만 저장했습니다." }
+        if ($readCount -eq 0) {
+            $result += "`r`n`r`n한 개도 읽지 못했습니다. 카카오톡에서 목록이 실제로 보이는지 확인하고, 창을 조금 크게 한 뒤 다시 해 보세요."
         } else {
-            $result += "`r`n`r`n① 보낼 방만 체크하세요.`r`n② [이름 확인·보정]을 누르면 실제 이름으로 자동 교정됩니다."
+            $result += "`r`n`r`n이제 보낼 방만 체크하시면 됩니다."
         }
-        # 카카오톡 [채팅] 목록에는 오픈채팅방도 섞여 있어, 탭만으로는 방마다 종류를 알 수 없습니다.
-        # [오픈채팅] 탭을 먼저 읽어 두면 그 방들이 오픈으로 표시되고,
-        # 그다음 [채팅] 탭을 읽을 때 나머지만 일반채팅이 됩니다.
-        if ($type -eq $script:RoomTypeNormal) {
-            $openCount = @($script:roomEntries | Where-Object { $_.Type -eq $script:RoomTypeOpen }).Count
-            if ($openCount -eq 0) {
-                $result += "`r`n`r`n[종류를 정확히 나누려면]`r`n[채팅] 목록에는 오픈채팅방도 함께 들어 있습니다."
-                $result += "`r`n카카오톡에서 [오픈채팅] 탭으로 바꿔 한 번 더 읽으면, 그 방들만 오픈채팅으로 바뀌고 나머지는 일반채팅으로 남습니다."
-            } else {
-                $result += "`r`n`r`n오픈채팅으로 표시된 방 $($openCount)개는 그대로 유지했습니다."
-            }
-        } else {
-            $result += "`r`n`r`n오픈채팅으로 표시했습니다. 아직 [채팅] 탭을 읽지 않으셨다면, 그쪽도 한 번 읽어 두시면 목록이 완성됩니다."
-        }
-        [System.Windows.Forms.MessageBox]::Show($result, '목록 읽기 완료') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show($result, '채팅방 목록 새로고침') | Out-Null
     } catch {
         $script:form.Enabled = $true
         $script:form.Activate()
-        Set-StatusPill '읽기 실패' 'error'
+        Set-StatusPill '목록 읽기 실패' 'error'
         Write-RunLog "목록 읽기 실패: $($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '목록 읽기 실패') | Out-Null
     }
 })
-
 $btnVerifyRoom.Add_Click({
     try {
         Sync-ConfigFromForm
-        $targets = @($script:roomEntries | Where-Object { $_.Checked })
+        $targets = @($script:roomEntries | Where-Object { $_.Checked } | ForEach-Object { [string]$_.Name })
         if ($targets.Count -eq 0) { throw '확인할 채팅방을 먼저 체크해 주세요.' }
-        if ($targets.Count -gt 50) { throw '한 번에 최대 50개까지만 확인합니다.' }
-        $body = "체크한 $($targets.Count)개 방을 하나씩 열어 실제 이름으로 교정합니다.`r`n`r`n메시지는 전송하지 않지만 채팅방이 열리므로 읽음 표시가 될 수 있습니다.`r`n진행하는 동안 마우스와 키보드를 사용하지 마세요. 계속할까요?"
+        if ($targets.Count -gt 60) { throw '한 번에 최대 60개까지만 확인합니다.' }
+        $body = "체크한 $($targets.Count)개 방을 하나씩 열어 창 제목으로 이름을 확인합니다." + "`r`n`r`n" +
+                "메시지는 보내지 않습니다. 다만 방이 열리므로 읽음 표시가 됩니다." + "`r`n" +
+                "진행하는 동안 마우스와 키보드를 쓰지 말아 주세요." + "`r`n`r`n" +
+                "계속할까요?"
         if ([System.Windows.Forms.MessageBox]::Show($body, '이름 확인·보정', 'YesNo', 'Question') -ne 'Yes') { return }
 
         $script:form.Enabled = $false
         Set-StatusPill '이름 확인 중' 'run'
-        $fixed = 0
-        $failed = 0
-        foreach ($entry in $targets) {
-            $current = [string]$entry.Name
-            $type = if ($entry.Type -eq $script:RoomTypeUnknown) { $script:RoomTypeNormal } else { $entry.Type }
-            try {
-                $result = Resolve-RoomName $current $type
-                if ($null -eq $result) { $failed++; Write-RunLog "이름 확인 실패: '$current' — 채팅창을 열지 못했습니다."; continue }
-                $actual = [string]$result.Name
-                # 개인/그룹 구분을 함께 기록합니다.
-                if ($entry.Type -ne $result.Type) {
-                    $entry.Type = $result.Type
-                    $detail = if ($result.Members -gt 0) { " (인원 $($result.Members)명)" } else { '' }
-                    Write-RunLog "종류 확인: '$actual' → $($result.Type)$detail"
-                }
-                if ($actual -and $actual -ne $current) {
-                    if ($null -ne (Get-RoomEntry $actual)) {
-                        Write-RunLog "이름 교정 생략: '$current' → '$actual' (이미 목록에 있음)"
-                    } else {
-                        Rename-RoomInGroups $current $actual
-                        # 목록에서 찾을 때는 원래 읽혔던 글자를 써야 합니다.
-                        Set-RoomListName $actual $current
-                        $entry.Name = $actual
-                        $fixed++
-                        Write-RunLog "이름 교정: '$current' → '$actual'"
-                    }
-                }
-            } catch {
-                $failed++
-                Write-RunLog "이름 확인 오류: '$current' — $($_.Exception.Message)"
-            }
-            Start-Sleep -Milliseconds 600
+        $result = $null
+        try { $result = Invoke-RoomNameVerify $targets ([int]$script:config.ScanPages) }
+        finally {
+            $script:form.Enabled = $true
+            $script:form.Activate()
         }
+        Sync-RoomEntriesFromRoster
         Update-RoomListView
-        $script:form.Enabled = $true
-        $script:form.Activate()
         Sync-ConfigFromForm
         Set-StatusPill '이름 확인 완료' 'done'
-        [System.Windows.Forms.MessageBox]::Show("확인 $($targets.Count)개 · 교정 $($fixed)개 · 실패 $($failed)개`r`n`r`n실패한 방은 카카오톡에 표시되는 이름을 [이름 수정]으로 직접 맞춰 주세요.", '이름 확인·보정 완료') | Out-Null
+        if ($null -eq $result) { return }
+
+        $text = "확인 $(@($result.Confirmed).Count)개 · 바로잡음 $(@($result.Renamed).Count)개 · 못 찾음 $(@($result.NotFound).Count)개"
+        if (@($result.Renamed).Count -gt 0) {
+            $text += "`r`n`r`n[바로잡은 이름]`r`n" + ((@($result.Renamed) | Select-Object -First 10) -join "`r`n")
+        }
+        if (@($result.NotFound).Count -gt 0) {
+            $text += "`r`n`r`n[못 찾은 방]`r`n" + ((@($result.NotFound) | Select-Object -First 10) -join "`r`n")
+            $text += "`r`n`r`n[채팅방 목록 새로고침]을 [방을 열어 이름 확인]을 켜고 한 번 해 보세요."
+        }
+        [System.Windows.Forms.MessageBox]::Show($text, '이름 확인·보정 완료') | Out-Null
     } catch {
         $script:form.Enabled = $true
         $script:form.Activate()
@@ -7191,6 +8096,19 @@ $btnPrereq.Add_Click({
 })
 $btnOpenLogs.Add_Click({ Start-Process 'explorer.exe' $LogDir })
 $btnOpenLogDir.Add_Click({ Start-Process 'explorer.exe' $LogDir })
+# 발송 결과를 표로 적어 둔 파일입니다. 시간 / 채팅방 / 문구 / 첨부 / 결과 / 사유
+$btnOpenSendLog.Add_Click({
+    $path = Join-Path $LogDir ('발송기록-' + (Get-Date -Format 'yyyy-MM') + '.csv')
+    if (-not (Test-Path -LiteralPath $path)) {
+        $found = @(Get-ChildItem -LiteralPath $LogDir -Filter '발송기록-*.csv' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+        if ($found.Count -gt 0) { $path = $found[0].FullName }
+    }
+    if (-not (Test-Path -LiteralPath $path)) {
+        [System.Windows.Forms.MessageBox]::Show('아직 발송 기록이 없습니다. 한 번 보내고 나면 여기에 표로 쌓입니다.', '발송 기록') | Out-Null
+        return
+    }
+    try { Start-Process -FilePath $path } catch { Start-Process 'explorer.exe' $LogDir }
+})
 $btnClearLog.Add_Click({ $script:txtLog.Clear() })
 $btnResetConf.Add_Click({
     # 이 PC 에 쌓인 것을 모두 지웁니다. 다른 사람에게 폴더를 넘길 때도 이 버튼을 쓰면 됩니다.
