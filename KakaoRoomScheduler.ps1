@@ -676,6 +676,11 @@ function New-DefaultConfig {
         RetryCount = 3
         # 한 방을 끝내면 그 채팅창을 닫고 다음 방으로 갑니다.
         CloseAfterSend = $true
+        # 사진을 묶어서 한 번에 보낼지 정합니다.
+        # 한 장씩 보내면 미리보기 창이 뜨고 닫히기를 되풀이해서 중간에 잘 막힙니다.
+        # 묶어 보내면 미리보기가 한 번만 뜨고 한 번에 나갑니다.
+        GroupPhotos = $true
+        PhotoBatchSize = 10
         # 공휴일마다 어떻게 할지 하나씩 정합니다.
         #   { Date = '2026-09-24'; Name = '추석'; Action = 'move'; MoveTo = '2026-09-25' }
         #   Action: normal(그대로 보냄) / skip(그날은 안 보냄) / move(다른 날로 옮김)
@@ -1763,14 +1768,23 @@ function Set-ClipboardTextSafe([string]$Text) {
     throw '클립보드에 문구를 넣지 못했습니다. 다른 프로그램이 클립보드를 사용 중일 수 있습니다.'
 }
 
-function Set-ClipboardFileSafe([string]$Path) {
+# 여러 파일을 한꺼번에 클립보드에 담습니다.
+# 사진을 묶어 보낼 때 이 방법을 씁니다. 한 장씩 보내는 것보다 잘 붙습니다.
+function Set-ClipboardFilesSafe([string[]]$Paths) {
     $files = New-Object System.Collections.Specialized.StringCollection
-    [void]$files.Add((Resolve-Path -LiteralPath $Path).Path)
+    foreach ($path in @($Paths)) {
+        [void]$files.Add((Resolve-Path -LiteralPath ([string]$path)).Path)
+    }
+    if ($files.Count -eq 0) { throw '클립보드에 담을 파일이 없습니다.' }
     for ($attempt = 0; $attempt -lt 6; $attempt++) {
         try { [System.Windows.Forms.Clipboard]::SetFileDropList($files); return }
         catch { Start-Sleep -Milliseconds 200 }
     }
     throw '클립보드에 첨부 파일을 넣지 못했습니다.'
+}
+
+function Set-ClipboardFileSafe([string]$Path) {
+    Set-ClipboardFilesSafe @($Path)
 }
 
 # 창 제목이 목표 방과 같은지 봅니다.
@@ -3075,32 +3089,50 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
     $problems = @()
 
     # ----- 1) 첨부 파일 -----
+    # 사진은 묶어서 한 번에 보냅니다. 한 장씩 보내는 것보다 훨씬 잘 갑니다.
     $waitMs = [Math]::Max(500, [int]$Content.AttachmentWaitMs)
     $files = @($Content.Attachments)
-    if ($files.Count -gt 0) { Set-SendProgress $Room '파일 첨부 중' '' }
-    foreach ($attachment in $files) {
-        $path = [string]$attachment
-        if ($state.SentFiles.ContainsKey($path)) { continue }
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            $problems += "ATTACH_MISSING 파일이 없습니다: $path"
-            Write-RunLog "첨부 실패: 파일 없음 — $path"
-            continue
+    if ($files.Count -gt 0) {
+        Set-SendProgress $Room '파일 첨부 중' ''
+        # 이미 보낸 파일은 빼고 묶습니다. 다시 할 때 같은 사진을 또 보내면 안 됩니다.
+        $left = @()
+        foreach ($path in $files) {
+            $p = [string]$path
+            if ($state.SentFiles.ContainsKey($p)) { continue }
+            if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+                $problems += "ATTACH_MISSING 파일이 없습니다: $p"
+                Write-RunLog "첨부 실패: 파일 없음 — $p"
+                continue
+            }
+            $left += $p
         }
-        $name = [System.IO.Path]::GetFileName($path)
-        $outcome = $null
-        try { $outcome = Send-ChatAttachment $chat $inputBox $path $waitMs $true } catch { $outcome = $null }
-        if ($null -eq $outcome) {
-            $problems += "ATTACH_FAILED '$name' 을(를) 보내지 못했습니다."
-            Write-RunLog "첨부 실패: '$name' — 알 수 없는 문제가 생겨 보내지 않았습니다."
-        } elseif ($outcome.Sent) {
-            $state.SentFiles[$path] = $true
-            Write-RunLog "첨부 보냄: $name  [$($outcome.Method) / $($outcome.SendWay)]"
-        } else {
-            $problems += "ATTACH_FAILED '$name' — $($outcome.Reason)"
-            Write-RunLog "첨부 실패: '$name' — $($outcome.Reason) (보내지 않았습니다)"
+        $batches = @(Group-AttachmentBatches $left ([bool]$Content.GroupPhotos) ([int]$Content.PhotoBatchSize))
+        $batchNo = 0
+        foreach ($batch in $batches) {
+            $batchNo++
+            $names = @(@($batch) | ForEach-Object {
+                $n = $_
+                try { $n = [System.IO.Path]::GetFileName([string]$_) } catch { }
+                [string]$n
+            })
+            $label = if (@($batch).Count -gt 1) { "$(@($batch).Count)장 묶음" } else { $names[0] }
+            if ($batches.Count -gt 1) {
+                Set-SendProgress $Room '파일 첨부 중' "$($batchNo)/$($batches.Count) — $label"
+            }
+            $outcome = $null
+            try { $outcome = Send-ChatAttachments $chat $inputBox $batch $waitMs $true } catch { $outcome = $null }
+            if ($null -eq $outcome) {
+                $problems += "ATTACH_FAILED '$label' 을(를) 보내지 못했습니다."
+                Write-RunLog "첨부 실패: '$label' — 알 수 없는 문제가 생겨 보내지 않았습니다."
+            } elseif ($outcome.Sent) {
+                foreach ($path in @($batch)) { $state.SentFiles[[string]$path] = $true }
+                Write-RunLog "첨부 보냄: $($names -join ', ')  [$($outcome.Method) / $($outcome.SendWay)]"
+            } else {
+                $problems += "ATTACH_FAILED '$label' — $($outcome.Reason)"
+                Write-RunLog "첨부 실패: '$label' — $($outcome.Reason) (보내지 않았습니다)"
+            }
         }
     }
-
     # ----- 2) 문구 -----
     $message = [string]$Content.Message
     if ((-not [string]::IsNullOrWhiteSpace($message)) -and (-not $state.MessageSent)) {
@@ -3641,15 +3673,21 @@ function Wait-FileDialog([hashtable]$Before, [int]$TimeoutMs) {
 
 # 파일 선택창에 경로를 적어 넣고 [열기] 를 누릅니다.
 # 이 창은 윈도우 기본 창이라 창 메시지가 그대로 통합니다.
-function Submit-FileDialog([object]$Dialog, [string]$Path, [int]$TimeoutMs) {
+# 파일 선택창의 이름 칸에 경로를 넣고 [열기] 를 누릅니다.
+# 여러 개를 한 번에 고를 때는 탐색기와 같은 방식으로 따옴표로 묶어 나열합니다.
+#   "C:\사진\1.jpg" "C:\사진\2.jpg" "C:\사진\3.jpg"
+function Submit-FileDialog([object]$Dialog, [string[]]$Paths, [int]$TimeoutMs) {
+    $list = @(@($Paths) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    if ($list.Count -eq 0) { return '넣을 파일이 없습니다' }
+    $typed = if ($list.Count -eq 1) { $list[0] } else { ($list | ForEach-Object { '"' + $_ + '"' }) -join ' ' }
     $edit = $null
     foreach ($child in [NativeKakao]::GetChildWindows($Dialog.Handle)) {
         if ($child.ClassName -eq 'Edit' -and $child.Visible -and $child.Width -gt 40) { $edit = $child; break }
     }
     if ($null -eq $edit) { return '파일 이름 칸을 찾지 못함' }
-    [NativeKakao]::SetControlText($edit.Handle, $Path)
+    [NativeKakao]::SetControlText($edit.Handle, $typed)
     Start-Sleep -Milliseconds 150
-    if ([NativeKakao]::GetControlText($edit.Handle) -ne $Path) { return '파일 이름 칸에 경로가 들어가지 않음' }
+    if ([NativeKakao]::GetControlText($edit.Handle) -ne $typed) { return '파일 이름 칸에 경로가 들어가지 않음' }
     $okButton = [NativeKakao]::GetDlgItem($Dialog.Handle, 1)
     if ($okButton -ne [IntPtr]::Zero) { [NativeKakao]::ClickButton($okButton) }
     else { [NativeKakao]::PressKey($edit.Handle, 0x0D) }
@@ -3661,8 +3699,6 @@ function Submit-FileDialog([object]$Dialog, [string]$Path, [int]$TimeoutMs) {
     }
     return '파일 선택창이 닫히지 않음'
 }
-
-# 열어 둔 파일 선택창을 반드시 닫습니다. 열린 채로 두면 다음 방부터 전부 막힙니다.
 function Close-FileDialog([object]$Dialog) {
     if ($null -eq $Dialog) { return }
     try {
@@ -3685,30 +3721,37 @@ function New-AttachStage([string]$Problem, [object]$Preview) {
 }
 
 # 1순위: 클립보드로 붙여넣습니다. 사진은 이 길이 가장 확실합니다.
-function Add-AttachmentByClipboard([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs) {
-    $methods = if (Test-IsImageFile $Path) { @('image', 'file') } else { @('file', 'image') }
+function Add-AttachmentByClipboard([object]$Chat, [object]$InputBox, [string[]]$Paths, [int]$WaitMs) {
+    $list = @(@($Paths) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    if ($list.Count -eq 0) { return (New-AttachStage '붙일 파일이 없음' $null) }
+    # 한 장일 때는 그림으로도, 파일로도 붙여 봅니다.
+    # 여러 장일 때는 파일 목록으로만 붙습니다. 그림은 한 번에 하나밖에 못 담습니다.
+    $methods = if ($list.Count -gt 1) { @('file') }
+               elseif (Test-IsImageFile $list[0]) { @('image', 'file') }
+               else { @('file', 'image') }
     $lastReason = '클립보드로 붙지 않음'
     foreach ($method in $methods) {
         $ready = $false
         try {
-            if ($method -eq 'image') { $ready = Set-ClipboardImageSafe $Path }
-            else { Set-ClipboardFileSafe $Path; $ready = $true }
+            if ($method -eq 'image') { $ready = Set-ClipboardImageSafe $list[0] }
+            else { Set-ClipboardFilesSafe $list; $ready = $true }
         } catch { $ready = $false }
         if (-not $ready) { $lastReason = '클립보드에 넣지 못함'; continue }
         $before = Get-VisibleWindowHandles
         if (-not (Enter-ChatForeground $Chat $InputBox)) { return (New-AttachStage '채팅창을 앞으로 가져오지 못함' $null) }
         [NativeKakao]::PressCtrlKey(0x56)
         # 사진은 미리보기 창이 뜹니다. 파일은 채팅창에 바로 붙기도 합니다.
-        $preview = Wait-KakaoPreviewWindow $before ([Math]::Max(2500, $WaitMs + 1200))
+        # 여러 장이면 미리보기가 뜨기까지 조금 더 걸립니다.
+        $extra = [Math]::Min(6000, 400 * $list.Count)
+        $preview = Wait-KakaoPreviewWindow $before ([Math]::Max(2500, $WaitMs + 1200 + $extra))
         if ($null -ne $preview) { return (New-AttachStage '' $preview) }
         if ((Test-ChatSendReady $Chat $InputBox) -eq 'yes') { return (New-AttachStage '' $null) }
     }
     return (New-AttachStage $lastReason $null)
 }
-
-# 2순위: 채팅창 아래 [파일] 아이콘으로 파일 선택창을 띄워 넣습니다.
-# 클립보드를 다른 프로그램이 쓰고 있을 때도 이 길은 막히지 않습니다.
-function Add-AttachmentByDialog([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs) {
+function Add-AttachmentByDialog([object]$Chat, [object]$InputBox, [string[]]$Paths, [int]$WaitMs) {
+    $list = @(@($Paths) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    if ($list.Count -eq 0) { return (New-AttachStage '붙일 파일이 없음' $null) }
     $icons = @(Find-ChatToolbarIcons $Chat $InputBox)
     if ($icons.Count -eq 0) { return (New-AttachStage '채팅창 아래 아이콘 줄을 찾지 못함' $null) }
     # 왼쪽부터 [+] [이모티콘] [파일] 순서입니다.
@@ -3737,22 +3780,19 @@ function Add-AttachmentByDialog([object]$Chat, [object]$InputBox, [string]$Path,
                 continue
             }
             $seen = Get-VisibleWindowHandles
-            $problem = Submit-FileDialog $dialog $Path 8000
+            $problem = Submit-FileDialog $dialog $list 8000
             if ($problem) {
                 $lastReason = $problem
                 Close-FileDialog $dialog
                 continue
             }
-            $preview = Wait-KakaoPreviewWindow $seen ([Math]::Max(2500, $WaitMs + 1200))
+            $extra = [Math]::Min(6000, 400 * $list.Count)
+            $preview = Wait-KakaoPreviewWindow $seen ([Math]::Max(2500, $WaitMs + 1200 + $extra))
             return (New-AttachStage '' $preview)
         }
     }
     return (New-AttachStage $lastReason $null)
 }
-
-# 채팅창에 바로 붙은 첨부를 보냅니다.
-# 첨부는 입력칸이 처음부터 비어 있어서, 입력칸으로는 성공을 알 수 없습니다.
-# 전송 버튼이 다시 꺼지는 것으로 확인합니다.
 function Invoke-ChatSendAttachment([object]$Chat, [object]$InputBox, [int]$WaitMs) {
     $ways = @(
         [pscustomobject]@{ Name = '입력칸에 Enter 키'; Act = { [NativeKakao]::PressKey($InputBox.Handle, 0x0D) } },
@@ -3775,17 +3815,52 @@ function Invoke-ChatSendAttachment([object]$Chat, [object]$InputBox, [int]$WaitM
 # 첨부 하나를 붙이고 보냅니다.
 # 붙은 것이 확인되지 않으면 보내지 않습니다. 잘못 보내는 것보다 안 보내는 것이 낫습니다.
 # SendIt 을 $false 로 주면 붙이기만 해 보고 치웁니다. (첨부 시험)
-function Send-ChatAttachment([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs, [bool]$SendIt = $true) {
-    $result = [pscustomobject]@{ Ok = $false; Sent = $false; Method = ''; SendWay = ''; Reason = '' }
+# 첨부를 어떻게 묶어 보낼지 정합니다.
+# 사진은 여러 장을 한 번에 보내는 편이 훨씬 잘 갑니다.
+# 한 장씩 보내면 그때마다 미리보기 창이 뜨고 닫히기를 되풀이해서 중간에 잘 막힙니다.
+# 문서나 그 밖의 파일은 카카오톡이 하나씩만 보내므로 따로 보냅니다.
+#
+# 순서는 사용자가 정한 그대로 지킵니다. 사진 사이에 문서가 끼어 있으면
+# 그 앞뒤로 묶음이 나뉩니다. 순서를 바꾸면서까지 묶지는 않습니다.
+function Group-AttachmentBatches([string[]]$Paths, [bool]$GroupPhotos, [int]$BatchSize) {
+    $list = @(@($Paths) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    $batches = @()
+    if ($list.Count -eq 0) { return @($batches) }
+    $limit = [Math]::Max(1, [Math]::Min(30, $BatchSize))
+    if (-not $GroupPhotos) {
+        foreach ($path in $list) { $batches += ,@($path) }
+        return @($batches)
+    }
+    $current = @()
+    foreach ($path in $list) {
+        if (-not (Test-IsImageFile $path)) {
+            if ($current.Count -gt 0) { $batches += ,@($current); $current = @() }
+            $batches += ,@($path)
+            continue
+        }
+        $current += $path
+        if ($current.Count -ge $limit) { $batches += ,@($current); $current = @() }
+    }
+    if ($current.Count -gt 0) { $batches += ,@($current) }
+    return @($batches)
+}
+
+# 묶음 하나를 붙여서 보냅니다. 한 장이든 열 장이든 같은 길을 씁니다.
+function Send-ChatAttachments([object]$Chat, [object]$InputBox, [string[]]$Paths, [int]$WaitMs, [bool]$SendIt = $true) {
+    $list = @(@($Paths) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    $result = [pscustomobject]@{ Ok = $false; Sent = $false; Method = ''; SendWay = ''; Reason = ''; Count = $list.Count }
+    if ($list.Count -eq 0) { $result.Reason = '보낼 파일이 없습니다'; return $result }
     $reasons = @()
     # 사진은 클립보드가 확실하고, 문서는 파일 선택창이 확실합니다.
+    $allImages = $true
+    foreach ($path in $list) { if (-not (Test-IsImageFile $path)) { $allImages = $false; break } }
     $ways = @()
-    if (Test-IsImageFile $Path) {
-        $ways += [pscustomobject]@{ Name = '붙여넣기'; Act = { Add-AttachmentByClipboard $Chat $InputBox $Path $WaitMs } }
-        $ways += [pscustomobject]@{ Name = '파일 선택창'; Act = { Add-AttachmentByDialog $Chat $InputBox $Path $WaitMs } }
+    if ($allImages) {
+        $ways += [pscustomobject]@{ Name = '붙여넣기'; Act = { Add-AttachmentByClipboard $Chat $InputBox $list $WaitMs } }
+        $ways += [pscustomobject]@{ Name = '파일 선택창'; Act = { Add-AttachmentByDialog $Chat $InputBox $list $WaitMs } }
     } else {
-        $ways += [pscustomobject]@{ Name = '파일 선택창'; Act = { Add-AttachmentByDialog $Chat $InputBox $Path $WaitMs } }
-        $ways += [pscustomobject]@{ Name = '붙여넣기'; Act = { Add-AttachmentByClipboard $Chat $InputBox $Path $WaitMs } }
+        $ways += [pscustomobject]@{ Name = '파일 선택창'; Act = { Add-AttachmentByDialog $Chat $InputBox $list $WaitMs } }
+        $ways += [pscustomobject]@{ Name = '붙여넣기'; Act = { Add-AttachmentByClipboard $Chat $InputBox $list $WaitMs } }
     }
     $preview = $null
     foreach ($way in $ways) {
@@ -3809,8 +3884,10 @@ function Send-ChatAttachment([object]$Chat, [object]$InputBox, [string]$Path, [i
         return $result
     }
 
+    # 여러 장이면 미리보기에서 보내는 데 시간이 더 걸립니다.
+    $extra = [Math]::Min(8000, 600 * $list.Count)
     if ($null -ne $preview) {
-        $problem = Submit-KakaoPreview $preview ([Math]::Max(4000, $WaitMs + 2500))
+        $problem = Submit-KakaoPreview $preview ([Math]::Max(4000, $WaitMs + 2500 + $extra))
         if ($problem) {
             $result.Reason = $problem
             [void](Close-KakaoPreview $preview)
@@ -3821,7 +3898,7 @@ function Send-ChatAttachment([object]$Chat, [object]$InputBox, [string]$Path, [i
         return $result
     }
 
-    $how = Invoke-ChatSendAttachment $Chat $InputBox $WaitMs
+    $how = Invoke-ChatSendAttachment $Chat $InputBox ($WaitMs + $extra)
     if ($how) {
         $result.Sent = $true
         $result.SendWay = $how
@@ -3832,9 +3909,10 @@ function Send-ChatAttachment([object]$Chat, [object]$InputBox, [string]$Path, [i
     return $result
 }
 
-# SendKeys 는 + ^ % ~ ( ) { } [ ] 를 특수 기호로 해석하므로 감싸 줍니다.
-# 줄바꿈은 반드시 Shift+Enter 로 보냅니다. 그냥 Enter 를 보내면
-# 줄마다 따로 전송되어 메시지가 여러 개로 쪼개집니다.
+# 한 개만 보낼 때 쓰는 짧은 이름입니다. (첨부 시험 등)
+function Send-ChatAttachment([object]$Chat, [object]$InputBox, [string]$Path, [int]$WaitMs, [bool]$SendIt = $true) {
+    return (Send-ChatAttachments $Chat $InputBox @($Path) $WaitMs $SendIt)
+}
 function ConvertTo-SendKeysText([string]$Text) {
     $escaped = [regex]::Replace($Text, '[+^%~(){}\[\]]', { param($m) '{' + $m.Value + '}' })
     $escaped = $escaped -replace "`r`n", "`n"
@@ -4676,6 +4754,8 @@ function New-SendContent([bool]$DryRun) {
         TemplateName = [string]$script:lastTemplateName
         Attachments = @($script:config.Attachments)
         AttachmentWaitMs = [int]$script:config.AttachmentWaitMs
+        GroupPhotos = [bool]$script:config.GroupPhotos
+        PhotoBatchSize = [int]$script:config.PhotoBatchSize
         OpenTimeoutMs = [Math]::Max(3000, [int]$script:config.OpenTimeoutMs)
         SettleMs = [Math]::Max(0, [Math]::Min(30000, [int]$script:config.SettleMs))
         DryRun = $DryRun
@@ -5034,7 +5114,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'Roster', 'RosterScannedAt', 'ScanExactNames', 'Templates', 'RetryCount', 'CloseAfterSend', 'AutoCheckUpdate', 'TourDone', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'Roster', 'RosterScannedAt', 'ScanExactNames', 'Templates', 'RetryCount', 'CloseAfterSend', 'GroupPhotos', 'PhotoBatchSize', 'AutoCheckUpdate', 'TourDone', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -5295,6 +5375,45 @@ if ($SelfTest) {
     }
 
 
+
+    # ----- 사진 묶어 보내기 -----
+    # 사진은 여러 장을 한 번에 보내야 잘 갑니다.
+    # 문서는 카카오톡이 하나씩만 보내므로 따로 나가야 합니다.
+    # 사용자가 정한 순서는 어떤 경우에도 지켜야 합니다.
+    $probeShots = @('a.jpg', 'b.png', 'c.jpeg', 'd.gif')
+    $probeMix = @('a.jpg', 'b.png', '안내.pdf', 'c.jpg', 'd.jpg')
+
+    # 묶기를 끄면 하나씩 나갑니다.
+    $probeOne = @(Group-AttachmentBatches $probeShots $false 10)
+    if ($probeOne.Count -ne 4) { throw "묶기를 껐는데 4묶음이 아닙니다: $($probeOne.Count)" }
+    foreach ($probeBatch in $probeOne) { if (@($probeBatch).Count -ne 1) { throw '묶기를 껐는데 여러 장이 한 묶음이 됐습니다' } }
+
+    # 사진만 있으면 한 묶음입니다.
+    $probeAll = @(Group-AttachmentBatches $probeShots $true 10)
+    if ($probeAll.Count -ne 1) { throw "사진 4장이 한 묶음이 아닙니다: $($probeAll.Count)" }
+    if (@($probeAll[0]).Count -ne 4) { throw '사진 4장이 다 담기지 않았습니다' }
+    if ((@($probeAll[0]) -join ',') -ne ($probeShots -join ',')) { throw '사진 순서가 바뀌었습니다' }
+
+    # 한 묶음 크기를 넘으면 나뉩니다.
+    $probeSplit = @(Group-AttachmentBatches $probeShots $true 2)
+    if ($probeSplit.Count -ne 2) { throw "2장씩 묶으면 2묶음이어야 합니다: $($probeSplit.Count)" }
+    if (@($probeSplit[0]).Count -ne 2 -or @($probeSplit[1]).Count -ne 2) { throw '2장씩 나뉘지 않았습니다' }
+
+    # 문서가 끼면 그 앞뒤로 나뉘고, 문서는 혼자 갑니다.
+    $probeMixed = @(Group-AttachmentBatches $probeMix $true 10)
+    if ($probeMixed.Count -ne 3) { throw "사진·문서·사진은 3묶음이어야 합니다: $($probeMixed.Count)" }
+    if (@($probeMixed[0]).Count -ne 2) { throw '앞의 사진 2장이 묶이지 않았습니다' }
+    if (@($probeMixed[1]).Count -ne 1 -or $probeMixed[1][0] -ne '안내.pdf') { throw '문서가 혼자 가지 않습니다' }
+    if (@($probeMixed[2]).Count -ne 2) { throw '뒤의 사진 2장이 묶이지 않았습니다' }
+    # 순서가 그대로여야 합니다.
+    $probeFlat = @()
+    foreach ($probeBatch in $probeMixed) { $probeFlat += @($probeBatch) }
+    if (($probeFlat -join ',') -ne ($probeMix -join ',')) { throw "묶으면서 순서가 바뀌었습니다: $($probeFlat -join ',')" }
+
+    # 빈 목록과 이상한 크기도 버텨야 합니다.
+    if (@(Group-AttachmentBatches @() $true 10).Count -ne 0) { throw '빈 목록에서 묶음이 생깁니다' }
+    if (@(Group-AttachmentBatches $probeShots $true 0).Count -ne 4) { throw '묶음 크기 0을 1로 보지 않습니다' }
+    if (@(Group-AttachmentBatches $probeShots $true 999).Count -ne 1) { throw '묶음 크기가 너무 커도 한 묶음이어야 합니다' }
     # ----- 저장 메시지 -----
     $savedTemplates = @($script:config.Templates)
     try {
@@ -6412,14 +6531,14 @@ function Show-AppPage([string]$Key) {
 # ===========================================================================
 $pageCompose = New-Page 'compose'
 
-$cardMessage = New-Card $pageCompose 28 12 784 224 '발송 문구' '카카오톡에 붙여넣기로 전송됩니다. 줄바꿈도 그대로 유지됩니다.'
-$script:txtMessage = New-AppTextBox $cardMessage 24 74 736 118 $true
+$cardMessage = New-Card $pageCompose 28 12 784 212 '발송 문구' '카카오톡에 붙여넣기로 전송됩니다. 줄바꿈도 그대로 유지됩니다.'
+$script:txtMessage = New-AppTextBox $cardMessage 24 72 736 110 $true
 $script:txtMessage.Text = [string]$script:config.Message
-$script:lblMessageCount = New-CardLabel $cardMessage '' 24 196 736 18 $FontSmall $Theme.Muted
+$script:lblMessageCount = New-CardLabel $cardMessage '' 24 186 736 18 $FontSmall $Theme.Muted
 
 # 자주 보내는 문구를 이름을 붙여 담아 둡니다. 다시 칠 필요가 없습니다.
-$cardTemplates = New-Card $pageCompose 28 244 784 112 '저장 메시지'
-$script:lblTemplateState = New-CardLabel $cardTemplates '' 24 46 736 18 $FontSmall $Theme.Muted
+$cardTemplates = New-Card $pageCompose 28 232 784 112 '저장 메시지'
+$script:lblTemplateState = New-CardLabel $cardTemplates '' 24 46 736 16 $FontSmall $Theme.Muted
 $script:cmbTemplate = New-Object System.Windows.Forms.ComboBox
 $script:cmbTemplate.DropDownStyle = 'DropDownList'
 $script:cmbTemplate.Font = $FontBase
@@ -6431,25 +6550,47 @@ $btnTplSave   = New-AppButton $cardTemplates '새로 저장' 442 68 100 32
 $btnTplUpdate = New-AppButton $cardTemplates '덮어쓰기' 550 68 96 32
 $btnTplDelete = New-AppButton $cardTemplates '삭제' 654 68 106 32 'danger'
 
-$cardFiles = New-Card $pageCompose 28 364 784 248 '첨부 사진 · 파일' '첨부를 먼저 보내고 그다음 문구를 보냅니다. [첨부 시험]은 붙는지만 확인하고 보내지 않습니다.'
-$frameFiles = New-FieldFrame $cardFiles 24 74 576 156
+$cardFiles = New-Card $pageCompose 28 352 784 258 '첨부 사진 · 파일' '첨부를 먼저 보내고 그다음 문구를 보냅니다. [첨부 시험]은 붙는지만 확인하고 보내지 않습니다.'
+$frameFiles = New-FieldFrame $cardFiles 24 72 576 150
 $script:lstFiles = New-Object System.Windows.Forms.ListBox
 $script:lstFiles.BorderStyle = 'None'
 $script:lstFiles.Font = $FontBase
 $script:lstFiles.Location = (New-UiPoint 12 12)
-$script:lstFiles.Size = (New-UiSize 552 132)
+$script:lstFiles.Size = (New-UiSize 552 126)
 $script:lstFiles.DisplayMember = 'Name'
 $script:lstFiles.ItemHeight = 24
 $frameFiles.Controls.Add($script:lstFiles)
 foreach ($file in @($script:config.Attachments)) { [void]$script:lstFiles.Items.Add((New-AttachmentItem ([string]$file))) }
 
-$btnAddFile    = New-AppButton $cardFiles '파일 추가' 616 74 144 36 'strong'
-$btnFileUp     = New-AppButton $cardFiles '위로' 616 118 70 32
-$btnFileDown   = New-AppButton $cardFiles '아래로' 690 118 70 32
-$btnRemoveFile = New-AppButton $cardFiles '선택 제거' 616 158 144 32 'danger'
-$btnCheckAttach = New-AppButton $cardFiles '첨부 시험' 616 198 144 32
+$btnAddFile    = New-AppButton $cardFiles '파일 추가' 616 72 144 36 'strong'
+$btnFileUp     = New-AppButton $cardFiles '위로' 616 114 70 32
+$btnFileDown   = New-AppButton $cardFiles '아래로' 690 114 70 32
+$btnRemoveFile = New-AppButton $cardFiles '선택 제거' 616 152 144 32 'danger'
+$btnCheckAttach = New-AppButton $cardFiles '첨부 시험' 616 190 144 32
 
-$lblComposeHint = New-CardLabel $pageCompose '내용은 자동 저장됩니다. 실제로 보내기 전에 [설정] 화면의 테스트 발송으로 결과를 먼저 확인해 보세요.' 28 622 784 22 $FontSmall $Theme.Muted
+# 사진을 묶어서 한 번에 보냅니다.
+# 한 장씩 보내면 미리보기 창이 뜨고 닫히기를 되풀이해서 중간에 잘 막힙니다.
+$script:chkGroupPhotos = New-Object System.Windows.Forms.CheckBox
+$script:chkGroupPhotos.Text = '사진은 묶어서 한 번에 보내기'
+$script:chkGroupPhotos.Checked = [bool]$script:config.GroupPhotos
+$script:chkGroupPhotos.Location = (New-UiPoint 24 228)
+$script:chkGroupPhotos.Size = (New-UiSize 236 26)
+$script:chkGroupPhotos.BackColor = $Theme.Card
+$script:chkGroupPhotos.Font = $FontBase
+$cardFiles.Controls.Add($script:chkGroupPhotos)
+[void](New-CardLabel $cardFiles '한 번에' 268 231 52 20 $FontSmall $Theme.Muted)
+$script:numPhotoBatch = New-Object System.Windows.Forms.NumericUpDown
+$script:numPhotoBatch.Minimum = 1
+$script:numPhotoBatch.Maximum = 30
+$script:numPhotoBatch.Value = [Math]::Max(1, [Math]::Min(30, [int]$script:config.PhotoBatchSize))
+$script:numPhotoBatch.Location = (New-UiPoint 322 227)
+$script:numPhotoBatch.Size = (New-UiSize 62 28)
+$script:numPhotoBatch.Font = $FontBase
+$script:numPhotoBatch.BorderStyle = 'FixedSingle'
+$cardFiles.Controls.Add($script:numPhotoBatch)
+[void](New-CardLabel $cardFiles '장씩 · 문서와 그 밖의 파일은 하나씩 보냅니다' 392 231 368 20 $FontSmall $Theme.Muted)
+
+$lblComposeHint = New-CardLabel $pageCompose '내용은 자동 저장됩니다. 실제로 보내기 전에 [설정] 화면의 테스트 발송으로 결과를 먼저 확인해 보세요.' 28 618 784 22 $FontSmall $Theme.Muted
 $lblComposeHint.BackColor = $Theme.Bg
 
 # ===========================================================================
@@ -7201,6 +7342,8 @@ function Sync-ConfigFromForm {
     $script:config.DryRun = [bool]$script:rdoDry.Checked
     $script:config.ScanPages = [int]$script:numScanPages.Value
     $script:config.RetryCount = [int]$script:numRetry.Value
+    $script:config.GroupPhotos = [bool]$script:chkGroupPhotos.Checked
+    $script:config.PhotoBatchSize = [int]$script:numPhotoBatch.Value
     $script:config.TestRoom = $script:txtTestRoom.Text.Trim()
     $script:config.AutoCheckUpdate = [bool]$script:chkAutoUpdate.Checked
     $script:config.AutoDownloadUpdate = [bool]$script:chkAutoDownload.Checked
@@ -7259,6 +7402,8 @@ $script:txtTestRoom.Add_TextChanged({ Request-AutoSave })
 $script:dtSchedule.Add_ValueChanged({ Request-AutoSave })
 $script:numInterval.Add_ValueChanged({ $script:config.IntervalSeconds = [int]$script:numInterval.Value; try { Update-LimitStateLabel } catch { }; Request-AutoSave })
 $script:numScanPages.Add_ValueChanged({ Request-AutoSave })
+$script:chkGroupPhotos.Add_CheckedChanged({ Sync-ConfigFromForm })
+$script:numPhotoBatch.Add_ValueChanged({ Request-AutoSave })
 # 발송 방식을 바꾸면 머리말 표시도 곧바로 바꿉니다.
 # 확인 전용인지 실제 발송인지가 가장 헷갈리는 부분이라 항상 보이게 합니다.
 $script:rdoDry.Add_CheckedChanged({ try { Update-HeaderSummary } catch { }; Request-AutoSave })
