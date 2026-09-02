@@ -2904,6 +2904,24 @@ function Get-RoomNameOfKey([string]$Key) {
     return $k
 }
 
+# 화면 목록에 방을 하나 넣습니다.
+# 방 항목에는 언제나 같은 칸이 들어 있어야 합니다.
+# 어느 한 곳에서만 칸을 빼먹으면 다른 곳에서 그 칸을 찾다가 오류가 납니다.
+function New-RoomEntry([string]$Name, [string]$Type, [bool]$Checked, [string]$Kind, [bool]$Verified, [int]$Instance, [string]$Key) {
+    $clean = ConvertTo-ExactKey $Name
+    $useInstance = if ([int]$Instance -ge 1) { [int]$Instance } else { 1 }
+    $useKey = if ($Key) { [string]$Key } else { Get-RoomKeyOf $useInstance $clean }
+    return [pscustomobject]@{
+        Name = $clean
+        Key = $useKey
+        Instance = $useInstance
+        Type = $Type
+        Checked = $Checked
+        Kind = $(if ($Kind) { $Kind } else { 'unknown' })
+        Verified = $Verified
+    }
+}
+
 # 열쇠에서 카카오톡 번호를 꺼냅니다.
 function Get-InstanceOfKey([string]$Key) {
     $k = [string]$Key
@@ -6222,6 +6240,49 @@ if ($SelfTest) {
     $probeZwj = '가족' + [char]::ConvertFromUtf32(0x1F468) + [char]0x200D + [char]::ConvertFromUtf32(0x1F467) + '방'
     if ((ConvertTo-ExactKey $probeZwj) -cne $probeZwj) { throw '이어 붙인 이모지가 끊어집니다' }
 
+
+
+    # ----- 방 항목에 빠진 칸이 없는지 -----
+    # 방 항목을 만드는 곳이 여러 군데인데, 한 곳에서 칸을 빼먹으면
+    # 다른 곳에서 그 칸을 찾다가 '이 개체에서 Key 속성을 찾을 수 없습니다' 로 멈춥니다.
+    # 실제로 [전체 선택] 을 누르면 프로그램이 멈추는 일이 있었습니다.
+    $probeFields = @('Name', 'Key', 'Instance', 'Type', 'Checked', 'Kind', 'Verified')
+    $probeEntry = New-RoomEntry '시험방' '일반채팅' $true 'group' $true 1 ''
+    foreach ($probeField in $probeFields) {
+        if ($null -eq $probeEntry.PSObject.Properties[$probeField]) { throw "방 항목에 '$probeField' 칸이 없습니다" }
+    }
+    if ($probeEntry.Key -cne '시험방') { throw '카카오톡 1 의 열쇠는 이름 그대로여야 합니다' }
+    $probeEntry2 = New-RoomEntry '시험방' '일반채팅' $true 'group' $true 2 ''
+    if ($probeEntry2.Key -cne '카카오톡2|시험방') { throw "카카오톡 2 의 열쇠가 다릅니다: $($probeEntry2.Key)" }
+    # 카카오톡이 다르면 서로 다른 방이어야 합니다.
+    if (Test-NameEquals $probeEntry.Key $probeEntry2.Key) { throw '카카오톡이 다른데 같은 방이라고 합니다' }
+    # 열쇠에서 이름과 번호를 다시 꺼낼 수 있어야 합니다.
+    if ((Get-RoomNameOfKey $probeEntry2.Key) -cne '시험방') { throw '열쇠에서 이름을 못 꺼냅니다' }
+    if ((Get-InstanceOfKey $probeEntry2.Key) -ne 2) { throw '열쇠에서 번호를 못 꺼냅니다' }
+    # 이모지가 든 이름도 열쇠에서 그대로 나와야 합니다.
+    $probeEmojiRoom = '자유로운홍보방' + [char]0x2764 + [char]0xFE0F
+    $probeEntry3 = New-RoomEntry $probeEmojiRoom '일반채팅' $true 'group' $true 3 ''
+    if ((Get-RoomNameOfKey $probeEntry3.Key) -cne $probeEmojiRoom) { throw '열쇠를 거치면서 이모지가 사라집니다' }
+
+    # [전체 선택] 이 하는 일을 그대로 해 봅니다. 여기서 멈추면 안 됩니다.
+    $probeList = New-Object System.Collections.Generic.List[object]
+    $probeList.Add((New-RoomEntry '시험방A' '일반채팅' $false 'group' $false 1 ''))
+    $probeList.Add((New-RoomEntry '시험방B' '오픈채팅' $false 'open' $true 1 ''))
+    $probeList.Add((New-RoomEntry '시험방C' '일반채팅' $false 'group' $true 2 ''))
+    foreach ($probeOne in $probeList) {
+        foreach ($probeField in $probeFields) {
+            if ($null -eq $probeOne.PSObject.Properties[$probeField]) {
+                throw "'$($probeOne.Name)' 에 '$probeField' 칸이 없습니다"
+            }
+        }
+    }
+    foreach ($probeOne in $probeList) { $probeOne.Checked = $true }
+    $probePicked = @($probeList | Where-Object { $_.Checked } | ForEach-Object { if ($_.Key) { [string]$_.Key } else { [string]$_.Name } })
+    if ($probePicked.Count -ne 3) { throw "고른 방이 3개가 아닙니다: $($probePicked.Count)" }
+    if (@($probePicked | Select-Object -Unique).Count -ne 3) { throw '고른 방의 열쇠가 겹칩니다' }
+    # 종류로 고르는 것도 해 봅니다.
+    foreach ($probeOne in $probeList) { $probeOne.Checked = ($probeOne.Kind -eq 'open') }
+    if (@($probeList | Where-Object { $_.Checked }).Count -ne 1) { throw '오픈채팅만 고르기가 틀렸습니다' }
     # ----- 이모지·특수문자가 든 방 이름 -----
     # 카카오톡에 적힌 이름을 한 글자도 바꾸지 않고 그대로 두어야 합니다.
     # 예전에는 목록이 보기 좋으라고 이모지를 지웠는데, 그 바람에
@@ -8833,42 +8894,37 @@ function Add-RoomEntry([string]$Name, [string]$Type, [bool]$Checked) {
     }
     $kind = Get-RoomKind $clean
     $verified = $false
+    $instance = 1
     $found = Find-RosterEntry $clean
-    if ($null -ne $found) { $kind = $found.Kind; $verified = $found.Verified }
-    $script:roomEntries.Add([pscustomobject]@{
-        Name = $clean; Type = $Type; Checked = $Checked; Kind = $kind; Verified = $verified
-    })
+    if ($null -ne $found) {
+        $kind = $found.Kind
+        $verified = $found.Verified
+        $instance = [int]$found.Instance
+    }
+    $script:roomEntries.Add((New-RoomEntry $clean $Type $Checked $kind $verified $instance ''))
     return $true
 }
-
 # 저장된 채팅방 목록을 화면 목록에 그대로 옮깁니다.
 # 체크해 둔 것은 그대로 두고, 목록에서 사라진 방은 화면에서도 뺍니다.
 function Sync-RoomEntriesFromRoster {
-    $checked = @{}
-    foreach ($entry in $script:roomEntries) { if ($entry.Checked) { $checked[$entry.Name] = $true } }
+    $checked = (New-NameMap)
+    foreach ($entry in $script:roomEntries) { if ($entry.Checked) { $checked[$entry.Key] = $true } }
     $roster = @(Get-Roster)
-    $byName = @{}
-    foreach ($row in $roster) { $byName[$row.Name] = $row }
+    $byKey = (New-NameMap)
+    foreach ($row in $roster) { $byKey[$row.Key] = $row }
 
     $fresh = New-Object System.Collections.Generic.List[object]
     foreach ($row in $roster) {
         $type = if ($row.Kind -eq 'open') { $script:RoomTypeOpen } else { $script:RoomTypeNormal }
-        $fresh.Add([pscustomobject]@{
-            Name = $row.Name
-            Type = $type
-            Checked = [bool]$checked[$row.Name]
-            Kind = $row.Kind
-            Verified = [bool]$row.Verified
-        })
+        $fresh.Add((New-RoomEntry $row.Name $type ([bool]$checked[$row.Key]) $row.Kind ([bool]$row.Verified) ([int]$row.Instance) $row.Key))
     }
     # 직접 넣은 방은 목록에 없어도 남겨 둡니다. 사용자가 일부러 넣은 것이기 때문입니다.
     foreach ($entry in $script:roomEntries) {
-        if ($byName.ContainsKey($entry.Name)) { continue }
+        if ($byKey.ContainsKey($entry.Key)) { continue }
         $fresh.Add($entry)
     }
     $script:roomEntries = $fresh
 }
-
 function Update-RoomCountLabel {
     $checked = @($script:roomEntries | Where-Object { $_.Checked }).Count
     $total = $script:roomEntries.Count
@@ -9775,10 +9831,7 @@ $btnReadOpen.Add_Click({
         $script:roomEntries = New-Object System.Collections.Generic.List[object]
         foreach ($room in $found) {
             $type = if ($room.Kind -eq 'open') { $script:RoomTypeOpen } else { $script:RoomTypeNormal }
-            $script:roomEntries.Add([pscustomobject]@{
-                Name = $room.Name; Key = $room.Key; Instance = $room.Instance; Type = $type; Checked = $true
-                Kind = $room.Kind; Verified = $true
-            })
+            $script:roomEntries.Add((New-RoomEntry $room.Name $type $true $room.Kind $true ([int]$room.Instance) $room.Key))
         }
         $script:roomFilter = '전체'
         if ($null -ne $script:txtRoomSearch) { $script:txtRoomSearch.Text = '' }
@@ -11546,6 +11599,30 @@ if ($UiSmokeTest) {
         foreach ($line in ($overlaps | Select-Object -First 20)) { Write-Output ("  " + $line) }
     } else {
         Write-Output 'LAYOUT_OK 겹치는 화면 요소 없음'
+    }
+    # 단추를 실제로 눌러 봅니다. 눌렀을 때 멈추는 일이 없어야 합니다.
+    # 예전에 [전체 선택] 을 누르면 'Key 속성을 찾을 수 없습니다' 로 멈춘 적이 있습니다.
+    # 단추는 화면이 보일 때만 눌립니다. 그래서 채팅방 화면으로 옮긴 뒤 누릅니다.
+    $before = $script:roomEntries.Count
+    try {
+        Show-AppPage 'rooms'
+        $script:form.Show()
+        [System.Windows.Forms.Application]::DoEvents()
+        $btnCheckAll.PerformClick()
+        $picked = @($script:config.Rooms).Count
+        if ($before -gt 0 -and $picked -ne $before) { throw "전체 선택이 $before 개 중 $picked 개만 골랐습니다" }
+        $btnPickOpen.PerformClick()
+        $btnPickNormal.PerformClick()
+        $btnFilterOpen.PerformClick()
+        $btnFilterAll.PerformClick()
+        $btnCheckNone.PerformClick()
+        if (@($script:config.Rooms).Count -ne 0) { throw '전체 해제가 되지 않았습니다' }
+        $btnSearchClear.PerformClick()
+        $script:form.Hide()
+        Write-Output ("BUTTONS_OK 방 {0}개 · 전체 선택 {1}개" -f $before, $picked)
+    } catch {
+        Write-Output ("BUTTONS_FAIL " + $_.Exception.Message)
+        exit 1
     }
     Write-Output ("UI_SMOKETEST_OK pages={0} nav={1}" -f $script:pages.Count, $script:navItems.Count)
     $script:form.Dispose()
