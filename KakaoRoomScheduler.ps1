@@ -21,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '9.1.1'
+$script:AppVersion = '9.2.0'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -7040,6 +7040,36 @@ if ($SelfTest) {
         }
         if ($step.Page -notin @('compose', 'rooms', 'run', 'settings', 'log')) { throw "가이드 투어의 화면 이름이 잘못되었습니다: $($step.Page)" }
     }
+    # 발송이 끝난 자리에서 뜨는 창은 절대로 창을 붙잡으면 안 됩니다.
+    # 그 자리는 예약 타이머 안이라, 붙잡으면 예약 타이머가 그대로 멈춰 섭니다.
+    # 그러면 창의 "저절로 닫힘" 시계도 같이 멈춰서 아무도 창을 닫지 못하고,
+    # 다음 회차가 영영 오지 않습니다. 예전에 밤새 돌릴 때 실제로 그랬습니다.
+    # 이 검사는 아래쪽에 있는 함수를 보는 것이라 글 자체를 읽습니다.
+    if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
+        $source = [System.IO.File]::ReadAllText($PSCommandPath, [System.Text.Encoding]::UTF8)
+        foreach ($noModal in @('Show-AutoCloseInfo', 'Show-RunResult')) {
+            $head = $source.IndexOf("function $noModal")
+            if ($head -lt 0) { throw "$noModal 을(를) 찾지 못했습니다" }
+            $tail = $source.IndexOf("`r`n}`r`n", $head)
+            if ($tail -lt 0) { $tail = $source.Length }
+            $body = $source.Substring($head, $tail - $head)
+            # 설명글에도 그 낱말이 나옵니다. 설명글은 빼고 봅니다.
+            $code = @($body -split "`r`n" | Where-Object { -not $_.TrimStart().StartsWith('#') }) -join "`r`n"
+            if ($code.Contains('ShowDialog')) {
+                throw "$noModal 이(가) 창을 붙잡는 방식으로 띄웁니다. 예약 발송이 멈춰 섭니다."
+            }
+        }
+    }
+
+    # 달력은 오늘보다 이른 날을 받지 못합니다.
+    # 예약 시각이 지나 있으면 그대로 오류를 냅니다. 지난 시각도 견뎌야 합니다.
+    $probeCal = New-Object System.Windows.Forms.MonthCalendar
+    $probeCal.MinDate = (Get-Date).Date
+    $probeStart = (Get-Date).AddDays(-3)
+    if ($probeStart -lt (Get-Date)) { $probeStart = (Get-Date).AddMinutes(10) }
+    try { $probeCal.SetDate($probeStart.Date) } catch { throw '지난 예약 시각을 달력이 받지 못했습니다' }
+    $probeCal.Dispose()
+
     [void](Get-KakaoProcesses)
     Write-Output 'SELFTEST_OK'
     exit 0
@@ -10041,13 +10071,19 @@ function Show-SchedulePicker([datetime]$Current) {
     $calendar = New-Object System.Windows.Forms.MonthCalendar
     $calendar.Location = (New-UiPoint 26 62)
     $calendar.MaxSelectionCount = 1
+    # 예약 시각이 이미 지나간 날짜로 남아 있을 수 있습니다.
+    # 밤새 돌려 두었다가 다음 날 열면 늘 그렇습니다.
+    # 달력은 오늘보다 이른 날을 받지 못하고 그 자리에서 오류를 냅니다.
+    # 그래서 지난 시각이면 오늘 기준으로 당겨서 보여 줍니다.
+    $start = $Current
+    if ($start -lt (Get-Date)) { $start = (Get-Date).AddMinutes(10) }
     $calendar.MinDate = (Get-Date).Date
-    $calendar.SetDate($Current.Date)
+    $calendar.SetDate($start.Date)
     $dialog.Controls.Add($calendar)
 
     [void](New-CardLabel $dialog '시' 300 80 24 26 $FontSmall $Theme.Muted)
     $numHour = New-Object System.Windows.Forms.NumericUpDown
-    $numHour.Minimum = 0; $numHour.Maximum = 23; $numHour.Value = $Current.Hour
+    $numHour.Minimum = 0; $numHour.Maximum = 23; $numHour.Value = $start.Hour
     $numHour.Location = (New-UiPoint 326 76)
     $numHour.Size = (New-UiSize 66 30)
     $numHour.Font = $FontBase; $numHour.BorderStyle = 'FixedSingle'
@@ -10055,7 +10091,7 @@ function Show-SchedulePicker([datetime]$Current) {
 
     [void](New-CardLabel $dialog '분' 400 80 24 26 $FontSmall $Theme.Muted)
     $numMinute = New-Object System.Windows.Forms.NumericUpDown
-    $numMinute.Minimum = 0; $numMinute.Maximum = 59; $numMinute.Value = $Current.Minute
+    $numMinute.Minimum = 0; $numMinute.Maximum = 59; $numMinute.Value = $start.Minute
     $numMinute.Location = (New-UiPoint 426 76)
     $numMinute.Size = (New-UiSize 66 30)
     $numMinute.Font = $FontBase; $numMinute.BorderStyle = 'FixedSingle'
@@ -10069,7 +10105,7 @@ function Show-SchedulePicker([datetime]$Current) {
 
     $lblPreview = New-CardLabel $dialog '' 26 320 508 30 $FontStrong $Theme.Info
 
-    $script:pickedSchedule = $Current
+    $script:pickedSchedule = $start
     $refresh = {
         $picked = $calendar.SelectionStart.Date.AddHours([int]$numHour.Value).AddMinutes([int]$numMinute.Value)
         $script:pickedSchedule = $picked
@@ -10609,28 +10645,52 @@ function Show-AutoCloseInfo([string]$Text, [string]$Title, [int]$Seconds = 30) {
     $lblLeft = New-CardLabel $foot '' 20 18 360 24 $FontSmall $Theme.Muted
     $lblLeft.BackColor = $Theme.Bg
 
+    # 이 창은 예약 발송이 끝난 자리에서 뜹니다. 그 자리는 예약 타이머 안입니다.
+    # 창을 붙잡는 방식(ShowDialog)으로 띄우면 예약 타이머가 그대로 멈춰 섭니다.
+    # 그러면 이 창의 "저절로 닫힘" 시계도 같이 멈춰서 아무도 창을 닫지 못하고,
+    # 다음 회차가 영영 오지 않습니다. 밤새 돌릴 때 몇 번째부터 안 보내지던 까닭입니다.
+    # 그래서 붙잡지 않고 띄웁니다.
+    #
+    # 붙잡지 않으면 이 함수가 먼저 끝납니다.
+    # 나중에 도는 코드는 여기 있던 값을 더는 찾지 못합니다.
+    # 그래서 창과 시계를 스크립트 칸에 적어 두고 그것만 씁니다.
+    try { if ($null -ne $script:toastTick) { $script:toastTick.Stop(); $script:toastTick.Dispose() } } catch { }
+    $script:toastTick = $null
+    try { if ($null -ne $script:toastForm -and -not $script:toastForm.IsDisposed) { $script:toastForm.Close() } } catch { }
+    $script:toastForm = $dialog
+    $script:toastLabel = $lblLeft
     $script:autoCloseLeft = [Math]::Max(5, $Seconds)
-    $tick = New-Object System.Windows.Forms.Timer
-    $tick.Interval = 1000
-    $tick.Add_Tick({
+    $script:toastTick = New-Object System.Windows.Forms.Timer
+    $script:toastTick.Interval = 1000
+    $script:toastTick.Add_Tick({
         $script:autoCloseLeft--
         if ($script:autoCloseLeft -le 0) {
-            $tick.Stop()
-            $dialog.Close()
+            try { $script:toastTick.Stop() } catch { }
+            try { $script:toastForm.Close() } catch { }
             return
         }
-        $lblLeft.Text = "$($script:autoCloseLeft)초 뒤 저절로 닫힙니다."
+        try { $script:toastLabel.Text = "$($script:autoCloseLeft)초 뒤 저절로 닫힙니다." } catch { }
     })
     $lblLeft.Text = "$($script:autoCloseLeft)초 뒤 저절로 닫힙니다."
     # 사용자가 창을 만지면 저절로 닫히지 않게 합니다. 읽는 중에 닫히면 곤란합니다.
-    $stop = { $tick.Stop(); $lblLeft.Text = '' }
+    $stop = {
+        try { $script:toastTick.Stop() } catch { }
+        try { $script:toastLabel.Text = '' } catch { }
+    }
     $box.Add_Click($stop)
     $dialog.Add_MouseDown($stop)
-    $btnClose.Add_Click({ $tick.Stop(); $dialog.Close() })
-    $dialog.Add_Shown({ $tick.Start() })
-    $dialog.Add_FormClosed({ $tick.Stop(); $tick.Dispose() })
-    [void]$dialog.ShowDialog()
-    $dialog.Dispose()
+    $btnClose.Add_Click({
+        try { $script:toastTick.Stop() } catch { }
+        try { $script:toastForm.Close() } catch { }
+    })
+    $dialog.Add_Shown({ try { $script:toastTick.Start() } catch { } })
+    $dialog.Add_FormClosed({
+        try { $script:toastTick.Stop(); $script:toastTick.Dispose() } catch { }
+        $script:toastTick = $null
+        try { $this.Dispose() } catch { }
+    })
+    $dialog.TopMost = $true
+    try { $dialog.Show($script:form) } catch { $dialog.Show() }
 }
 
 # 끝난 뒤 결과를 보여 줍니다.
@@ -11235,6 +11295,7 @@ $timer.Add_Tick({
     if (-not $script:armed) { return }
     # 이미 보내는 중이면 예약 시각이 와도 또 시작하지 않습니다.
     # 카카오톡을 두 군데서 동시에 만지면 엉킵니다.
+    Update-WatchdogState
     if ($script:running) {
         $late = ((Get-Date) - $script:dtSchedule.Value).TotalSeconds
         if ($late -ge 0) {
@@ -11618,18 +11679,210 @@ if ($UiSmokeTest) {
         $btnCheckNone.PerformClick()
         if (@($script:config.Rooms).Count -ne 0) { throw '전체 해제가 되지 않았습니다' }
         $btnSearchClear.PerformClick()
-        $script:form.Hide()
         Write-Output ("BUTTONS_OK 방 {0}개 · 전체 선택 {1}개" -f $before, $picked)
     } catch {
         Write-Output ("BUTTONS_FAIL " + $_.Exception.Message)
         exit 1
     }
+    # ----- 단추를 하나하나 눌러 보기 -----
+    # 사람이 눌러야 도는 코드는 배포 전에 오류를 모르고 지나갑니다.
+    # 그래서 화면마다 단추를 전부 찾아 눌러 봅니다.
+    # 실제로 보내거나 카카오톡을 만지는 단추는 빼고 누릅니다.
+    $skipWords = @(
+        '즉시발송', '중지', '예약 시작', '예약 중지', '지금 실행', '예약 취소',
+        '테스트 발송', '방 확인만', '열어 둔 채팅방 읽기', '전체 목록 읽기',
+        '이름 확인·보정', '지금 미리 열기', '첨부 시험', '업데이트', '지금 받기',
+        '폴더 열기', '삭제', '제거', '비우기', '다시 보내기', '이어서 발송',
+        '가이드', '사용 가이드', '?', '메모리 정리', '설정 저장',
+        '지우기', '되돌리기', '초기화'
+    )
+    function Test-SkipButton([string]$Text) {
+        $t = ([string]$Text).Trim()
+        if (-not $t) { return $true }
+        foreach ($word in $skipWords) { if ($t.Contains($word)) { return $true } }
+        return $false
+    }
+    function Get-AllButtons([object]$Root) {
+        $found = @()
+        foreach ($child in $Root.Controls) {
+            if ($child -is [System.Windows.Forms.Button]) { $found += $child }
+            if ($child.Controls.Count -gt 0) { $found += @(Get-AllButtons $child) }
+        }
+        return @($found)
+    }
+
+    # 단추를 누르면 알림창이 뜰 수 있습니다. 사람이 없으면 그 자리에서 멈춰 섭니다.
+    # 그래서 우리 창을 막고 있는 알림창만 골라 스스로 닫아 줍니다.
+    # 다른 프로그램 창은 건드리지 않습니다.
+    # 파워셸로 만든 타이머는 단추를 누르는 동안 돌지 못합니다.
+    # 단추를 누르는 일이 끝나야 파워셸이 다음 일을 하기 때문입니다.
+    # 그래서 알림창을 닫는 일은 C# 으로 만들어 둡니다. 이쪽은 그대로 돕니다.
+    Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class ProbeDialogKiller {
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll")] static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+    const uint GW_ENABLEDPOPUP = 6;
+    const uint WM_CLOSE = 0x0010;
+    static IntPtr _main = IntPtr.Zero;
+    static Timer _timer = null;
+    public static int Closed = 0;
+    public static void Start(IntPtr mainWindow) {
+        _main = mainWindow;
+        if (_timer == null) {
+            _timer = new Timer();
+            _timer.Interval = 200;
+            _timer.Tick += delegate {
+                IntPtr popup = GetWindow(_main, GW_ENABLEDPOPUP);
+                if (popup != IntPtr.Zero && popup != _main) {
+                    PostMessageW(popup, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                    Closed++;
+                }
+            };
+        }
+        _timer.Start();
+    }
+    public static void Stop() { if (_timer != null) _timer.Stop(); }
+}
+'@
+    [ProbeDialogKiller]::Start($script:form.Handle)
+    $clickFails = @()
+    $clicked = 0
+    foreach ($pageKey in @('compose', 'rooms', 'run', 'settings', 'log')) {
+        Show-AppPage $pageKey
+        [System.Windows.Forms.Application]::DoEvents()
+        $all = @(Get-AllButtons $script:pages[$pageKey])
+        foreach ($button in $all) {
+            $label = [string]$button.AccessibleName
+            if (Test-SkipButton $label) { continue }
+            try {
+                [Console]::Error.WriteLine("  누르는 중: [" + $pageKey + "] " + $label)
+                $button.PerformClick()
+                [System.Windows.Forms.Application]::DoEvents()
+                $clicked++
+            } catch {
+                $clickFails += ("[{0}] {1} — {2}" -f $pageKey, $label, $_.Exception.Message)
+            }
+        }
+    }
+    # 달력에서 시각을 고르고 확인을 누른 것과 같은 일도 해 봅니다.
+    # 예전에 여기서 'Key 속성을 찾을 수 없습니다' 로 멈췄습니다.
+    try {
+        $script:dtSchedule.Value = (Get-Date).AddMinutes(30)
+        Sync-ConfigFromForm
+        $clicked++
+    } catch {
+        $clickFails += ("[run] 달력에서 시각 고르기 — " + $_.Exception.Message)
+    }
+    if ($clickFails.Count -gt 0) {
+        Write-Output ("CLICK_FAIL " + $clickFails.Count + "건")
+        foreach ($line in $clickFails) { Write-Output ("  " + $line) }
+        exit 1
+    }
+    Write-Output ("CLICK_OK 단추 {0}개를 눌러 보았고 오류가 없습니다" -f $clicked)
+
+    # ----- 창 열어 보기 -----
+    # 대화 상자는 사람이 눌러야 열립니다. 그래서 오류가 있어도 배포 전에 모르고 지나갑니다.
+    # 여기서는 창을 하나씩 열되, 뜨자마자 스스로 닫도록 해서 오류만 잡아냅니다.
+    $dlgFails = @()
+    foreach ($one in @(
+        @{ Name = '예약 시각 고르기'; Act = { [void](Show-SchedulePicker (Get-Date)) } },
+        @{ Name = '예약 시각 고르기(지난 날짜)'; Act = { [void](Show-SchedulePicker ((Get-Date).AddDays(-3))) } },
+        @{ Name = '공휴일 관리';      Act = { Show-HolidayManager } },
+        @{ Name = '채팅방 고르기';    Act = { [void](Show-RoomPicker '시험')  } },
+        @{ Name = '발송 세부설정';    Act = { [void](Show-SendSetupDialog 'now') } },
+        @{ Name = '예약 세부설정';    Act = { [void](Show-SendSetupDialog 'schedule') } },
+        @{ Name = '발송 확인';        Act = { [void](Show-SendConfirm '시험') } },
+        @{ Name = '저절로 닫히는 알림'; Act = { Show-AutoCloseInfo '시험' '시험' 5 } }
+    )) {
+        try {
+            & $one.Act
+            Write-Output ("  창 열기 OK — " + $one.Name)
+        } catch {
+            $dlgFails += ("{0}: {1}" -f $one.Name, $_.Exception.Message)
+            Write-Output ("  창 열기 실패 — " + $one.Name + " : " + $_.Exception.Message)
+        }
+    }
+    try { [ProbeDialogKiller]::Stop() } catch { }
+    if ($dlgFails.Count -gt 0) {
+        Write-Output ("DIALOG_FAIL " + $dlgFails.Count + "건")
+        exit 1
+    }
+    Write-Output 'DIALOG_OK 모든 창이 오류 없이 열립니다'
+
     Write-Output ("UI_SMOKETEST_OK pages={0} nav={1}" -f $script:pages.Count, $script:navItems.Count)
     $script:form.Dispose()
     exit 0
 }
 
+# 밤새 예약 발송을 돌릴 때, 뜻하지 않은 알림창 하나가 뜨면
+# 프로그램 전체가 그 창 앞에서 멈춰 섭니다. 예약 시계도 같이 멈춥니다.
+# 그러면 아침까지 한 번도 보내지 못합니다. 실제로 그런 일이 있었습니다.
+#
+# 파워셸로 만든 시계는 그럴 때 같이 멈춰서 아무 도움이 되지 못합니다.
+# 그래서 이 지킴이만 C# 으로 따로 둡니다. 이쪽은 멈추지 않고 돕니다.
+#
+# 조심할 점이 있습니다. 사용자가 열어 둔 설정 창까지 닫아 버리면 안 됩니다.
+# 그래서 윈도우가 만든 알림창(#32770) 만, 예약이 걸려 있을 때만,
+# 그리고 2분 넘게 그대로 서 있을 때만 닫습니다.
+Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class ScheduleWatchdog {
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll")] static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr hWnd, StringBuilder buf, int max);
+    const uint GW_ENABLEDPOPUP = 6;
+    const uint WM_CLOSE = 0x0010;
+    static IntPtr _main = IntPtr.Zero;
+    static Timer _timer = null;
+    static IntPtr _seen = IntPtr.Zero;
+    static DateTime _since = DateTime.MinValue;
+    public static bool Armed = false;
+    public static int ClosedCount = 0;
+    public static void Start(IntPtr mainWindow) {
+        _main = mainWindow;
+        if (_timer == null) {
+            _timer = new Timer();
+            _timer.Interval = 5000;
+            _timer.Tick += delegate { Check(); };
+        }
+        _timer.Start();
+    }
+    static void Check() {
+        if (!Armed || _main == IntPtr.Zero) { _seen = IntPtr.Zero; return; }
+        IntPtr popup = GetWindow(_main, GW_ENABLEDPOPUP);
+        if (popup == IntPtr.Zero || popup == _main) { _seen = IntPtr.Zero; return; }
+        StringBuilder cls = new StringBuilder(64);
+        GetClassNameW(popup, cls, 64);
+        if (cls.ToString() != "#32770") { _seen = IntPtr.Zero; return; }
+        if (popup != _seen) { _seen = popup; _since = DateTime.Now; return; }
+        if ((DateTime.Now - _since).TotalSeconds < 120) return;
+        PostMessageW(popup, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+        ClosedCount++;
+        _seen = IntPtr.Zero;
+    }
+}
+'@
+$script:watchdogSeen = 0
+function Update-WatchdogState {
+    try {
+        [ScheduleWatchdog]::Armed = [bool]$script:armed
+        $closed = [int][ScheduleWatchdog]::ClosedCount
+        if ($closed -gt $script:watchdogSeen) {
+            $script:watchdogSeen = $closed
+            Write-RunLog '예약을 막고 서 있던 알림창을 스스로 닫았습니다. 다음 회차는 그대로 진행합니다.'
+        }
+    } catch { }
+}
+
 $script:form.Add_Shown({
+    # 예약을 막고 서 있는 알림창을 치워 주는 지킴이를 켭니다.
+    try { [ScheduleWatchdog]::Start($script:form.Handle) } catch { }
     # 시작 화면에서 순서대로 점검합니다. 문제가 있으면 다음 화면으로 넘어가지 않습니다.
     for ($attempt = 0; $attempt -lt 6; $attempt++) {
         $result = Show-SplashScreen
