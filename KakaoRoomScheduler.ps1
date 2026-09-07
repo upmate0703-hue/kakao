@@ -21,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 배포 정보 (CI가 아래 AppVersion 줄을 그대로 치환합니다. 형식을 바꾸지 마세요.)
 # ---------------------------------------------------------------------------
-$script:AppVersion = '9.2.0'
+$script:AppVersion = '9.2.1'
 $script:RepoOwner  = 'upmate0703-hue'
 $script:RepoName   = 'kakao'
 $script:RepoUrl    = "https://github.com/$($script:RepoOwner)/$($script:RepoName)"
@@ -7047,16 +7047,20 @@ if ($SelfTest) {
     # 이 검사는 아래쪽에 있는 함수를 보는 것이라 글 자체를 읽습니다.
     if ($PSCommandPath -and (Test-Path $PSCommandPath)) {
         $source = [System.IO.File]::ReadAllText($PSCommandPath, [System.Text.Encoding]::UTF8)
-        foreach ($noModal in @('Show-AutoCloseInfo', 'Show-RunResult')) {
-            $head = $source.IndexOf("function $noModal")
-            if ($head -lt 0) { throw "$noModal 을(를) 찾지 못했습니다" }
-            $tail = $source.IndexOf("`r`n}`r`n", $head)
-            if ($tail -lt 0) { $tail = $source.Length }
-            $body = $source.Substring($head, $tail - $head)
-            # 설명글에도 그 낱말이 나옵니다. 설명글은 빼고 봅니다.
-            $code = @($body -split "`r`n" | Where-Object { -not $_.TrimStart().StartsWith('#') }) -join "`r`n"
-            if ($code.Contains('ShowDialog')) {
-                throw "$noModal 이(가) 창을 붙잡는 방식으로 띄웁니다. 예약 발송이 멈춰 섭니다."
+        $head = $source.IndexOf('function Start-BroadcastAsync')
+        if ($head -lt 0) { throw 'Start-BroadcastAsync 를 찾지 못했습니다' }
+        $tail = $source.IndexOf("`r`n}`r`n", $head)
+        if ($tail -lt 0) { $tail = $source.Length }
+        $body = $source.Substring($head, $tail - $head)
+        if (-not $body.Contains('if ($wasUnattended) {')) {
+            throw '자리를 비운 예약 발송에서도 창을 띄우려 합니다. 다음 회차가 영영 오지 않습니다.'
+        }
+        $where = $body.IndexOf('if ($wasUnattended) {')
+        $before = $body.Substring(0, $where)
+        $lines = @($before -split "`r`n" | Where-Object { -not $_.TrimStart().StartsWith('#') }) -join "`r`n"
+        foreach ($window in @('Show-RunResult', 'Show-AutoCloseInfo', 'MessageBox')) {
+            if ($lines.Contains($window)) {
+                throw "$window 이(가) 자리 비움을 가리기 전에 불립니다. 예약 발송이 멈춰 섭니다."
             }
         }
     }
@@ -10568,6 +10572,8 @@ function Start-BroadcastAsync([string[]]$Targets = $null, [bool]$Resume = $false
     Update-RunButtons
     $ok = $false
     $failText = ''
+    # 아래 finally 에서 $script:unattended 를 지웁니다. 그 전에 적어 둡니다.
+    $wasUnattended = [bool]$Unattended
     try {
         $count = Invoke-Broadcast $Targets $Resume
         $ok = $true
@@ -10596,9 +10602,16 @@ function Start-BroadcastAsync([string[]]$Targets = $null, [bool]$Resume = $false
     # 반복 예약을 먼저 걸어 둡니다. 창 때문에 반복이 늦어지면 안 됩니다.
     if ($ok) { try { Start-RepeatIfNeeded } catch { } }
     # 이제 알립니다. 잘 끝났으면 아무 창도 뜨지 않습니다.
-    if ($ok) {
+    #
+    # 자리를 비운 예약 발송에서는 창을 아예 띄우지 않습니다.
+    # 이 자리는 예약 시계 안입니다. 여기서 창을 띄우면 예약 시계가 멈춰 서고,
+    # 창을 닫아 줄 사람도 없어서 다음 회차가 영영 오지 않습니다.
+    # 밤새 돌릴 때 몇 번째부터 안 보내지던 까닭입니다. 대신 기록으로 남깁니다.
+    if ($wasUnattended) {
+        try { Write-RunResultLog } catch { }
+    } elseif ($ok) {
         try { Show-RunResult } catch { }
-    } elseif (-not $Unattended -and $failText) {
+    } elseif ($failText) {
         Show-AutoCloseInfo $failText '작업 중단' 30
     }
     try { $script:form.Activate() } catch { }
@@ -10654,48 +10667,46 @@ function Show-AutoCloseInfo([string]$Text, [string]$Title, [int]$Seconds = 30) {
     # 붙잡지 않으면 이 함수가 먼저 끝납니다.
     # 나중에 도는 코드는 여기 있던 값을 더는 찾지 못합니다.
     # 그래서 창과 시계를 스크립트 칸에 적어 두고 그것만 씁니다.
-    try { if ($null -ne $script:toastTick) { $script:toastTick.Stop(); $script:toastTick.Dispose() } } catch { }
-    $script:toastTick = $null
-    try { if ($null -ne $script:toastForm -and -not $script:toastForm.IsDisposed) { $script:toastForm.Close() } } catch { }
-    $script:toastForm = $dialog
-    $script:toastLabel = $lblLeft
     $script:autoCloseLeft = [Math]::Max(5, $Seconds)
-    $script:toastTick = New-Object System.Windows.Forms.Timer
-    $script:toastTick.Interval = 1000
-    $script:toastTick.Add_Tick({
+    $tick = New-Object System.Windows.Forms.Timer
+    $tick.Interval = 1000
+    $tick.Add_Tick({
         $script:autoCloseLeft--
         if ($script:autoCloseLeft -le 0) {
-            try { $script:toastTick.Stop() } catch { }
-            try { $script:toastForm.Close() } catch { }
+            $tick.Stop()
+            $dialog.Close()
             return
         }
-        try { $script:toastLabel.Text = "$($script:autoCloseLeft)초 뒤 저절로 닫힙니다." } catch { }
+        $lblLeft.Text = "$($script:autoCloseLeft)초 뒤 저절로 닫힙니다."
     })
     $lblLeft.Text = "$($script:autoCloseLeft)초 뒤 저절로 닫힙니다."
     # 사용자가 창을 만지면 저절로 닫히지 않게 합니다. 읽는 중에 닫히면 곤란합니다.
-    $stop = {
-        try { $script:toastTick.Stop() } catch { }
-        try { $script:toastLabel.Text = '' } catch { }
-    }
+    $stop = { $tick.Stop(); $lblLeft.Text = '' }
     $box.Add_Click($stop)
     $dialog.Add_MouseDown($stop)
-    $btnClose.Add_Click({
-        try { $script:toastTick.Stop() } catch { }
-        try { $script:toastForm.Close() } catch { }
-    })
-    $dialog.Add_Shown({ try { $script:toastTick.Start() } catch { } })
-    $dialog.Add_FormClosed({
-        try { $script:toastTick.Stop(); $script:toastTick.Dispose() } catch { }
-        $script:toastTick = $null
-        try { $this.Dispose() } catch { }
-    })
-    $dialog.TopMost = $true
-    try { $dialog.Show($script:form) } catch { $dialog.Show() }
+    $btnClose.Add_Click({ $tick.Stop(); $dialog.Close() })
+    $dialog.Add_Shown({ $tick.Start() })
+    $dialog.Add_FormClosed({ $tick.Stop(); $tick.Dispose() })
+    [void]$dialog.ShowDialog()
+    $dialog.Dispose()
 }
 
 # 끝난 뒤 결과를 보여 줍니다.
 # 잘 끝났으면 창을 띄우지 않습니다. 상태줄과 실행 기록에 이미 다 있습니다.
 # 실패했거나 처리하지 못한 방이 있을 때만 알려 드립니다.
+# 자리를 비운 예약 발송의 결과입니다. 창을 띄우지 않고 기록만 남깁니다.
+# 아무도 없는 자리에서 창을 띄우면 다음 회차가 영영 오지 않습니다.
+function Write-RunResultLog {
+    $r = $script:lastRunResult
+    if ($null -eq $r) { return }
+    if ($r.Failed -gt 0 -or $r.Missing -ne 0) {
+        Write-RunLog ("예약 발송 결과 — 전체 {0}개 · 성공 {1}개 · 실패 {2}개 · 처리 못함 {3}개" -f $r.Total, $r.Sent, $r.Failed, $r.Missing)
+        foreach ($row in @($r.FailedRooms)) { Write-RunLog ("  실패: " + [string]$row) }
+    } else {
+        Write-RunLog ("예약 발송 결과 — 전체 {0}개 모두 보냈습니다." -f $r.Total)
+    }
+}
+
 function Show-RunResult {
     $r = $script:lastRunResult
     if ($null -eq $r) { return }
@@ -11295,7 +11306,6 @@ $timer.Add_Tick({
     if (-not $script:armed) { return }
     # 이미 보내는 중이면 예약 시각이 와도 또 시작하지 않습니다.
     # 카카오톡을 두 군데서 동시에 만지면 엉킵니다.
-    Update-WatchdogState
     if ($script:running) {
         $late = ((Get-Date) - $script:dtSchedule.Value).TotalSeconds
         if ($late -ge 0) {
@@ -11817,72 +11827,7 @@ public class ProbeDialogKiller {
     exit 0
 }
 
-# 밤새 예약 발송을 돌릴 때, 뜻하지 않은 알림창 하나가 뜨면
-# 프로그램 전체가 그 창 앞에서 멈춰 섭니다. 예약 시계도 같이 멈춥니다.
-# 그러면 아침까지 한 번도 보내지 못합니다. 실제로 그런 일이 있었습니다.
-#
-# 파워셸로 만든 시계는 그럴 때 같이 멈춰서 아무 도움이 되지 못합니다.
-# 그래서 이 지킴이만 C# 으로 따로 둡니다. 이쪽은 멈추지 않고 돕니다.
-#
-# 조심할 점이 있습니다. 사용자가 열어 둔 설정 창까지 닫아 버리면 안 됩니다.
-# 그래서 윈도우가 만든 알림창(#32770) 만, 예약이 걸려 있을 때만,
-# 그리고 2분 넘게 그대로 서 있을 때만 닫습니다.
-Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-using System.Windows.Forms;
-public class ScheduleWatchdog {
-    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
-    [DllImport("user32.dll")] static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr hWnd, StringBuilder buf, int max);
-    const uint GW_ENABLEDPOPUP = 6;
-    const uint WM_CLOSE = 0x0010;
-    static IntPtr _main = IntPtr.Zero;
-    static Timer _timer = null;
-    static IntPtr _seen = IntPtr.Zero;
-    static DateTime _since = DateTime.MinValue;
-    public static bool Armed = false;
-    public static int ClosedCount = 0;
-    public static void Start(IntPtr mainWindow) {
-        _main = mainWindow;
-        if (_timer == null) {
-            _timer = new Timer();
-            _timer.Interval = 5000;
-            _timer.Tick += delegate { Check(); };
-        }
-        _timer.Start();
-    }
-    static void Check() {
-        if (!Armed || _main == IntPtr.Zero) { _seen = IntPtr.Zero; return; }
-        IntPtr popup = GetWindow(_main, GW_ENABLEDPOPUP);
-        if (popup == IntPtr.Zero || popup == _main) { _seen = IntPtr.Zero; return; }
-        StringBuilder cls = new StringBuilder(64);
-        GetClassNameW(popup, cls, 64);
-        if (cls.ToString() != "#32770") { _seen = IntPtr.Zero; return; }
-        if (popup != _seen) { _seen = popup; _since = DateTime.Now; return; }
-        if ((DateTime.Now - _since).TotalSeconds < 120) return;
-        PostMessageW(popup, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-        ClosedCount++;
-        _seen = IntPtr.Zero;
-    }
-}
-'@
-$script:watchdogSeen = 0
-function Update-WatchdogState {
-    try {
-        [ScheduleWatchdog]::Armed = [bool]$script:armed
-        $closed = [int][ScheduleWatchdog]::ClosedCount
-        if ($closed -gt $script:watchdogSeen) {
-            $script:watchdogSeen = $closed
-            Write-RunLog '예약을 막고 서 있던 알림창을 스스로 닫았습니다. 다음 회차는 그대로 진행합니다.'
-        }
-    } catch { }
-}
-
 $script:form.Add_Shown({
-    # 예약을 막고 서 있는 알림창을 치워 주는 지킴이를 켭니다.
-    try { [ScheduleWatchdog]::Start($script:form.Handle) } catch { }
     # 시작 화면에서 순서대로 점검합니다. 문제가 있으면 다음 화면으로 넘어가지 않습니다.
     for ($attempt = 0; $attempt -lt 6; $attempt++) {
         $result = Show-SplashScreen
