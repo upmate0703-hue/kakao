@@ -779,7 +779,13 @@ function New-DefaultConfig {
         ScheduleSendAtStart = $true
         # 마지막으로 실제 발송에 성공한 때입니다.
         LastSuccessAt = ''
-        # 한 PC 에 켜 둔 카카오톡 수입니다. 대부분 1 입니다.  [BETA]
+        # 여러 카카오톡 함께 쓰기입니다. 켜야만 작동합니다.  [BETA]
+        #
+        # 꺼 두면 카카오톡이 하나만 있는 것처럼 굽니다.
+        # 방 열쇠에 카카오톡 번호를 붙이지 않고, 지금 쓰는 창 하나만 봅니다.
+        # 켜지 않은 분에게는 예전과 똑같이 돌아갑니다.
+        MultiEnabled = $false
+        # 한 PC 에 켜 둔 카카오톡 수입니다. 위를 켰을 때만 씁니다.  [BETA]
         KakaoCount = 1
         # 공휴일마다 어떻게 할지 하나씩 정합니다.
         #   { Date = '2026-09-24'; Name = '추석'; Action = 'move'; MoveTo = '2026-09-25' }
@@ -3246,12 +3252,25 @@ function Get-InstanceIndexOf([int]$ProcessId, [object[]]$Instances) {
     return 1
 }
 
+# 여러 카카오톡 함께 쓰기를 켜 두었는지 봅니다.
+#
+# 이 프로그램의 다중 카카오톡 기능은 전부 이 하나로 켜고 끕니다.
+# 꺼져 있으면 방 열쇠에 카카오톡 번호가 붙지 않고, 그러면 그 뒤가 모두
+# 따라옵니다. 오갈 카카오톡이 하나뿐이 되고, 창도 하나만 봅니다.
+# 카카오톡을 하나만 쓰는 대부분의 분은 예전 그대로 쓰게 됩니다.
+function Test-MultiKakaoEnabled {
+    try { return [bool]$script:config.MultiEnabled } catch { return $false }
+}
+
 # 방을 가리는 열쇠입니다. 카카오톡 번호와 방 이름을 함께 씁니다.
 #   '카카오톡1|거래처'  와  '카카오톡2|거래처'  는 서로 다른 방입니다.
-# 카카오톡이 하나뿐이면 예전처럼 이름만 씁니다. 기존 설정을 그대로 쓸 수 있습니다.
+# 함께 쓰기를 끄면, 또 카카오톡이 하나뿐이면 예전처럼 이름만 씁니다.
+# 기존 설정을 그대로 쓸 수 있습니다.
 function Get-RoomKeyOf([int]$Instance, [string]$Name) {
     $clean = ConvertTo-ExactKey $Name
     if (-not $clean) { return '' }
+    # 켜지 않았으면 번호를 붙이지 않습니다. 여기가 다중 카카오톡의 잠금장치입니다.
+    if (-not (Test-MultiKakaoEnabled)) { return $clean }
     if ([int]$Instance -le 1) { return $clean }
     return ("카카오톡{0}|{1}" -f [int]$Instance, $clean)
 }
@@ -3328,7 +3347,19 @@ function Get-OpenChatRooms {
     $rooms = @()
     $seen = (New-NameMap)
     $instances = @(Get-KakaoInstances)
+    # 함께 쓰기가 꺼져 있으면 지금 쓰는 카카오톡의 창만 봅니다.
+    # 다른 계정의 창까지 긁어 오면 이름이 같은 방이 섞여 엉뚱한 곳으로 갑니다.
+    $onlyProcess = 0
+    if (-not (Test-MultiKakaoEnabled)) {
+        try {
+            $mainHandle = Find-KakaoMainHandle
+            foreach ($one in (Get-KakaoMainWindows)) {
+                if ($one.Handle -eq $mainHandle) { $onlyProcess = [int]$one.ProcessId; break }
+            }
+        } catch { $onlyProcess = 0 }
+    }
     foreach ($process in (Get-KakaoProcesses)) {
+        if ($onlyProcess -gt 0 -and [int]$process.Id -ne $onlyProcess) { continue }
         $instance = Get-InstanceIndexOf $process.Id $instances
         $windows = @()
         try { $windows = @([NativeKakao]::GetWindows($process.Id)) } catch { continue }
@@ -4094,7 +4125,17 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
     }
 
     $inputBox = $ready.InputBox
-    $state = Get-DeliveryState $Room
+    # '이미 보냈는지' 는 방마다 따로 적어야 합니다. 그 방을 가리는 것은 이름이 아니라 열쇠입니다.
+    #
+    # 예전에는 이름($Room)으로 적었습니다. 그런데 카카오톡이 여럿이면
+    # '카카오톡1|공지방' 과 '카카오톡2|공지방' 은 이름은 같고 방은 다릅니다.
+    # 그래서 1번 계정 공지방에 보내고 나면 2번 계정 공지방도 '이미 보냈다' 로 읽혔습니다.
+    # 그러면 아래 문구·첨부 구역을 통째로 지나가고, 문제가 없으니 $true 를 돌려줍니다.
+    # 한 글자도 보내지 않고 '발송 완료' 가 되던 까닭입니다.
+    #
+    # 진행 상태표($Room2)와 같은 열쇠를 씁니다. 이어하기 기록도 이 열쇠로 저장되므로,
+    # 두 번째 카카오톡의 방이 이어하기에서 통째로 빠지던 문제도 함께 없어집니다.
+    $state = Get-DeliveryState $Room2
     $problems = @()
 
     # ----- 1) 첨부 파일 -----
@@ -6557,7 +6598,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'Roster', 'RosterScannedAt', 'ScanExactNames', 'Templates', 'RetryCount', 'CloseAfterSend', 'GroupPhotos', 'PhotoBatchSize', 'AutoCheckUpdate', 'TourDone', 'InstanceMap', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'Roster', 'RosterScannedAt', 'ScanExactNames', 'Templates', 'RetryCount', 'CloseAfterSend', 'GroupPhotos', 'PhotoBatchSize', 'AutoCheckUpdate', 'TourDone', 'InstanceMap', 'MultiEnabled', 'KakaoCount', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -6774,6 +6815,14 @@ if ($SelfTest) {
 
 
 
+    # ----- 여러 카카오톡 함께 쓰기 -----
+    # 여기서부터는 '함께 쓰기' 를 켠 상태의 시험입니다.
+    # 켜야만 열쇠에 카카오톡 번호가 붙습니다. 끈 상태의 시험은 이 구역이 끝난 뒤에 있습니다.
+    $probeSavedMulti = $false
+    try { $probeSavedMulti = [bool]$script:config.MultiEnabled } catch { }
+    try {
+    $script:config.MultiEnabled = $true
+
     # ----- 방 항목에 빠진 칸이 없는지 -----
     # 방 항목을 만드는 곳이 여러 군데인데, 한 곳에서 칸을 빼먹으면
     # 다른 곳에서 그 칸을 찾다가 '이 개체에서 Key 속성을 찾을 수 없습니다' 로 멈춥니다.
@@ -6968,6 +7017,33 @@ if ($SelfTest) {
             throw '이름 확인이 카카오톡 번호를 지웠습니다'
         }
     } finally { $script:config.Roster = $probeSavedRoster3 }
+
+    } finally { $script:config.MultiEnabled = $probeSavedMulti }
+
+    # ----- 함께 쓰기를 끄면 예전처럼 굴어야 합니다 -----
+    # 켜지 않은 분은 카카오톡을 여러 개 켜 두어도 예전과 똑같아야 합니다.
+    # 열쇠에 번호가 붙지 않고, 오갈 카카오톡도 하나여야 합니다.
+    try {
+        $script:config.MultiEnabled = $false
+        if ((Get-RoomKeyOf 2 '거래처') -cne '거래처') {
+            throw '함께 쓰기를 껐는데 열쇠에 카카오톡 번호가 붙습니다'
+        }
+        if ((New-RoomEntry '시험방' '일반채팅' $true 'group' $true 2 '').Key -cne '시험방') {
+            throw '함께 쓰기를 껐는데 방 항목 열쇠에 카카오톡 번호가 붙습니다'
+        }
+        $probeOffPending = New-Object System.Collections.Specialized.OrderedDictionary([System.StringComparer]::Ordinal)
+        $probeOffPending.Add((Get-RoomKeyOf 1 '공지방'), $true)
+        $probeOffPending.Add((Get-RoomKeyOf 2 '거래처'), $true)
+        $probeOffInstances = @(Get-PendingInstances $probeOffPending)
+        if (($probeOffInstances -join ',') -ne '1') {
+            throw "함께 쓰기를 껐는데 카카오톡을 오갑니다: $($probeOffInstances -join ',')"
+        }
+        # 다시 켜면 번호가 붙어야 합니다. 잠금장치가 한쪽으로만 걸리면 안 됩니다.
+        $script:config.MultiEnabled = $true
+        if ((Get-RoomKeyOf 2 '거래처') -cne '카카오톡2|거래처') {
+            throw '함께 쓰기를 켰는데 열쇠에 카카오톡 번호가 붙지 않습니다'
+        }
+    } finally { $script:config.MultiEnabled = $probeSavedMulti }
     # ④ 저장하고 다시 읽어도 그대로여야 합니다.
     $probeSavedRoster2 = @($script:config.Roster)
     try {
@@ -7272,6 +7348,67 @@ if ($SelfTest) {
         $script:trackDelivery = $false
         Clear-RunProgress
         if ($null -ne $pileSavedProgress) { Set-Content -LiteralPath $script:ProgressPath -Value $pileSavedProgress -Encoding UTF8 }
+        Reset-SendProgress @()
+        Reset-DeliveryState
+        $script:runStats = @{ Photos = 0; Files = 0; Messages = 0 }
+    }
+    }
+    # ----- 카카오톡이 여럿일 때 · 이름이 같은 방에 각각 보내는지 -----
+    # 카카오톡1 의 '공지방' 과 카카오톡2 의 '공지방' 은 이름만 같고 서로 다른 방입니다.
+    # 앞의 방에 보냈다고 뒤의 방을 '이미 보냈다' 로 넘기면
+    # 한 글자도 보내지 않은 채 '발송 완료' 가 됩니다. 실제로 그랬습니다.
+    & {
+    $script:twinSent = @()
+    $script:twinRoom = ''
+
+    function Wait-ChatWindowReady([object]$Chat, [string]$Room, [int]$TimeoutMs = 8000) {
+        return [pscustomobject]@{ Window = $Chat; InputBox = ([pscustomobject]@{ Handle = [IntPtr]7 }) }
+    }
+    function Wait-KakaoResponsive([object]$Window, [int]$TimeoutMs = 20000) { return $true }
+    function Close-ChatWindow([object]$Window) { }
+    function Write-RunLog([string]$Text) { }
+    function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]$SettleMs = 4000) {
+        $script:twinSent = @($script:twinSent) + $script:twinRoom
+        return '모의'
+    }
+
+    $twinContent = [pscustomobject]@{
+        Message = '문구'; TemplateName = ''
+        Attachments = @()
+        GroupPhotos = $false; PhotoBatchSize = 1
+        AttachmentWaitMs = 100; OpenTimeoutMs = 100; SettleMs = 0; DryRun = $false
+    }
+    $twinChat = [pscustomobject]@{ Handle = [IntPtr]78; Title = '모의'; Visible = $true }
+    try {
+        Reset-SendProgress @('공지방', '카카오톡2|공지방')
+        Reset-DeliveryState
+        $script:trackDelivery = $true
+        $script:runStats = @{ Photos = 0; Files = 0; Messages = 0 }
+
+        # 첫 번째 카카오톡의 공지방. 열쇠에는 번호가 붙지 않습니다.
+        $script:twinRoom = '카카오톡1'
+        $twinOk1 = Send-ToChatWindow $twinChat '공지방' $twinContent $true '공지방'
+        # 두 번째 카카오톡의 공지방. 이름은 같고 열쇠가 다릅니다.
+        $script:twinRoom = '카카오톡2'
+        $twinOk2 = Send-ToChatWindow $twinChat '공지방' $twinContent $true '카카오톡2|공지방'
+
+        if (-not $twinOk1) { throw '첫 번째 카카오톡의 방이 실패했습니다' }
+        if (-not $twinOk2) { throw '두 번째 카카오톡의 방이 실패했습니다' }
+        if (@($script:twinSent).Count -ne 2) {
+            throw ("이름이 같은 두 방에 각각 보내야 하는데 {0}번 보냈습니다" -f @($script:twinSent).Count)
+        }
+        if ($script:runStats.Messages -ne 2) {
+            throw ("문구가 두 번 나가야 합니다: {0}" -f $script:runStats.Messages)
+        }
+        # 이어하기 기록도 열쇠로 남아야 합니다. 이름으로 남기면 두 방이 한 칸을 같이 씁니다.
+        if (-not $script:deliveryState.ContainsKey('카카오톡2|공지방')) {
+            throw '두 번째 카카오톡 방의 기록이 열쇠로 남지 않았습니다'
+        }
+        if (@($script:deliveryState.Keys).Count -ne 2) {
+            throw ("두 방의 기록이 따로 남아야 합니다: {0}칸" -f @($script:deliveryState.Keys).Count)
+        }
+    } finally {
+        $script:trackDelivery = $false
         Reset-SendProgress @()
         Reset-DeliveryState
         $script:runStats = @{ Photos = 0; Files = 0; Messages = 0 }
@@ -9498,23 +9635,32 @@ $btnTestDry  = New-AppButton $cardTest '방 확인만 (전송 안 함)' 236 156 
 
 
 # ----- 여러 카카오톡 함께 쓰기 [BETA] -----
-$cardMulti = New-Card $pageSettings 28 1650 784 176 '여러 카카오톡 함께 쓰기   BETA' '한 PC 에 카카오톡을 여러 개 켜 두고 쓰실 때만 손대시면 됩니다. 대부분 1 그대로 두시면 됩니다.'
-[void](New-CardLabel $cardMulti '사용 중인 카카오톡 수' 24 78 150 24 $FontSmall $Theme.Muted)
+$cardMulti = New-Card $pageSettings 28 1650 784 216 '여러 카카오톡 함께 쓰기   BETA' '한 PC 에 카카오톡을 여러 개 켜 두고 쓰실 때만 켜십시오. 켜지 않으면 지금 쓰는 카카오톡 하나만 씁니다.'
+$script:chkMultiEnabled = New-Object System.Windows.Forms.CheckBox
+$script:chkMultiEnabled.Text = '여러 카카오톡 함께 쓰기를 켭니다'
+$script:chkMultiEnabled.Checked = [bool]$script:config.MultiEnabled
+$script:chkMultiEnabled.Location = (New-UiPoint 24 72)
+$script:chkMultiEnabled.Size = (New-UiSize 500 26)
+$script:chkMultiEnabled.BackColor = $Theme.Card
+$script:chkMultiEnabled.Font = $FontBase
+$cardMulti.Controls.Add($script:chkMultiEnabled)
+$script:lblKakaoCount = New-CardLabel $cardMulti '사용 중인 카카오톡 수' 24 114 150 24 $FontSmall $(if ($script:config.MultiEnabled) { $Theme.Sub } else { $Theme.Muted })
 $script:numKakaoCount = New-Object System.Windows.Forms.NumericUpDown
 $script:numKakaoCount.Minimum = 1
 $script:numKakaoCount.Maximum = 8
 $script:numKakaoCount.Value = [Math]::Max(1, [Math]::Min(8, [int]$script:config.KakaoCount))
-$script:numKakaoCount.Location = (New-UiPoint 178 74)
+$script:numKakaoCount.Location = (New-UiPoint 178 110)
 $script:numKakaoCount.Size = (New-UiSize 66 30)
 $script:numKakaoCount.Font = $FontBase
 $script:numKakaoCount.BorderStyle = 'FixedSingle'
+$script:numKakaoCount.Enabled = [bool]$script:config.MultiEnabled
 $cardMulti.Controls.Add($script:numKakaoCount)
-[void](New-CardLabel $cardMulti '개' 250 78 26 24 $FontSmall $Theme.Muted)
-$btnMultiCheck = New-AppButton $cardMulti '지금 확인' 286 72 116 34
-$script:lblMultiState = New-CardLabel $cardMulti '' 24 114 736 46 $FontBase $Theme.Sub
+[void](New-CardLabel $cardMulti '개' 250 114 26 24 $FontSmall $Theme.Muted)
+$btnMultiCheck = New-AppButton $cardMulti '지금 확인' 286 108 116 34
+$script:lblMultiState = New-CardLabel $cardMulti '' 24 152 736 50 $FontBase $Theme.Sub
 # ----- 프로그램 상태 -----
 # 오래 켜 두는 프로그램이라, 느려졌을 때 무엇 때문인지 볼 수 있어야 합니다.
-$cardPerf = New-Card $pageSettings 28 1850 784 176 '프로그램 상태' '느려졌다고 느껴질 때 여기를 보시면 됩니다.'
+$cardPerf = New-Card $pageSettings 28 1890 784 176 '프로그램 상태' '느려졌다고 느껴질 때 여기를 보시면 됩니다.'
 $script:lblPerf = New-CardLabel $cardPerf '' 24 72 736 54 $FontBase $Theme.Sub
 $btnPerfRefresh = New-AppButton $cardPerf '지금 다시 보기' 24 132 168 36
 $btnGcNow = New-AppButton $cardPerf '메모리 정리' 200 132 140 36 'ghost'
@@ -9924,6 +10070,11 @@ function Sync-ConfigFromForm {
     $script:config.RepeatEnabled = [bool]$script:chkRepeat.Checked
     $script:config.RepeatMinutes = [int]$script:numRepeatMinutes.Value
     $script:config.RepeatCount = [int]$script:numRepeatCount.Value
+    # 예전에는 이 두 값을 화면에서 읽지 않아, 고쳐도 저장되지 않았습니다.
+    if ($null -ne $script:chkMultiEnabled) {
+        $script:config.MultiEnabled = [bool]$script:chkMultiEnabled.Checked
+        $script:config.KakaoCount = [int]$script:numKakaoCount.Value
+    }
     Update-LimitStateLabel
     Update-RoomCountLabel
     $script:lblMessageCount.Text = "$($script:txtMessage.Text.Length)자"
@@ -11594,6 +11745,28 @@ $btnTestDry.Add_Click({
 function Update-MultiState {
     if ($null -eq $script:lblMultiState) { return }
     try {
+        if (-not (Test-MultiKakaoEnabled)) {
+            $off = @('꺼져 있습니다. 지금 쓰는 카카오톡 하나만 씁니다.')
+            $warn = $false
+            try {
+                $running = @(Get-KakaoProcesses).Count
+                if ($running -gt 1) {
+                    $off += ("지금 카카오톡이 {0}개 켜져 있습니다. 두 계정에 모두 보내시려면 위를 켜 주세요." -f $running)
+                }
+            } catch { }
+            # 켰다가 끈 분에게는 알려 드려야 합니다.
+            # 두 번째 카카오톡의 방으로 골라 둔 것이 있으면 끈 동안에는 보내지 않습니다.
+            try {
+                $others = @(@($script:config.Rooms) | Where-Object { [string]$_ -match '^카카오톡\d+\|' })
+                if ($others.Count -gt 0) {
+                    $off += ("두 번째 카카오톡의 방 {0}개를 골라 두셨습니다. 끈 동안에는 그 방에는 보내지 않습니다." -f $others.Count)
+                    $warn = $true
+                }
+            } catch { }
+            $script:lblMultiState.Text = ($off -join [Environment]::NewLine)
+            $script:lblMultiState.ForeColor = if ($warn) { $Theme.Warning } else { $Theme.Muted }
+            return
+        }
         $want = [Math]::Max(1, [int]$script:numKakaoCount.Value)
         $found = @(Get-KakaoInstances)
         $rooms = @()
@@ -11617,6 +11790,15 @@ function Update-MultiState {
 
 $btnMultiCheck.Add_Click({ Clear-OpenRoomCache; Update-MultiState })
 $script:numKakaoCount.Add_ValueChanged({ Sync-ConfigFromForm; Update-MultiState })
+$script:chkMultiEnabled.Add_CheckedChanged({
+    # 켜고 끄면 방을 가리는 열쇠 자체가 달라집니다.
+    # 기억해 둔 열린 방 목록은 예전 열쇠로 되어 있으므로 버립니다.
+    $script:numKakaoCount.Enabled = [bool]$script:chkMultiEnabled.Checked
+    $script:lblKakaoCount.ForeColor = if ($script:chkMultiEnabled.Checked) { $Theme.Sub } else { $Theme.Muted }
+    Sync-ConfigFromForm
+    Clear-OpenRoomCache
+    Update-MultiState
+})
 # ----- 프로그램 상태 보기 -----
 # 무거워졌다고 느껴질 때 무엇 때문인지 볼 수 있게 합니다.
 function Update-PerfLabel {
@@ -12535,6 +12717,19 @@ public class ProbeDialogKiller {
         $clicked++
     } catch {
         $clickFails += ("[run] 달력에서 시각 고르기 — " + $_.Exception.Message)
+    }
+    # 여러 카카오톡 함께 쓰기를 켜고 꺼 봅니다.
+    # 이 체크칸은 단추가 아니라서 위의 누르기 검사에 걸리지 않습니다.
+    # 켜고 끄는 그 자리에서 오류가 난 적이 있어 여기서 따로 해 봅니다.
+    try {
+        $probeMultiWas = [bool]$script:chkMultiEnabled.Checked
+        foreach ($probeOn in @($true, $false, $probeMultiWas)) {
+            $script:chkMultiEnabled.Checked = $probeOn
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        $clicked++
+    } catch {
+        $clickFails += ("[settings] 여러 카카오톡 함께 쓰기 켜고 끄기 — " + $_.Exception.Message)
     }
     if ($clickFails.Count -gt 0) {
         Write-Output ("CLICK_FAIL " + $clickFails.Count + "건")
