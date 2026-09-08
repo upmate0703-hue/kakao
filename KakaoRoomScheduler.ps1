@@ -797,6 +797,10 @@ function New-DefaultConfig {
         #   direct(1:1) / group(단체) / open(오픈채팅) / unknown(모름)
         RoomKinds = [pscustomobject]@{}
         AutoCheckUpdate = $true
+        # '나중에' 를 고른 버전을 적어 둡니다. 그 버전은 시작할 때 다시 묻지 않습니다.
+        # 업데이트하지 않고 그대로 쓰시려는 분을 위한 것입니다.
+        # [지금 확인] 을 누르시면 이 값을 지우고 다시 물어봅니다.
+        SkipUpdateVersion = ''
         TourDone = $false
         # 카카오톡을 여러 개 켤 때 어느 창이 몇 번인지 적어 둡니다.
         # 여기에 적어 두어야 껐다 켜도 번호가 그대로 유지됩니다.
@@ -4070,7 +4074,22 @@ function Test-AttachmentList([string[]]$Paths) {
 $script:deliveryState = (New-NameMap)
 $script:trackDelivery = $false
 
-function Reset-DeliveryState { $script:deliveryState = (New-NameMap) }
+# 보내기는 했는데 대화창에서 확인하지 못한 방을 적어 둡니다.
+# 이 표가 비어 있어야만 '다 보냈습니다' 라고 말할 수 있습니다.
+$script:unverifiedKeys = (New-NameMap)
+
+function Reset-DeliveryState {
+    $script:deliveryState = (New-NameMap)
+    $script:unverifiedKeys = (New-NameMap)
+}
+
+# 방 하나가 끝났을 때 상태 칸에 적을 말입니다.
+# '발송 완료' 라고만 적으면, 확인하지 못한 것도 다 보낸 것처럼 보입니다.
+function Get-SentNote([object]$Content, [string]$Key) {
+    if ([bool]$Content.DryRun) { return '확인만 함 — 보내지 않았습니다' }
+    if ($script:unverifiedKeys.ContainsKey($Key)) { return '확인 못 함 — 카카오톡에서 직접 확인해 주세요' }
+    return ''
+}
 
 function Get-DeliveryState([string]$Room) {
     if (-not $script:trackDelivery) {
@@ -4122,6 +4141,18 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
         Write-StepLog $Room '확인만 함 — 아무것도 보내지 않았습니다'
         if ($CloseWhenDone) { Close-ChatWindow $chat }
         return $true
+    }
+
+    # 보낼 것이 하나도 없으면 성공이라고 하면 안 됩니다.
+    #
+    # 문구가 비어 있고 첨부도 없으면 아래 두 구역(첨부·문구)을 모두 지나갑니다.
+    # 지나가면 잘못된 것이 없으니 그대로 성공으로 끝나고, 방마다 '발송 완료' 가 찍힙니다.
+    # 한 글자도 보내지 않았는데도요. 여기서 먼저 막습니다.
+    if ([string]::IsNullOrWhiteSpace([string]$Content.Message) -and @($Content.Attachments).Count -eq 0) {
+        $script:lastSendProblem = 'NOTHING_TO_SEND — 보낼 문구도 첨부 파일도 없습니다.'
+        Write-StepLog $Room $script:lastSendProblem
+        if ($CloseWhenDone) { Close-ChatWindow $chat }
+        return $false
     }
 
     $inputBox = $ready.InputBox
@@ -4211,6 +4242,10 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
             return $false
         }
         $state.MessageSent = $true
+        if ($script:lastSendUnverified) {
+            $script:unverifiedKeys[$Room2] = $true
+            Write-StepLog $Room 'SEND_UNVERIFIED — 보냈지만 대화창에 올라온 것을 확인하지 못했습니다.'
+        }
         $script:runStats.Messages++
         if ($script:sendMethodLogged -ne $how) {
             $script:sendMethodLogged = $how
@@ -4317,6 +4352,11 @@ function Get-ChatTailSignature([object]$List) {
     $image = $null
     try { $image = Get-WindowImage $window } catch { return '' }
     try {
+        # 창 크기를 못 읽으면 1x1 빈 그림이 옵니다. 거기서는 아래 계산이
+        # 한 칸도 돌지 않아 빈 글자가 나오고, 그러면 부르는 쪽이
+        # '견줄 것이 없다' 며 확인을 건너뛰고 성공으로 봅니다.
+        # 너무 작은 그림은 애초에 견줄 수 없으니 여기서 확실히 빈 값으로 돌립니다.
+        if ($image.Height -lt 20 -or $image.Width -lt 20) { return '' }
         $parts = @()
         $from = [int]($image.Height * 0.55)
         for ($i = 0; $i -lt 5; $i++) {
@@ -4424,6 +4464,7 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
     }
     $list = Get-ChatListControl $Chat
     $script:lastSendProblem = ''
+    $script:lastSendUnverified = $false
 
     $ways = @('실제 붙여넣기', '실제 키보드', '창 붙여넣기', '창 메시지')
     # 이 컴퓨터에서 한 번 통한 방법을 기억해 두었다가 다음 방부터 먼저 씁니다.
@@ -4462,6 +4503,20 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
             # 입력칸이 비워진 것만으로는 보냈다고 할 수 없습니다.
             # 카카오톡이 글을 그냥 지워 버리는 경우가 있고, 그때도 입력칸은 빕니다.
             # 그래서 대화창에 글이 올라온 것까지 확인해야 성공으로 봅니다.
+            #
+            # 다만 견줄 그림 자체를 뜨지 못하는 컴퓨터가 있습니다.
+            # 그때 실패로 돌리면 실제로는 간 글을 다시 보내 같은 글이 두 번 갑니다.
+            # 그래서 막지는 않되, '확인하지 못했다' 를 반드시 남깁니다.
+            # 이것을 남기지 않으면 한 번도 확인하지 않고 전부 '발송 완료' 가 됩니다.
+            if ([string]::IsNullOrEmpty($before)) {
+                $script:lastSendUnverified = $true
+                if (-not $script:sendVerifyNoted) {
+                    $script:sendVerifyNoted = $true
+                    Write-RunLog '대화창 그림을 뜨지 못해 글이 올라온 것을 확인할 수 없습니다. 보낸 뒤 카카오톡에서 직접 확인해 주세요.'
+                }
+                $script:preferredSendWay = $way
+                return "$way + $press (확인 못 함)"
+            }
             if (Test-ChatMessageLanded $list $before $tune.Landed) {
                 $script:preferredSendWay = $way
                 return "$way + $press"
@@ -5074,6 +5129,11 @@ $script:barProgress = $null
 $script:preferredSendWay = ''
 $script:savedClipboard = $null
 $script:lastSendProblem = ''
+# 마지막 전송에서 '글이 올라온 것' 을 확인하지 못했는지입니다.
+# 창 그림을 뜨지 못하는 컴퓨터가 있어, 확인 없이 보내게 되는 경우가 있습니다.
+# 그때 이 값이 참이 되고, 그 방은 '확인 못 함' 으로 남깁니다.
+$script:lastSendUnverified = $false
+$script:sendVerifyNoted = $false
 $script:roomRepairNote = ''
 $script:pendingSwap = ''
 $script:sendMethodLogged = ''
@@ -5518,7 +5578,7 @@ function Invoke-ListPass([object]$Pending, [object]$Content, [int]$MaxPages,
                 $NotTarget['N:' + $openedKey] = $true
                 $NotTarget[(Get-RowKey $pick)] = $true
                 $sent++
-                Set-SendProgress $openedKey '발송 완료' ''
+                Set-SendProgress $openedKey '발송 완료' (Get-SentNote $Content $openedKey)
                 if ($Reasons.ContainsKey($openedKey)) { $Reasons.Remove($openedKey) }
             } else {
                 # 실패한 방은 목록에 남겨 둡니다. 다음 회차에 다시 해 봅니다.
@@ -5594,6 +5654,11 @@ function Invoke-OpenWindowPass([object]$Pending, [object]$Content, [int]$Interva
         $script:strictTitleMatch = $true
         $ok = $false
         $closeIt = (-not [bool]$script:config.KeepRoomsOpen)
+        # 카카오톡을 여러 개 쓸 때는 창을 닫지 않습니다.
+        # 닫으면 그 계정의 열린 창 목록이 그 자리에서 바뀝니다. 우리가 기억해 둔
+        # 창 목록도 같이 어긋나서, 뒤이어 보낼 방의 창을 못 찾는 일이 생깁니다.
+        # 열어 둔 창이 곧 보낼 수 있는 방이므로 그대로 둡니다.
+        if (Test-MultiKakaoEnabled) { $closeIt = $false }
         try { $ok = [bool](Send-ToChatWindow $window $title $Content $closeIt $name) }
         catch {
             $ok = $false
@@ -5604,7 +5669,7 @@ function Invoke-OpenWindowPass([object]$Pending, [object]$Content, [int]$Interva
         if ($ok) {
             $Pending.Remove($name)
             $sent++
-            Set-SendProgress $name '발송 완료' ''
+            Set-SendProgress $name '발송 완료' (Get-SentNote $Content $name)
             if ($Reasons.ContainsKey($name)) { $Reasons.Remove($name) }
         } else {
             # 실패한 방은 목록에 남겨 둡니다. 다음 회차에 다시 해 봅니다.
@@ -5668,6 +5733,30 @@ function Enter-KakaoInstance([int]$Instance) {
     return $false
 }
 
+# 고른 방 가운데 지금 채팅방 창이 열려 있는 것과 아닌 것을 갈라 줍니다.
+#
+# 카카오톡을 여러 개 쓸 때는 열어 둔 창으로만 보냅니다.
+# 그래서 보내기 전에 '어느 방이 준비되어 있는지' 를 사람이 먼저 알아야 합니다.
+# 확인 창과 실행 기록이 이 함수 하나를 같이 써서 말이 어긋나지 않게 합니다.
+function Get-OpenRoomSplit([string[]]$Keys) {
+    $open = (New-NameMap)
+    try {
+        foreach ($room in (Get-OpenChatRoomsCached)) { $open[[string]$room.Key] = $room }
+    } catch { }
+    $ready = @()
+    $notReady = @()
+    foreach ($key in @($Keys)) {
+        $one = ConvertTo-ExactKey ([string]$key)
+        if (-not $one) { continue }
+        if ($open.ContainsKey($one)) { $ready += $one } else { $notReady += $one }
+    }
+    return [pscustomobject]@{
+        Ready = @($ready)
+        NotReady = @($notReady)
+        OpenCount = $open.Count
+    }
+}
+
 function Invoke-RosterSend([string[]]$Targets, [object]$Content, [int]$MaxPages,
                            [int]$IntervalSeconds, [int]$BatchSize, [int]$BatchRestMinutes,
                            [int]$RetryCount) {
@@ -5679,6 +5768,17 @@ function Invoke-RosterSend([string[]]$Targets, [object]$Content, [int]$MaxPages,
     }
     $total = $pending.Count
     if ($total -eq 0) { throw '보낼 채팅방을 한 개 이상 골라 주세요.' }
+
+    # 카카오톡을 여러 개 쓸 때는 열어 둔 창으로만 보냅니다.
+    # 어느 방이 열려 있는지 시작할 때 적어 둡니다. 끝나고 기록만 봐도 알 수 있어야 합니다.
+    if (Test-MultiKakaoEnabled) {
+        $split = Get-OpenRoomSplit @($pending.Keys)
+        Write-RunLog ("여러 카카오톡 함께 쓰기 — 열어 둔 창으로만 보냅니다. 지금 열려 있는 채팅방 창 {0}개" -f $split.OpenCount)
+        Write-RunLog ("고른 방 {0}개 중 창이 열려 있는 방 {1}개 · 열려 있지 않은 방 {2}개" -f $total, @($split.Ready).Count, @($split.NotReady).Count)
+        foreach ($one in @($split.NotReady)) {
+            Write-RunLog ("  창이 닫혀 있음: '{0}'" -f (Get-RoomDisplayName $one))
+        }
+    }
 
     $sent = 0
     $reasons = (New-NameMap)
@@ -5709,13 +5809,31 @@ function Invoke-RosterSend([string[]]$Targets, [object]$Content, [int]$MaxPages,
         # 창을 미리 열어 두지 않는 한 영영 찾지 못하고 'ROOM_NOT_FOUND' 가 났습니다.
         # 이제 보낼 방이 걸쳐 있는 계정을 하나씩 돌면서 각각의 목록을 훑습니다.
         $exhaustive = ($round -gt 1)
-        $howText = if ($exhaustive) { '아직 못 찾은 방을 위해 목록의 모든 줄을 하나씩 열어 확인합니다 (오래 걸립니다)' } else { '이름으로 찾아 열기' }
-        Write-RunLog ("{0}회차 · 목록: 남은 방 {1}개 / {2}" -f $round, $pending.Count, $howText)
+        if (-not (Test-MultiKakaoEnabled)) {
+            $howText = if ($exhaustive) { '아직 못 찾은 방을 위해 목록의 모든 줄을 하나씩 열어 확인합니다 (오래 걸립니다)' } else { '이름으로 찾아 열기' }
+            Write-RunLog ("{0}회차 · 목록: 남은 방 {1}개 / {2}" -f $round, $pending.Count, $howText)
+        }
 
         $before = $pending.Count
         $passSent = 0
         $passTried = 0
         $passInterrupted = $false
+        if (Test-MultiKakaoEnabled) {
+            # 카카오톡을 여러 개 쓸 때는 목록을 훑지 않습니다. 열어 둔 창으로만 보냅니다.
+            #
+            # 목록을 훑으려면 계정을 오가며 창을 앞으로 불러내고, 줄을 눌러 방을 열고,
+            # 화면 글자를 읽어 이름을 알아내야 합니다. 그 사이에 다른 계정의 창이
+            # 앞으로 나오면 글이 엉뚱한 방으로 들어갑니다. 계정이 섞이면 되돌릴 수 없습니다.
+            #
+            # 열어 둔 창은 다릅니다. 창 제목이 곧 정확한 방 이름이고, 그 창이 어느
+            # 카카오톡의 것인지도 창 자체로 분명합니다. 화면 글자를 읽을 일이 없습니다.
+            # 그래서 여러 개일 때는 이 길만 씁니다.
+            foreach ($key in @($pending.Keys)) {
+                if ($reasons.ContainsKey($key)) { continue }
+                $reasons[$key] = 'ROOM_NOT_OPEN — 카카오톡을 여러 개 쓸 때는 채팅방 창을 열어 두어야 보냅니다.'
+            }
+            Write-RunLog ("{0}회차 · 여러 카카오톡: 창이 열려 있지 않은 방 {1}개는 보내지 않습니다." -f $round, $pending.Count)
+        } else {
         $instances = @(Get-PendingInstances $pending)
         foreach ($one in $instances) {
             if ($pending.Count -eq 0) { break }
@@ -5731,6 +5849,7 @@ function Invoke-RosterSend([string[]]$Targets, [object]$Content, [int]$MaxPages,
             $passSent += $pass.Sent
             $passTried += $pass.Tried
             if ($pass.Interrupted) { $passInterrupted = $true; break }
+        }
         }
         $sent += $passSent
         Write-RunLog ("{0}회차 결과: 보냄 {1} / 남음 {2}" -f $round, ($openPass.Sent + $passSent), $pending.Count)
@@ -6309,6 +6428,7 @@ function Invoke-Broadcast([string[]]$Targets = $null, [bool]$Resume = $false) {
         Files = [int]$script:runStats.Files
         Messages = [int]$script:runStats.Messages
         FailedRooms = @($failedRooms)
+        Unverified = @($script:unverifiedKeys.Keys)
         DryRun = $dryRun
         FinishedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
@@ -6326,6 +6446,14 @@ function Invoke-Broadcast([string[]]$Targets = $null, [bool]$Resume = $false) {
     }
     if ($failedRooms.Count -gt 0) {
         Write-RunLog "실패한 방: $((@($failedRooms) | Select-Object -First 10) -join ', ')"
+    }
+    # 확인하지 못한 방이 있으면 반드시 알립니다.
+    # 이 줄이 없으면 한 번도 확인하지 못한 발송이 '성공' 으로만 보입니다.
+    $unverified = @($script:unverifiedKeys.Keys)
+    if ($unverified.Count -gt 0) {
+        Write-RunLog ("확인 못 함:  {0}개 — 보내기는 했지만 대화창에 올라온 것을 확인하지 못했습니다." -f $unverified.Count)
+        Write-RunLog ("             {0}" -f ((@($unverified) | Select-Object -First 10) -join ', '))
+        Write-RunLog '             이 컴퓨터에서 카카오톡 창 그림을 뜨지 못해서입니다. 카카오톡에서 직접 확인해 주세요.'
     }
     Write-StageSummary
     Write-RunLog '자세한 결과는 logs 폴더의 발송기록 파일에 표로 남았습니다.'
@@ -6598,10 +6726,15 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'Roster', 'RosterScannedAt', 'ScanExactNames', 'Templates', 'RetryCount', 'CloseAfterSend', 'GroupPhotos', 'PhotoBatchSize', 'AutoCheckUpdate', 'TourDone', 'InstanceMap', 'MultiEnabled', 'KakaoCount', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'Roster', 'RosterScannedAt', 'ScanExactNames', 'Templates', 'RetryCount', 'CloseAfterSend', 'GroupPhotos', 'PhotoBatchSize', 'AutoCheckUpdate', 'TourDone', 'InstanceMap', 'MultiEnabled', 'KakaoCount', 'SkipUpdateVersion', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
+    # 자체 점검은 이 PC 에 저장된 설정을 그대로 읽습니다.
+    # '여러 카카오톡 함께 쓰기' 는 발송이 도는 길 자체를 바꾸므로,
+    # 이 값이 켜져 있는 PC 에서는 시험 결과가 달라집니다. 실제로 그런 일이 있었습니다.
+    # 기준을 꺼짐으로 고정하고, 켠 상태를 보는 시험은 그때그때 직접 켭니다.
+    $script:config.MultiEnabled = $false
     foreach ($name in @('SearchIconOffset')) {
         if ($null -eq $script:config.Calibration.PSObject.Properties[$name]) { throw "필수 보정 항목 누락: $name" }
     }
@@ -7353,13 +7486,32 @@ if ($SelfTest) {
         $script:runStats = @{ Photos = 0; Files = 0; Messages = 0 }
     }
     }
-    # ----- 카카오톡이 여럿일 때 · 이름이 같은 방에 각각 보내는지 -----
+    # ----- 보낸 것을 확인하지 못했을 때 -----
+    # 컴퓨터에 따라 카카오톡 창 그림을 뜨지 못합니다. 그러면 견줄 것이 없어
+    # 글이 올라왔는지 확인할 수 없습니다.
+    #
+    # 그때 실패로 돌리면 실제로는 간 글을 다시 보내 같은 글이 두 번 갑니다.
+    # 그래서 막지는 않습니다. 대신 '확인 못 함' 을 반드시 남겨야 합니다.
+    # 이것을 남기지 않으면 한 번도 확인하지 않은 발송이 깨끗한 '발송 완료' 로 보입니다.
+    # 실제로 그런 일이 있었습니다.
+    & {
+    # 창 그림이 1x1 로만 나오는 컴퓨터를 흉내 냅니다.
+    function Get-WindowImage([object]$Window) { return (New-Object System.Drawing.Bitmap(1, 1)) }
+    $verSig = Get-ChatTailSignature ([pscustomobject]@{ Handle = [IntPtr]5 })
+    if ($verSig -ne '') { throw "1x1 그림에서 견줄 값을 만들어 냈습니다: '$verSig'" }
+    # 견줄 값이 없으면 확인할 방법이 없습니다. 그것을 '확인함' 으로 보면 안 됩니다.
+    if (-not (Test-ChatMessageLanded ([pscustomobject]@{ Handle = [IntPtr]5 }) '' 10)) {
+        throw '확인할 수 없을 때는 막지 않아야 합니다 (같은 글이 두 번 갑니다)'
+    }
+    }
+
     # 카카오톡1 의 '공지방' 과 카카오톡2 의 '공지방' 은 이름만 같고 서로 다른 방입니다.
     # 앞의 방에 보냈다고 뒤의 방을 '이미 보냈다' 로 넘기면
     # 한 글자도 보내지 않은 채 '발송 완료' 가 됩니다. 실제로 그랬습니다.
     & {
     $script:twinSent = @()
     $script:twinRoom = ''
+    $script:twinUnverified = $false
 
     function Wait-ChatWindowReady([object]$Chat, [string]$Room, [int]$TimeoutMs = 8000) {
         return [pscustomobject]@{ Window = $Chat; InputBox = ([pscustomobject]@{ Handle = [IntPtr]7 }) }
@@ -7369,6 +7521,8 @@ if ($SelfTest) {
     function Write-RunLog([string]$Text) { }
     function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]$SettleMs = 4000) {
         $script:twinSent = @($script:twinSent) + $script:twinRoom
+        # 창 그림을 뜨지 못해 확인할 수 없었던 상황을 흉내 냅니다.
+        $script:lastSendUnverified = [bool]$script:twinUnverified
         return '모의'
     }
 
@@ -7406,6 +7560,58 @@ if ($SelfTest) {
         }
         if (@($script:deliveryState.Keys).Count -ne 2) {
             throw ("두 방의 기록이 따로 남아야 합니다: {0}칸" -f @($script:deliveryState.Keys).Count)
+        }
+
+        # ----- 보낼 것이 없으면 완료라고 하면 안 됩니다 -----
+        # 문구가 비어 있고 첨부도 없으면 첨부 구역도 문구 구역도 지나갑니다.
+        # 예전에는 그대로 성공으로 끝나서, 한 글자도 보내지 않고 '발송 완료' 가 찍혔습니다.
+        $twinEmpty = [pscustomobject]@{
+            Message = '   '; TemplateName = ''
+            Attachments = @()
+            GroupPhotos = $false; PhotoBatchSize = 1
+            AttachmentWaitMs = 100; OpenTimeoutMs = 100; SettleMs = 0; DryRun = $false
+        }
+        $twinBefore = @($script:twinSent).Count
+        $script:twinRoom = '빈내용'
+        if (Send-ToChatWindow $twinChat '빈방' $twinEmpty $true '빈방') {
+            throw '보낼 것이 없는데 발송 완료라고 합니다'
+        }
+        if (@($script:twinSent).Count -ne $twinBefore) { throw '보낼 것이 없는데 무언가 보냈습니다' }
+        if ($script:lastSendProblem -notmatch 'NOTHING_TO_SEND') {
+            throw "보낼 것이 없다는 까닭이 적히지 않았습니다: $($script:lastSendProblem)"
+        }
+        # ----- 보냈지만 확인하지 못한 방 -----
+        # 확인할 수 없었으면 막지는 않습니다. 막으면 같은 글이 두 번 갑니다.
+        # 대신 반드시 '확인 못 함' 으로 남아야 합니다.
+        # 남지 않으면 한 번도 확인하지 않은 발송이 깨끗한 완료로 보입니다.
+        Reset-DeliveryState
+        if ($script:unverifiedKeys.Count -ne 0) { throw '새 발송을 시작할 때 확인 못 함 기록이 비어 있어야 합니다' }
+        $script:twinUnverified = $true
+        try {
+            $script:twinRoom = '확인못함'
+            if (-not (Send-ToChatWindow $twinChat '흐린방' $twinContent $true '흐린방')) {
+                throw '확인하지 못했다고 발송을 실패로 돌렸습니다 (같은 글이 두 번 갑니다)'
+            }
+            if (-not $script:unverifiedKeys.ContainsKey('흐린방')) {
+                throw '확인하지 못한 방이 기록되지 않았습니다'
+            }
+            $twinNote = Get-SentNote $twinContent '흐린방'
+            if ($twinNote -notmatch '확인 못 함') {
+                throw "확인하지 못한 방인데 상태 칸에 그렇게 적히지 않았습니다: '$twinNote'"
+            }
+            # 확인이 된 방은 아무 말도 붙지 않아야 합니다.
+            if ((Get-SentNote $twinContent '공지방') -ne '') { throw '확인된 방에 군더더기가 붙었습니다' }
+        } finally { $script:twinUnverified = $false }
+
+        # 확인 전용은 방만 열어 보는 것이므로 빈 내용이어도 됩니다.
+        $twinDry = [pscustomobject]@{
+            Message = ''; TemplateName = ''
+            Attachments = @()
+            GroupPhotos = $false; PhotoBatchSize = 1
+            AttachmentWaitMs = 100; OpenTimeoutMs = 100; SettleMs = 0; DryRun = $true
+        }
+        if (-not (Send-ToChatWindow $twinChat '빈방' $twinDry $true '빈방')) {
+            throw '확인 전용인데 방 열어 보기가 실패했습니다'
         }
     } finally {
         $script:trackDelivery = $false
@@ -7608,6 +7814,51 @@ if ($SelfTest) {
         if (($simDone + $simFail) -ne 7) { throw "상태표의 방 수가 7이 아닙니다: $($simDone + $simFail)" }
         if ($simDone -ne 6 -or $simFail -ne 1) { throw "상태표가 결과와 다릅니다: 완료 $simDone / 실패 $simFail" }
         if ([string]$script:progressRows['없는방'].Note -notmatch 'ROOM_NOT_FOUND') { throw '못 찾은 방에 까닭이 적히지 않았습니다' }
+
+        # ----- 같은 상황을 '여러 카카오톡 함께 쓰기' 를 켜고 다시 -----
+        # 켜면 목록을 훑지 않고 열어 둔 창으로만 보냅니다.
+        # 목록을 훑으려면 계정을 오가야 하고, 그 사이에 다른 계정 창이 앞으로 나오면
+        # 글이 엉뚱한 방으로 들어갑니다. 그래서 열어 둔 창만 씁니다.
+        # 대신 못 보낸 방이 조용히 사라지면 안 됩니다. 까닭이 남아야 합니다.
+        $script:fakeSendLog = @()
+        $script:fakeOpenSent = @()
+        $script:fakeFail = @{}
+        Reset-SendProgress $simTargets
+        Reset-DeliveryState
+        $simSavedMulti = [bool]$script:config.MultiEnabled
+        $simSavedKeep = [bool]$script:config.KeepRoomsOpen
+        try {
+            $script:config.MultiEnabled = $true
+            # 일부러 '발송 뒤 채팅방 닫기' 를 쓰는 상황으로 둡니다.
+            # 카카오톡이 하나면 닫아도 됩니다. 여러 개면 닫는 순간 그 계정의
+            # 열린 창 목록이 바뀌어 뒤이어 보낼 방의 창을 못 찾습니다.
+            # 그래서 여러 개일 때는 이 설정과 상관없이 닫지 않아야 합니다.
+            $script:config.KeepRoomsOpen = $false
+            $simMulti = Invoke-RosterSend $simTargets $simContent 12 0 0 0 2
+
+            if ($simMulti.Total -ne 7) { throw "여러 카카오톡: 고른 방 수가 7이 아닙니다: $($simMulti.Total)" }
+            if (($simMulti.Sent + $simMulti.Failed) -ne $simMulti.Total) {
+                throw "여러 카카오톡: 숫자가 맞지 않습니다: 완료 $($simMulti.Sent) / 실패 $($simMulti.Failed)"
+            }
+            if ($simMulti.Sent -ne 2) { throw "여러 카카오톡: 열어 둔 창 2개에만 보냈어야 합니다: $($simMulti.Sent)" }
+            foreach ($simOpen in @('투투', '업체B')) {
+                if (@($script:fakeSendLog) -notcontains $simOpen) { throw "여러 카카오톡: 열어 둔 '$simOpen' 에 보내지 못했습니다" }
+            }
+            foreach ($simShut in @('뽀식', '토토', '우리반 공지방', '스마트스토어 블로그 홍보방')) {
+                if (@($script:fakeSendLog) -contains $simShut) { throw "여러 카카오톡: 창이 닫힌 '$simShut' 에 보냈습니다" }
+            }
+            # 창을 닫으면 그 계정의 열린 창 목록이 그 자리에서 어긋납니다. 닫지 않아야 합니다.
+            if (@($script:fakeOpenSent).Count -ne 2) {
+                throw "여러 카카오톡: 창을 열어 둔 채로 보내지 않았습니다: $(@($script:fakeOpenSent).Count)"
+            }
+            # 못 보낸 방은 까닭이 남아야 합니다.
+            if ([string]$script:progressRows['뽀식'].Note -notmatch 'ROOM_NOT_OPEN') {
+                throw "여러 카카오톡: 창이 닫힌 방에 까닭이 적히지 않았습니다: $([string]$script:progressRows['뽀식'].Note)"
+            }
+        } finally {
+            $script:config.MultiEnabled = $simSavedMulti
+            $script:config.KeepRoomsOpen = $simSavedKeep
+        }
     } finally {
         Set-ConfigValue 'RoomKinds' $simSavedKinds
         Reset-SendProgress @()
@@ -11075,12 +11326,32 @@ function Show-SendConfirm([string]$Action) {
     $list.Font = $FontBase
     $list.Location = (New-UiPoint 12 12)
     $list.Size = (New-UiSize 520 200)
-    [void]$list.Columns.Add('채팅방 이름', 380)
+    # 카카오톡을 여러 개 쓸 때는 열어 둔 창으로만 보냅니다.
+    # 그러면 어느 방이 준비되어 있는지가 곧 결과를 가릅니다. 보내기 전에 보여 줍니다.
+    $multi = Test-MultiKakaoEnabled
+    $notOpenKeys = (New-NameMap)
+    if ($multi) {
+        try {
+            $split = Get-OpenRoomSplit @($rooms | ForEach-Object { [string]$_.Key })
+            foreach ($one in @($split.NotReady)) { $notOpenKeys[[string]$one] = $true }
+        } catch { }
+        if ($notOpenKeys.Count -gt 0) {
+            $lblTo.Text = "받는 채팅방 $($rooms.Count)개 — 이 가운데 $($notOpenKeys.Count)개는 창이 닫혀 있어 보내지 않습니다"
+            $lblTo.ForeColor = $Theme.Danger
+        }
+    }
+    [void]$list.Columns.Add('채팅방 이름', $(if ($multi) { 260 } else { 380 }))
     [void]$list.Columns.Add('종류', 120)
+    if ($multi) { [void]$list.Columns.Add('창', 120) }
     # 보내기 전 확인 목록도 종류로 묶지 않고 이름 순서로 보여 줍니다.
     foreach ($entry in ($rooms | Sort-Object -Property Name)) {
         $item = New-Object System.Windows.Forms.ListViewItem((Get-RoomDisplayName $entry.Key))
         [void]$item.SubItems.Add([string]$entry.Type)
+        if ($multi) {
+            $closed = $notOpenKeys.ContainsKey([string]$entry.Key)
+            [void]$item.SubItems.Add($(if ($closed) { '닫힘 — 안 보냄' } else { '열림' }))
+            if ($closed) { $item.ForeColor = $Theme.Danger }
+        }
         [void]$list.Items.Add($item)
     }
     $listFrame.Controls.Add($list)
@@ -11141,7 +11412,24 @@ function Show-SendConfirm([string]$Action) {
     return $script:sendConfirmResult
 }
 
+# 보낼 것이 하나도 없는지 봅니다.
+#
+# 문구도 첨부도 없으면 방마다 보낼 것이 없어 아무 일도 일어나지 않습니다.
+# 그런데도 잘못된 것은 없으니 방마다 '발송 완료' 가 찍힙니다.
+# 사용자는 다 보낸 줄 알게 됩니다. 그래서 시작하기 전에 막습니다.
+function Test-NothingToSend {
+    if ([bool]$script:config.DryRun) { return $false }
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:config.Message)) { return $false }
+    return (@($script:config.Attachments).Count -eq 0)
+}
+
 function Confirm-LiveRun([string]$Action) {
+    if (Test-NothingToSend) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "보낼 문구도 첨부 파일도 없습니다.`r`n`r`n[1. 보낼 내용] 화면에서 문구를 적거나 사진·파일을 넣어 주세요.",
+            '보낼 내용이 없습니다', 'OK', 'Warning') | Out-Null
+        return $false
+    }
     # 보낼 대상을 한 번 보여 줍니다. '다음부터 보지 않기'를 고르면 건너뜁니다.
     if (-not [bool]$script:config.SkipSendConfirm) {
         if (-not (Show-SendConfirm $Action)) { return $false }
@@ -11956,7 +12244,16 @@ function Show-UpdateState([object]$Release, [string]$ErrorText) {
     }
     if (Test-UpdateAvailable $Release) {
         $script:latestRelease = $Release
-        $script:lblUpdateState.Text = "현재 버전 v$($script:AppVersion)  →  새 버전 $($Release.Tag) 이(가) 있습니다.`r`n$($Release.PageUrl)"
+        $skip = ''
+        try { $skip = [string]$script:config.SkipUpdateVersion } catch { }
+        if ($skip -and $skip -eq [string]$Release.Tag) {
+            # 건너뛰기로 해 두셨어도 새 버전이 있다는 것은 그대로 보여 드립니다.
+            # 숨기면 나중에 받고 싶어지셨을 때 찾을 곳이 없습니다.
+            $script:lblUpdateState.Text = "현재 버전 v$($script:AppVersion)  →  새 버전 $($Release.Tag) 이(가) 있습니다." +
+                "`r`n이 버전은 건너뛰도록 해 두었습니다. 받으시려면 아래 [지금 업데이트] 를 누르세요."
+        } else {
+            $script:lblUpdateState.Text = "현재 버전 v$($script:AppVersion)  →  새 버전 $($Release.Tag) 이(가) 있습니다.`r`n$($Release.PageUrl)"
+        }
         $script:lblUpdateState.ForeColor = $Theme.Info
         $script:btnDoUpdate.Enabled = $true
         $script:pnlUpdate.Visible = $true
@@ -11989,14 +12286,37 @@ function Invoke-UpdateCheck([bool]$Silent) {
 }
 
 # 확인 한 번으로 내려받기·설치·재시작까지 진행합니다.
-function Start-UpdateInstall([object]$Release) {
+# 새 버전을 받을지 물어봅니다.
+#
+# $Auto 는 '프로그램이 스스로 물었다' 는 뜻입니다. 시작할 때가 그렇습니다.
+# 업데이트하지 않고 그대로 쓰시려는 분에게 켤 때마다 창을 띄우면 안 됩니다.
+# 그래서 스스로 물어서 '나중에' 를 고르시면 그 버전은 다시 묻지 않습니다.
+# 더 새로운 버전이 나오면 그때는 다시 물어봅니다.
+#
+# 사용자가 직접 [지금 확인] 을 누른 경우($Auto 가 거짓)에는 언제나 물어봅니다.
+function Start-UpdateInstall([object]$Release, [bool]$Auto = $false) {
     if ($null -eq $Release) { return }
+    $tag = [string]$Release.Tag
+    if ($Auto) {
+        $skip = ''
+        try { $skip = [string]$script:config.SkipUpdateVersion } catch { }
+        if ($skip -and $skip -eq $tag) { return }
+    }
     $notes = ([string]$Release.Notes).Trim()
     if ($notes.Length -gt 400) { $notes = $notes.Substring(0, 400) + '...' }
-    $body = "새 버전 $($Release.Tag) 이(가) 있습니다.`r`n`r`n"
+    $body = "새 버전 $tag 이(가) 있습니다.`r`n`r`n"
     if ($notes) { $body += "$notes`r`n`r`n" }
     $body += "지금 내려받아 설치할까요?`r`n`r`n· 현재 파일은 backup 폴더에 보관됩니다.`r`n· 설정과 실행 기록은 그대로 유지됩니다.`r`n· 설치가 끝나면 프로그램이 다시 시작됩니다."
-    if ([System.Windows.Forms.MessageBox]::Show($body, '업데이트 설치', 'YesNo', 'Question') -ne 'Yes') { return }
+    if ($Auto) { $body += "`r`n`r`n[아니오] 를 고르시면 이 버전은 다시 묻지 않습니다.`r`n그대로 쓰시다가 마음이 바뀌면 [설정] → [업데이트] 에서 받으실 수 있습니다." }
+    if ([System.Windows.Forms.MessageBox]::Show($body, '업데이트 설치', 'YesNo', 'Question') -ne 'Yes') {
+        if ($Auto) {
+            Set-ConfigValue 'SkipUpdateVersion' $tag
+            try { Save-Config $script:config } catch { }
+            Write-RunLog "업데이트 $tag 를 건너뜁니다. 시작할 때 다시 묻지 않습니다."
+            try { Show-UpdateState $Release '' } catch { }
+        }
+        return
+    }
     try {
         $script:form.Enabled = $false
         Set-StatusPill '업데이트 내려받는 중' 'run'
@@ -12016,6 +12336,9 @@ function Start-UpdateInstall([object]$Release) {
 }
 
 $btnCheckUpdate.Add_Click({
+    # 직접 누르신 것이므로 건너뛰기를 풀고 다시 물어봅니다.
+    Set-ConfigValue 'SkipUpdateVersion' ''
+    try { Save-Config $script:config } catch { }
     Set-StatusPill '업데이트 확인 중' 'run'
     Invoke-UpdateCheck $false
     Set-StatusPill '준비됨' 'idle'
@@ -12317,7 +12640,7 @@ $startupTimer.Add_Tick({
         Invoke-UpdateCheck $true
         # 새 버전이 있으면 확인 한 번으로 바로 받아 설치합니다.
         if ($null -ne $script:latestRelease -and [bool]$script:config.AutoDownloadUpdate) {
-            Start-UpdateInstall $script:latestRelease
+            Start-UpdateInstall $script:latestRelease $true
         }
     }
 })
@@ -12723,8 +13046,16 @@ public class ProbeDialogKiller {
     # 켜고 끄는 그 자리에서 오류가 난 적이 있어 여기서 따로 해 봅니다.
     try {
         $probeMultiWas = [bool]$script:chkMultiEnabled.Checked
-        foreach ($probeOn in @($true, $false, $probeMultiWas)) {
-            $script:chkMultiEnabled.Checked = $probeOn
+        try {
+            foreach ($probeOn in @($true, $false)) {
+                $script:chkMultiEnabled.Checked = $probeOn
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+        } finally {
+            # 도중에 잘못되어도 쓰시던 설정으로 되돌려 놓습니다.
+            # 예전에는 되돌리지 못해 이 PC 의 설정이 켜진 채로 남았고,
+            # 그 뒤 자체 점검이 다른 길로 돌아 엉뚱한 곳에서 걸렸습니다.
+            $script:chkMultiEnabled.Checked = $probeMultiWas
             [System.Windows.Forms.Application]::DoEvents()
         }
         $clicked++
