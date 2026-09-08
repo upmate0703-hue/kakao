@@ -4392,6 +4392,45 @@ function Test-ChatMessageLanded([object]$List, [string]$Before, [int]$TimeoutMs)
 # 창 메시지로 넣으면 전송 버튼이 노랗게 켜지기까지 하지만,
 # Enter 를 누르면 글을 지우고 보내지 않는 경우가 있습니다.
 # 그래서 실제 입력(붙여넣기, 키보드)을 먼저 쓰고, 창 메시지는 마지막에 씁니다.
+# 이 방식이 복사·붙여넣기인지 봅니다.
+function Test-PasteWay([string]$Way) {
+    return ($Way -eq '실제 붙여넣기' -or $Way -eq '창 붙여넣기')
+}
+
+# 전송 방식을 어떤 차례로 시도할지 정합니다.
+#
+# 규칙은 하나입니다. 복사·붙여넣기를 먼저, 직접 입력은 그것이 안 될 때만.
+# 카카오톡 없이도 시험할 수 있도록 규칙만 따로 떼어 두었습니다.
+function Get-SendWayOrder([string]$Preferred, [bool]$PasteFailed) {
+    $pasteWays = @('실제 붙여넣기', '창 붙여넣기')
+    $typeWays  = @('실제 키보드', '창 메시지')
+    # 한 번 통한 방법은 그 무리 안에서 맨 앞으로 옮깁니다. 무리 순서는 건드리지 않습니다.
+    if ($Preferred) {
+        if ($pasteWays -contains $Preferred) {
+            $pasteWays = @($Preferred) + @($pasteWays | Where-Object { $_ -ne $Preferred })
+        } elseif ($typeWays -contains $Preferred) {
+            $typeWays = @($Preferred) + @($typeWays | Where-Object { $_ -ne $Preferred })
+        }
+    }
+    if ($PasteFailed) { return (@($typeWays) + @($pasteWays)) }
+    return (@($pasteWays) + @($typeWays))
+}
+
+# 어느 방식으로 통했는지 적어 둡니다.
+# 붙여넣기로 통했으면 다음 방도 붙여넣기부터, 직접 입력으로 통했으면
+# 이번 실행 동안은 직접 입력부터 갑니다.
+function Set-SendWayResult([string]$Way) {
+    $script:preferredSendWay = $Way
+    if (Test-PasteWay $Way) {
+        $script:pasteFailed = $false
+        return
+    }
+    if (-not $script:pasteFailed) {
+        $script:pasteFailed = $true
+        Write-RunLog '복사·붙여넣기가 통하지 않아 직접 입력으로 바꿨습니다. (이번 실행 동안)'
+    }
+}
+
 function Add-ChatMessageText([object]$Chat, [object]$InputBox, [string]$Message, [string]$Way) {
     # 입력칸이 키보드 입력을 받는 상태여야 글이 들어가고 Enter 도 먹습니다.
     [void](Enter-ChatInputFocus $Chat $InputBox)
@@ -4466,12 +4505,15 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
     $script:lastSendProblem = ''
     $script:lastSendUnverified = $false
 
-    $ways = @('실제 붙여넣기', '실제 키보드', '창 붙여넣기', '창 메시지')
-    # 이 컴퓨터에서 한 번 통한 방법을 기억해 두었다가 다음 방부터 먼저 씁니다.
-    # 안 되는 방법을 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
-    if ($script:preferredSendWay -and ($ways -contains $script:preferredSendWay)) {
-        $ways = @($script:preferredSendWay) + @($ways | Where-Object { $_ -ne $script:preferredSendWay })
-    }
+    # 복사·붙여넣기를 먼저 씁니다.
+    # 한 번에 통째로 들어가서 빠르고, 긴 글이나 줄바꿈도 그대로 들어갑니다.
+    # 직접 입력은 글자를 하나씩 넣는 방식이라 느리고, 넣는 중에 사용자가
+    # 다른 창을 누르면 엉뚱한 곳에 글자가 들어갈 수 있습니다.
+    # 그래서 붙여넣기가 안 될 때만 직접 입력으로 바꿉니다.
+    # 이번 실행에서 붙여넣기가 통하지 않는 것으로 이미 판명되었으면 직접 입력부터 갑니다.
+    # 안 되는 것을 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
+    # 다음 실행에서는 다시 붙여넣기부터 해 봅니다. 그 사이에 사정이 달라질 수 있습니다.
+    $ways = @(Get-SendWayOrder $script:preferredSendWay ([bool]$script:pasteFailed))
     foreach ($way in $ways) {
         # 보내기 전 대화창 모습을 기억해 둡니다.
         # 보낸 뒤 이것과 견주어 글이 실제로 올라왔는지 확인합니다.
@@ -4509,6 +4551,7 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
             # 그래서 막지는 않되, '확인하지 못했다' 를 반드시 남깁니다.
             # 이것을 남기지 않으면 한 번도 확인하지 않고 전부 '발송 완료' 가 됩니다.
             if ([string]::IsNullOrEmpty($before)) {
+                Set-SendWayResult $way
                 $script:lastSendUnverified = $true
                 if (-not $script:sendVerifyNoted) {
                     $script:sendVerifyNoted = $true
@@ -4518,7 +4561,7 @@ function Send-ChatText([object]$Chat, [object]$InputBox, [string]$Message, [int]
                 return "$way + $press (확인 못 함)"
             }
             if (Test-ChatMessageLanded $list $before $tune.Landed) {
-                $script:preferredSendWay = $way
+                Set-SendWayResult $way
                 return "$way + $press"
             }
 
@@ -5134,6 +5177,9 @@ $script:lastSendProblem = ''
 # 그때 이 값이 참이 되고, 그 방은 '확인 못 함' 으로 남깁니다.
 $script:lastSendUnverified = $false
 $script:sendVerifyNoted = $false
+# 이번 실행에서 복사·붙여넣기가 통하지 않는 것으로 판명되었는지입니다.
+# 참이면 그 뒤로는 직접 입력부터 씁니다. 실행이 끝나면 다시 거짓으로 돌립니다.
+$script:pasteFailed = $false
 $script:roomRepairNote = ''
 $script:pendingSwap = ''
 $script:sendMethodLogged = ''
@@ -6384,6 +6430,9 @@ function Invoke-Broadcast([string[]]$Targets = $null, [bool]$Resume = $false) {
         $script:runStartedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
     $script:trackDelivery = $true
+    # 실행을 시작할 때마다 다시 복사·붙여넣기부터 해 봅니다.
+    # 지난 실행에서 안 됐다고 이번에도 안 된다는 법은 없습니다.
+    $script:pasteFailed = $false
     $script:runClock = [System.Diagnostics.Stopwatch]::StartNew()
     Save-RunProgress $content
 
@@ -7486,7 +7535,63 @@ if ($SelfTest) {
         $script:runStats = @{ Photos = 0; Files = 0; Messages = 0 }
     }
     }
-    # ----- 보낸 것을 확인하지 못했을 때 -----
+    # ----- 복사·붙여넣기를 먼저, 직접 입력은 안 될 때만 -----
+    # 붙여넣기는 한 번에 통째로 들어가서 빠르고 긴 글도 그대로 들어갑니다.
+    # 직접 입력은 글자를 하나씩 넣어 느리고, 넣는 중에 다른 창을 누르면
+    # 엉뚱한 곳에 글자가 들어갑니다. 그래서 붙여넣기가 안 될 때만 씁니다.
+    $wayFirst = @(Get-SendWayOrder '' $false)
+    if ($wayFirst.Count -ne 4) { throw "전송 방식이 4가지가 아닙니다: $($wayFirst.Count)" }
+    if (-not (Test-PasteWay $wayFirst[0])) { throw "맨 처음이 붙여넣기가 아닙니다: $($wayFirst[0])" }
+    if (-not (Test-PasteWay $wayFirst[1])) { throw "두 번째가 붙여넣기가 아닙니다: $($wayFirst[1])" }
+    if (Test-PasteWay $wayFirst[2]) { throw "직접 입력이 붙여넣기보다 먼저 옵니다: $($wayFirst -join ' > ')" }
+
+    # 어느 방에서 키보드가 한 번 통했다고 해서 다음 방을 키보드부터 하면 안 됩니다.
+    # 예전에는 그랬습니다. 한 번 통한 방법을 무리와 상관없이 맨 앞으로 옮겼습니다.
+    $wayAfterType = @(Get-SendWayOrder '실제 키보드' $false)
+    if (-not (Test-PasteWay $wayAfterType[0])) {
+        throw "키보드로 한 번 통했다고 다음 방까지 키보드부터 합니다: $($wayAfterType -join ' > ')"
+    }
+    if ($wayAfterType[2] -ne '실제 키보드') {
+        throw "직접 입력 무리 안에서 통한 방법이 앞으로 오지 않았습니다: $($wayAfterType -join ' > ')"
+    }
+
+    # 붙여넣기 무리 안에서는 통한 방법이 앞으로 와야 합니다.
+    $wayAfterPaste = @(Get-SendWayOrder '창 붙여넣기' $false)
+    if ($wayAfterPaste[0] -ne '창 붙여넣기') {
+        throw "붙여넣기 무리 안에서 통한 방법이 앞으로 오지 않았습니다: $($wayAfterPaste -join ' > ')"
+    }
+
+    # 붙여넣기가 통하지 않는 것으로 판명되면 그때는 직접 입력부터 갑니다.
+    # 안 되는 것을 방마다 다시 시도하면 방 300개에서 몇 분을 그냥 버립니다.
+    $wayGaveUp = @(Get-SendWayOrder '' $true)
+    if (Test-PasteWay $wayGaveUp[0]) {
+        throw "붙여넣기가 안 되는데도 계속 붙여넣기부터 합니다: $($wayGaveUp -join ' > ')"
+    }
+    # 그래도 네 가지를 다 남겨 두어야 합니다. 마지막 기회까지 버리면 안 됩니다.
+    if ($wayGaveUp.Count -ne 4) { throw "붙여넣기 방식을 목록에서 아예 빼 버렸습니다: $($wayGaveUp -join ' > ')" }
+
+    # 확인 전용은 방만 열어 보고 아무것도 보내지 않습니다.
+    # 그런데 실패가 없으면 결과 창이 아예 뜨지 않아, 실제로 보낸 것과
+    # 화면상 구분이 되지 않았습니다. 그래서 며칠이고 보냈다고 믿게 됩니다.
+    #
+    # 결과 창을 띄울지 가르는 조건에 확인 전용이 들어 있어야 합니다.
+    $dryProbe = [pscustomobject]@{ Total = 3; Sent = 3; Failed = 0; Missing = 0; DryRun = $true }
+    $liveProbe = [pscustomobject]@{ Total = 3; Sent = 3; Failed = 0; Missing = 0; DryRun = $false }
+    $dryRule = { param($r) return ($r.Failed -gt 0 -or $r.Missing -ne 0 -or [bool]$r.DryRun) }
+    if (-not (& $dryRule $dryProbe)) {
+        throw '확인 전용으로 다 끝나면 아무 창도 뜨지 않습니다 (보낸 줄 알게 됩니다)'
+    }
+    if (& $dryRule $liveProbe) {
+        throw '잘 끝난 실제 발송에까지 창을 띄웁니다'
+    }
+    # 방마다 붙는 말도 갈려야 합니다.
+    $dryContent = [pscustomobject]@{ DryRun = $true }
+    $liveContent = [pscustomobject]@{ DryRun = $false }
+    if ((Get-SentNote $dryContent '아무방') -notmatch '보내지 않았습니다') {
+        throw '확인 전용인데 방 상태 칸에 그렇게 적히지 않습니다'
+    }
+    if ((Get-SentNote $liveContent '아무방') -ne '') { throw '실제 발송에 군더더기가 붙었습니다' }
+
     # 컴퓨터에 따라 카카오톡 창 그림을 뜨지 못합니다. 그러면 견줄 것이 없어
     # 글이 올라왔는지 확인할 수 없습니다.
     #
@@ -11444,7 +11549,13 @@ function Confirm-LiveRun([string]$Action) {
             if ([System.Windows.Forms.MessageBox]::Show($body, '발송 제한 확인', 'YesNo', 'Warning') -ne 'Yes') { return $false }
         }
     }
-    if ([bool]$script:config.DryRun) { return $true }
+    if ([bool]$script:config.DryRun) {
+        # 확인 전용은 아무것도 보내지 않습니다.
+        # 확인 창을 꺼 두신 분은 이 사실을 볼 기회가 아예 없었습니다.
+        $dryAsk = "지금은 확인 전용입니다.`r`n`r`n방만 열어 보고 아무것도 보내지 않습니다.`r`n`r`n" +
+                  "· [예] 확인 전용으로 진행합니다.`r`n· [아니오] 그만두고 [실제 발송] 으로 바꿉니다."
+        return ([System.Windows.Forms.MessageBox]::Show($dryAsk, '확인 전용 — 보내지 않습니다', 'YesNo', 'Warning') -eq 'Yes')
+    }
     # 확인 창을 껐다면 여기서 마지막으로 한 번만 묻습니다.
     if ([bool]$script:config.SkipSendConfirm) {
         $roomCount = @($script:config.Rooms).Count
@@ -11759,7 +11870,12 @@ function Start-BroadcastAsync([string[]]$Targets = $null, [bool]$Resume = $false
         if ($null -ne $r -and ($r.Failed -gt 0 -or $r.Missing -ne 0)) {
             Set-StatusPill "완료 · 성공 $($r.Sent) · 실패 $($r.Failed)" 'error'
         } else {
-            Set-StatusPill "완료 · 성공 $($count)개" 'done'
+            if ([bool]$script:config.DryRun) {
+                # '완료 · 성공' 이라고만 적으면 보낸 줄 알게 됩니다.
+                Set-StatusPill "확인 전용 완료 · 보내지 않았습니다 ($($count)개 방 확인)" 'error'
+            } else {
+                Set-StatusPill "완료 · 성공 $($count)개" 'done'
+            }
         }
     } catch {
         $failText = [string]$_.Exception.Message
@@ -11894,10 +12010,18 @@ function Write-RunResultLog {
 function Show-RunResult {
     $r = $script:lastRunResult
     if ($null -eq $r) { return }
-    $needAttention = ($r.Failed -gt 0 -or $r.Missing -ne 0)
+    # 확인 전용은 아무것도 보내지 않습니다. 그런데 실패가 없으면 아무 창도 뜨지 않아
+    # 실제로 보낸 것과 화면상 구분이 되지 않았습니다. 그래서 며칠이고 보냈다고
+    # 믿게 됩니다. 확인 전용으로 끝났으면 잘 끝났더라도 반드시 알립니다.
+    $needAttention = ($r.Failed -gt 0 -or $r.Missing -ne 0 -or [bool]$r.DryRun)
     if (-not $needAttention) { return }
 
     $lines = @()
+    if ([bool]$r.DryRun) {
+        $lines += '확인 전용이라 아무것도 보내지 않았습니다.'
+        $lines += '실제로 보내시려면 [3. 보내기] 화면에서 [실제 발송] 을 골라 주세요.'
+        $lines += ''
+    }
     $lines += "전체 대상: $($r.Total)개"
     $lines += "성공:      $($r.Sent)개"
     $lines += "실패:      $($r.Failed)개"
@@ -12636,6 +12760,23 @@ $startupTimer.Add_Tick({
     $startupTimer.Stop()
     try { [void](Update-KakaoStateLabel) } catch { }
     try { Update-LimitStateLabel } catch { }
+    # 확인 전용은 설정에 저장되어 껐다 켜도 그대로 남습니다.
+    # 그 상태로는 무엇을 눌러도 한 통도 나가지 않는데, 화면은 '완료' 라고만 합니다.
+    # 켤 때 한 번 짚어 드립니다. 여기서 바로 실제 발송으로 바꿀 수 있습니다.
+    try {
+        if ([bool]$script:config.DryRun) {
+            $dryBody = "지금은 확인 전용으로 되어 있습니다.`r`n`r`n" +
+                       "방만 열어 보고 아무것도 보내지 않습니다. 예약 발송도 나가지 않습니다.`r`n`r`n" +
+                       "· [예] 지금 [실제 발송] 으로 바꿉니다.`r`n· [아니오] 확인 전용 그대로 둡니다."
+            if ([System.Windows.Forms.MessageBox]::Show($dryBody, '확인 전용입니다 — 보내지 않습니다', 'YesNo', 'Warning') -eq 'Yes') {
+                $script:rdoLive.Checked = $true
+                Sync-ConfigFromForm
+                Write-RunLog '확인 전용을 실제 발송으로 바꿨습니다.'
+            } else {
+                Write-RunLog '확인 전용 그대로 둡니다. 이 상태에서는 아무것도 보내지 않습니다.'
+            }
+        }
+    } catch { }
     if (-not $NoUpdateCheck -and [bool]$script:config.AutoCheckUpdate) {
         Invoke-UpdateCheck $true
         # 새 버전이 있으면 확인 한 번으로 바로 받아 설치합니다.
