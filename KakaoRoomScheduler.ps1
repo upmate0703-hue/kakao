@@ -91,6 +91,24 @@ public static class NativeKakao {
     // 이것을 안 하면 스크립트로 실행할 때 파워셸 아이콘으로 묶여 버립니다.
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern int SetCurrentProcessExplicitAppUserModelID(string appID);
     public static void SetAppId(string appID) { try { SetCurrentProcessExplicitAppUserModelID(appID); } catch { } }
+    // 보내는 동안 컴퓨터가 잠들지 않게 합니다.
+    // 밤새 예약 발송을 걸어 두면 화면이 꺼지고 컴퓨터가 절전으로 들어가
+    // 보내던 중간에 그대로 멈춰 버립니다.
+    // ES_CONTINUOUS(0x80000000) 는 '다음에 풀 때까지 계속' 이라는 뜻입니다.
+    // ES_SYSTEM_REQUIRED(0x00000001) 는 '컴퓨터를 재우지 마라',
+    // ES_DISPLAY_REQUIRED(0x00000002) 는 '화면도 끄지 마라' 입니다.
+    // 화면 인식으로 글자를 읽으므로 화면도 살아 있어야 합니다.
+    [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+    const uint ES_CONTINUOUS = 0x80000000u;
+    const uint ES_SYSTEM_REQUIRED = 0x00000001u;
+    const uint ES_DISPLAY_REQUIRED = 0x00000002u;
+    public static void KeepAwake(bool on) {
+        try {
+            if (on) { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED); }
+            else { SetThreadExecutionState(ES_CONTINUOUS); }
+        } catch { }
+    }
+
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int virtualKey);
@@ -154,7 +172,16 @@ public static class NativeKakao {
     }
 
     // 지금 화면의 DPI 입니다. 96 이 100% 입니다.
+    //
+    // GetDeviceCaps 는 프로그램이 배율을 어떻게 인식하느냐에 따라 값이 달라집니다.
+    // GetDpiForSystem 은 그와 상관없이 늘 시스템 배율을 돌려주므로 이것을 먼저 씁니다.
+    // (윈도우 10 1607 부터 있습니다. 없으면 예전 방식으로 돌아갑니다)
+    [DllImport("user32.dll")] static extern uint GetDpiForSystem();
     public static int GetSystemDpi() {
+        try {
+            uint viaSystem = GetDpiForSystem();
+            if (viaSystem >= 72 && viaSystem <= 480) { return (int)viaSystem; }
+        } catch { }
         IntPtr dc = GetDC(IntPtr.Zero);
         if (dc == IntPtr.Zero) { return 96; }
         int dpi = GetDeviceCaps(dc, 88);
@@ -339,9 +366,18 @@ public static class NativeKakao {
         }
     }
 
+    // 이모지는 속으로 두 칸이 한 글자입니다.
+    // 예전처럼 한 칸씩 따로 보내면 카카오톡이 그 사이에 화면을 갱신해 버려
+    // 이모지가 깨지거나 검색이 엉뚱하게 걸렸습니다.
+    // 두 칸짜리 글자는 사이를 두지 않고 붙여 보냅니다.
     public static void TypeText(IntPtr hWnd, string text) {
-        foreach (char c in text) {
+        for (int i = 0; i < text.Length; i++) {
+            char c = text[i];
             PostMessageW(hWnd, WM_CHAR, (IntPtr)c, (IntPtr)1);
+            if (char.IsHighSurrogate(c) && i + 1 < text.Length) {
+                i++;
+                PostMessageW(hWnd, WM_CHAR, (IntPtr)text[i], (IntPtr)1);
+            }
             System.Threading.Thread.Sleep(6);
         }
     }
@@ -509,6 +545,37 @@ public static class FastImage {
         return (double)yellow / (double)total;
     }
 
+    // PrintWindow 가 창 크기보다 '작게' 그려 주는 경우가 있습니다.
+    // 모니터마다 배율이 다를 때(예: 노트북 150% + 외부 모니터 100%) 그렇습니다.
+    // 그러면 그림 오른쪽과 아래쪽이 통째로 빈 색으로 남고,
+    // 그림 위의 좌표를 화면 좌표로 그대로 쓰면 엉뚱한 곳을 누르게 됩니다.
+    //
+    // 여기서는 '실제로 그려진 부분이 어디까지인지' 를 재서 돌려줍니다.
+    // 오른쪽 아래 구석 색을 '안 그려진 색' 으로 보고, 그 색이 아닌 픽셀이
+    // 마지막으로 나오는 가로줄·세로줄을 찾습니다.
+    public static int[] ContentExtent(Bitmap bitmap) {
+        int w = bitmap.Width, h = bitmap.Height;
+        if (w <= 0 || h <= 0) { return new int[] { 0, 0 }; }
+        var rect = new Rectangle(0, 0, w, h);
+        int stride;
+        int[] pixels = ReadRows(bitmap, rect, out stride);
+        int bg = pixels[(h - 1) * stride + (w - 1)];
+        int lastCol = -1;
+        for (int x = w - 1; x >= 0 && lastCol < 0; x--) {
+            for (int y = 0; y < h; y++) {
+                if (pixels[y * stride + x] != bg) { lastCol = x; break; }
+            }
+        }
+        int lastRow = -1;
+        for (int y = h - 1; y >= 0 && lastRow < 0; y--) {
+            int rowStart = y * stride;
+            for (int x = 0; x < w; x++) {
+                if (pixels[rowStart + x] != bg) { lastRow = y; break; }
+            }
+        }
+        return new int[] { lastCol + 1, lastRow + 1 };
+    }
+
     // 지정한 영역에서 어두운 픽셀 비율을 돌려줍니다. 탭 선택 여부 판별에 씁니다.
     public static double DarkRatio(Bitmap bitmap, int left, int top, int right, int bottom, double threshold) {
         if (left < 0) left = 0;
@@ -632,6 +699,8 @@ $script:statusKind = 'idle'
 $script:pillStatus = $null
 $script:hoverNav = ''
 $script:selectedKakaoProcessId = 0
+# 카카오톡 번호를 새로 매겼다고 이미 알렸는지 적어 둡니다. 같은 말을 되풀이하지 않으려고요.
+$script:instanceRenumberNoted = $false
 $script:lastTabRatios = ''
 $script:activeKakaoWindow = $null
 
@@ -723,6 +792,10 @@ function New-DefaultConfig {
         RoomKinds = [pscustomobject]@{}
         AutoCheckUpdate = $true
         TourDone = $false
+        # 카카오톡을 여러 개 켤 때 어느 창이 몇 번인지 적어 둡니다.
+        # 여기에 적어 두어야 껐다 켜도 번호가 그대로 유지됩니다.
+        #   Index(번호) / Tag(실행 파일 경로) / Pid(그때의 실행 번호)
+        InstanceMap = @()
         Calibration = [pscustomobject]@{
             SearchIconOffset = 0
         }
@@ -857,7 +930,9 @@ function Repair-RoomNames([object]$Config) {
     $Config.Groups = $newGroups
 
     $Config.KnownRooms = @($names)
-    $Config.Rooms = @($names | Where-Object { $picked[(ConvertTo-CompareKey $_)] })
+    # 넣을 때 쓴 열쇠와 꺼낼 때 쓴 열쇠가 달라서, 이름에 빈칸·기호·이모지가
+    # 하나라도 있으면 고른 표시가 켤 때마다 사라졌습니다. 같은 열쇠를 씁니다.
+    $Config.Rooms = @($names | Where-Object { $picked[(ConvertTo-ExactKey $_)] })
     $script:roomRepairNote = ''
     if ($cleaned -gt 0 -or $merged -gt 0) {
         $script:roomRepairNote = "채팅방 목록을 정리했습니다: 이름 다듬음 $($cleaned)개 · 같은 방 합침 $($merged)개"
@@ -1353,8 +1428,14 @@ function Get-KakaoMainWindows {
     return @($found | Sort-Object -Property ProcessId, Handle)
 }
 
+# 창 고르기 안내에 쓰는 이름입니다.
+# 실행 번호(PID)만 보여 주면 사용자가 어느 계정인지 알 수 없습니다.
+# 방 목록에 적히는 '카카오톡 N' 과 같은 번호를 함께 보여 줍니다.
 function Get-KakaoInstanceLabel([object]$Instance) {
     $state = if ($Instance.Minimized) { '최소화됨' } else { '사용 가능' }
+    $number = 0
+    try { $number = Get-InstanceIndexOf ([int]$Instance.ProcessId) (Get-KakaoInstances) } catch { }
+    if ($number -ge 1) { return "카카오톡 $number (실행번호 $($Instance.ProcessId), $state)" }
     return "카카오톡 #$($Instance.ProcessId) ($state)"
 }
 
@@ -1365,6 +1446,28 @@ function Find-KakaoMainHandle {
     if ($script:selectedKakaoProcessId -gt 0) {
         $chosen = @($instances | Where-Object { $_.ProcessId -eq $script:selectedKakaoProcessId })
         if ($chosen.Count -gt 0) { return $chosen[0].Handle }
+    }
+    # 카카오톡이 하나뿐이면 더 따질 것이 없습니다. (거의 모든 경우입니다)
+    if ($instances.Count -eq 1) { return $instances[0].Handle }
+
+    # 고른 것이 없으면 '카카오톡 1번' 부터 씁니다.
+    # 예전에는 실행 번호(PID)가 작은 창을 썼는데, 그 순서는 우리가 매긴
+    # 카카오톡 번호와 아무 상관이 없습니다. 그래서 1번 계정의 방을
+    # 2번 계정 창에서 찾는 일이 생겼습니다.
+    $numbered = @()
+    try { $numbered = @(Get-KakaoInstances | Sort-Object -Property Index) } catch { }
+    foreach ($one in $numbered) {
+        foreach ($window in $instances) {
+            if ($window.ProcessId -ne $one.ProcessId) { continue }
+            if ($window.Minimized) { continue }
+            return $window.Handle
+        }
+    }
+    # 전부 최소화되어 있으면 번호가 가장 작은 창을 씁니다.
+    foreach ($one in $numbered) {
+        foreach ($window in $instances) {
+            if ($window.ProcessId -eq $one.ProcessId) { return $window.Handle }
+        }
     }
     $usable = @($instances | Where-Object { -not $_.Minimized })
     if ($usable.Count -gt 0) { return $usable[0].Handle }
@@ -1408,6 +1511,20 @@ function Enter-KakaoForeground([object]$Window) {
 # 이 이름과 위치를 실시간으로 읽어 클릭 좌표를 스스로 계산하므로,
 # 사용자가 좌표를 지정할 필요가 없습니다.
 function Get-KakaoLayout([object]$MainWindow) {
+    # 카카오톡이 그 사이에 꺼지거나 다시 시작되면 창을 못 찾아 $null 이 들어옵니다.
+    # 예전에는 없는 창의 값을 읽다가 그 자리에서 오류가 나서, 발송 회차가 통째로
+    # 멈추고 예약까지 같이 꺼졌습니다. 부르는 곳이 여덟 군데라 여기서 한 번에 막습니다.
+    # 빈 배치를 돌려주면 부르는 쪽의 'List 가 없으면 그만둔다' 검사가 그대로 걸립니다.
+    if ($null -eq $MainWindow) {
+        return [pscustomobject]@{
+            Main = $null
+            List = $null
+            SearchRow = $null
+            ViewName = ''
+            IsChatList = $false
+            IsOpenChatList = $false
+        }
+    }
     $children = @([NativeKakao]::GetChildWindows($MainWindow.Handle))
 
     $view = @($children | Where-Object {
@@ -1641,6 +1758,10 @@ function Open-KakaoSearchBox([object]$Layout, [object[]]$Words) {
 # 양쪽 모두에서 떼어 내고 글자와 숫자만으로 견줍니다.
 function ConvertTo-CompareKey([string]$Text) {
     $clean = ([string]$Text) -replace '[^0-9A-Za-z가-힣]', ''
+    # 이모지나 기호만으로 된 이름은 위 규칙을 거치면 아무것도 안 남습니다.
+    # 빈 열쇠는 어디에도 맞지 않아서, 그런 방은 영영 못 찾고 검색도 안 됐습니다.
+    # 그때는 빈칸만 지운 원래 글자를 씁니다.
+    if (-not $clean) { $clean = ([string]$Text) -replace '\s', '' }
     return $clean.ToLowerInvariant()
 }
 
@@ -1869,7 +1990,10 @@ function Test-RoomTitle([string]$Actual, [string]$Expected) {
     $a = ([string]$Actual).Trim()
     $e = ([string]$Expected).Trim()
     if (-not $a -or -not $e) { return $false }
-    if ($a -eq $e) { return $true }
+    # -eq 는 이모지 뒤의 변형표시(U+FE0F)나 잇는 글자(ZWJ)를 없는 셈 칩니다.
+    # 그래서 '홍보방' 뒤에 붙은 하트의 모양이 달라도 같은 방이 되어
+    # 엉뚱한 방으로 나갔습니다. 아래 엄격 비교를 켜 두어도 이 줄에서 먼저 통과했습니다.
+    if (Test-NameEquals $a $e) { return $true }
     if ($script:strictTitleMatch) {
         # 정확히 같을 때만 맞다고 봅니다. 인원수만 떼어 내고 글자는 그대로 견줍니다.
         return (Test-NameEquals (Get-RoomTitleName $a) (ConvertTo-ExactKey $e))
@@ -1908,8 +2032,16 @@ function Test-RoomTitle([string]$Actual, [string]$Expected) {
     return $true
 }
 
+# 이름으로 열려 있는 채팅방 창을 찾습니다.
+# 카카오톡이 여럿일 때 이름만 보고 고르면 다른 계정의 같은 이름 방이 걸립니다.
+# 그래서 기준이 되는 메인 창과 같은 카카오톡 안에서만 찾습니다.
 function Find-ChatWindow([string]$Room, [IntPtr]$MainHandle) {
+    $ownerPid = 0
+    if ($MainHandle -ne [IntPtr]::Zero) {
+        try { $ownerPid = [int][NativeKakao]::GetProcessId($MainHandle) } catch { $ownerPid = 0 }
+    }
     foreach ($process in (Get-KakaoProcesses)) {
+        if ($ownerPid -gt 0 -and [int]$process.Id -ne $ownerPid) { continue }
         foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
             if (-not $window.Visible -or $window.Handle -eq $MainHandle) { continue }
             if (Test-RoomTitle $window.Title $Room) { return $window }
@@ -2135,8 +2267,17 @@ function ConvertTo-RoomCandidate([string]$RawName) {
     if ($parts.Count -eq 0) { return $null }
     $wasTruncated = ($parts[0] -match '[…⋯]\s*$')
     $name = Remove-RoomNameNoise $parts[0]
-    if ($name.Length -lt 2 -or $name.Length -gt 60) { return $null }
-    if ($name -notmatch '[0-9A-Za-z가-힣]') { return $null }
+    if ($name.Length -lt 2) { return $null }
+    # 길이는 눈에 보이는 글자 수로 셉니다.
+    # 이모지는 속으로 두 칸을 차지해서, 그냥 세면 이모지가 많은 이름이 억울하게 잘립니다.
+    $visibleLength = $name.Length
+    try { $visibleLength = (New-Object System.Globalization.StringInfo($name)).LengthInTextElements } catch { }
+    if ($visibleLength -gt 60) { return $null }
+    # 글자가 하나도 없는 이름을 버릴 때, 예전에는 이모지까지 같이 버렸습니다.
+    # 그래서 '❤️🔥' 같은 방은 목록에 아예 들어오지 못했습니다.
+    # 이제는 점·줄표 같은 '부호' 뿐일 때만 화면 인식 찌꺼기로 보고 버립니다.
+    # ★ 나 이모지 같은 그림 문자는 진짜 방 이름에 흔히 쓰이므로 남깁니다.
+    if ($name -notmatch '[0-9A-Za-z가-힣]' -and $name -match '^[\s\p{P}\p{Sm}]+$') { return $null }
     if ($name -match '^\d{1,2}:\d{2}$') { return $null }
     if ($name -match '^\d+$') { return $null }
     if ($name -match '^(오전|오후)\s*\d') { return $null }
@@ -2377,7 +2518,10 @@ function Initialize-Ocr {
 
 function Wait-WinRt($Operation, $ResultType) {
     $task = $script:awaitAsTask.MakeGenericMethod($ResultType).Invoke($null, @($Operation))
-    [void]$task.Wait(-1)
+    # 끝없이 기다리면 프로그램 전체가 그 자리에서 굳습니다.
+    # 화면이 잠기거나 메모리가 모자랄 때 실제로 그렇게 멈춥니다.
+    # 밤새 돌리다 '응답 없음' 으로 굳어 있던 까닭입니다.
+    if (-not $task.Wait(20000)) { throw '문자 인식이 20초 안에 끝나지 않았습니다.' }
     return $task.Result
 }
 
@@ -2395,21 +2539,128 @@ function Test-ImageBlank([System.Drawing.Bitmap]$Bitmap) {
     }
 }
 
+# 같은 말을 회차마다 되풀이하지 않으려고 한 번 알렸는지 적어 둡니다.
+$script:screenShotNoted = $false
+$script:captureBlankNoted = $false
+$script:captureScaleNoted = $false
+
+# 그림이 창 크기보다 작게 그려졌으면 창 크기에 맞춰 늘립니다.
+#
+# 이렇게 해 두면 그림 위의 좌표를 그대로 화면 좌표로 쓸 수 있어,
+# 이 그림을 쓰는 모든 곳(탭 찾기·줄 클릭·아이콘 찾기)이 한꺼번에 맞습니다.
+# 부르는 곳마다 배율을 곱하는 것보다 안전합니다.
+#
+# 함부로 손대지 않도록 조건을 좁게 걸었습니다.
+#   · 가로·세로 모두 5% 넘게 모자라야 하고
+#   · 가로와 세로가 거의 같은 비율로 모자라야 하며
+#   · 그 비율이 실제 윈도우 배율(125·150·175·200%)에서 나오는 값이어야 합니다
+# 셋 다 맞을 때만 손댑니다. 그러지 않으면 그림을 그대로 돌려줍니다.
+# 늘려야 하는 상황인지만 따집니다.
+# 그림 없이 숫자만으로 판단하므로 따로 시험해 볼 수 있습니다.
+#   · 가로·세로 모두 5% 넘게 모자라야 하고
+#   · 가로와 세로가 거의 같은 비율로 모자라야 하며
+#   · 그 비율이 실제 윈도우 배율에서 나오는 값이어야 합니다
+#     96/120=0.800(125%) · 96/144=0.667(150%) · 96/168=0.571(175%) · 96/192=0.500(200%)
+function Test-CaptureNeedsScale([int]$ContentW, [int]$ContentH, [int]$FullW, [int]$FullH) {
+    if ($ContentW -le 0 -or $ContentH -le 0 -or $FullW -le 0 -or $FullH -le 0) { return $false }
+    $ratioW = $ContentW / [double]$FullW
+    $ratioH = $ContentH / [double]$FullH
+    if ($ratioW -gt 0.95 -or $ratioH -gt 0.95) { return $false }
+    if ([Math]::Abs($ratioW - $ratioH) -gt 0.06) { return $false }
+    foreach ($one in @(0.800, 0.667, 0.571, 0.500)) {
+        # 늘어난 크기는 픽셀 단위로 딱 떨어지므로 오차 여유는 조금이면 됩니다.
+        # 넓게 잡으면 여백이 넓은 멀쩡한 화면까지 늘려 버립니다.
+        if ([Math]::Abs($ratioW - $one) -le 0.02) { return $true }
+    }
+    return $false
+}
+
+function Repair-CaptureScale([System.Drawing.Bitmap]$Bitmap, [int]$FullW, [int]$FullH) {
+    if ($null -eq $Bitmap -or $FullW -le 0 -or $FullH -le 0) { return $Bitmap }
+    $extent = $null
+    try { $extent = [FastImage]::ContentExtent($Bitmap) } catch { return $Bitmap }
+    if ($null -eq $extent -or $extent.Length -lt 2) { return $Bitmap }
+    $contentW = [int]$extent[0]
+    $contentH = [int]$extent[1]
+    if ($contentW -le 0 -or $contentH -le 0) { return $Bitmap }
+
+    if (-not (Test-CaptureNeedsScale $contentW $contentH $FullW $FullH)) { return $Bitmap }
+    $ratioW = $contentW / [double]$FullW
+
+    $bigger = $null
+    try {
+        $bigger = New-Object System.Drawing.Bitmap($FullW, $FullH)
+        $painter = [System.Drawing.Graphics]::FromImage($bigger)
+        try {
+            $painter.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $painter.DrawImage($Bitmap,
+                (New-Object System.Drawing.Rectangle(0, 0, $FullW, $FullH)),
+                (New-Object System.Drawing.Rectangle(0, 0, $contentW, $contentH)),
+                [System.Drawing.GraphicsUnit]::Pixel)
+        } finally { $painter.Dispose() }
+    } catch {
+        if ($null -ne $bigger) { try { $bigger.Dispose() } catch { } }
+        return $Bitmap
+    }
+    if (-not $script:captureScaleNoted) {
+        $script:captureScaleNoted = $true
+        Write-RunLog ("카카오톡 그림이 창보다 작게 그려져 {0}% 로 늘려 맞췄습니다. (모니터마다 배율이 다를 때 생깁니다)" -f [int][Math]::Round(100 / $ratioW))
+    }
+    $Bitmap.Dispose()
+    return $bigger
+}
+
 # PrintWindow 는 창이 가려져 있거나 뒤에 있어도 내용을 그려 줍니다.
 # 다만 첫 호출은 아직 그려지지 않은 빈 화면을 돌려주는 경우가 있어 비면 다시 시도합니다.
 function Get-WindowImage([object]$Window) {
+    $w = 0
+    $h = 0
+    try { $w = [int]$Window.Width; $h = [int]$Window.Height } catch { }
+    # 창이 닫혔거나 그 창이 있던 모니터가 빠지면 크기가 0 이 됩니다.
+    # 예전에는 여기서 그림 만들기가 그대로 터져 훑기가 통째로 멈췄습니다.
+    # 1x1 빈 그림을 돌려주면 부르는 쪽이 '빈 화면' 으로 보고 스스로 물러납니다.
+    if ($w -le 0 -or $h -le 0) { return (New-Object System.Drawing.Bitmap(1, 1)) }
+
     $bitmap = $null
     for ($attempt = 0; $attempt -lt 3; $attempt++) {
         if ($null -ne $bitmap) { $bitmap.Dispose() }
-        $bitmap = New-Object System.Drawing.Bitmap($Window.Width, $Window.Height)
+        $bitmap = New-Object System.Drawing.Bitmap($w, $h)
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
         try {
             $hdc = $graphics.GetHdc()
             try { [void][NativeKakao]::PrintWindow($Window.Handle, $hdc, 2) }
             finally { $graphics.ReleaseHdc($hdc) }
         } finally { $graphics.Dispose() }
-        if (-not (Test-ImageBlank $bitmap)) { return $bitmap }
+        if (-not (Test-ImageBlank $bitmap)) { return (Repair-CaptureScale $bitmap $w $h) }
         Start-Sleep -Milliseconds 200
+    }
+
+    # 여기까지 왔으면 PrintWindow 가 빈 화면만 주고 있습니다.
+    # 그래픽 카드와 모니터 조합에 따라 실제로 그렇습니다.
+    # 특히 보조 모니터에 놓인 창에서 자주 그렇습니다.
+    # 그때는 화면에 보이는 그대로를 떠 옵니다.
+    # 창이 다른 창에 가려져 있으면 가린 것이 찍히지만, 아무것도 못 읽는 것보다 낫습니다.
+    try {
+        $shot = New-Object System.Drawing.Bitmap($w, $h)
+        $painter = [System.Drawing.Graphics]::FromImage($shot)
+        try {
+            $painter.CopyFromScreen([int]$Window.Rect.Left, [int]$Window.Rect.Top, 0, 0,
+                (New-Object System.Drawing.Size($w, $h)))
+        } finally { $painter.Dispose() }
+        if (-not (Test-ImageBlank $shot)) {
+            if (-not $script:screenShotNoted) {
+                $script:screenShotNoted = $true
+                Write-RunLog '창 그림을 뜨지 못해 화면을 직접 떴습니다. (보조 모니터·그래픽 카드 조합에서 생깁니다)'
+            }
+            $bitmap.Dispose()
+            return $shot
+        }
+        $shot.Dispose()
+    } catch { }
+
+    if (-not $script:captureBlankNoted) {
+        $script:captureBlankNoted = $true
+        Write-RunLog '창 그림이 계속 비어 있습니다. 카카오톡 창이 다른 모니터에 있거나 가려져 있지 않은지 봐 주세요.'
     }
     return $bitmap
 }
@@ -2436,6 +2687,8 @@ function Get-OcrLines([object]$Window, [int]$Scale = 2) {
     $source = Get-WindowImage $Window
     $scaled = $null
     $stream = $null
+    $random = $null
+    $software = $null
     try {
         if (Test-ImageBlank $source) { return @() }
         $scaled = New-Object System.Drawing.Bitmap(($source.Width * $Scale), ($source.Height * $Scale))
@@ -2469,7 +2722,18 @@ function Get-OcrLines([object]$Window, [int]$Scale = 2) {
             }
         }
         return $lines
+    } catch {
+        # 화면 글자 인식은 이따금 실패합니다. 메모리가 모자라거나, 화면이 잠기거나,
+        # 인식이 제 시간에 끝나지 않을 때입니다. 여기서 오류를 그대로 올리면
+        # 발송 회차가 통째로 멈추고 예약까지 같이 꺼졌습니다.
+        # 이 화면만 못 읽은 것으로 보고 넘어갑니다. 부르는 쪽은 빈 결과를 이미 다룹니다.
+        Write-RunLog ('화면 글자 인식에 실패해 이 화면은 건너뜁니다: ' + $_.Exception.Message)
+        return @()
     } finally {
+        # 아래 둘은 예전에 그냥 두고 나왔습니다. 밤새 여러 회차를 돌리면
+        # 조금씩 쌓여 메모리를 갉아먹었습니다.
+        if ($null -ne $software) { try { $software.Dispose() } catch { } }
+        if ($null -ne $random) { try { $random.Dispose() } catch { } }
         if ($null -ne $scaled) { $scaled.Dispose() }
         if ($null -ne $stream) { $stream.Dispose() }
         $source.Dispose()
@@ -2855,13 +3119,80 @@ function Get-OpenChatRoomsCached([int]$MaxAgeMs = 3000) {
 # 실제로 보낼 때는 언제나 창 제목을 다시 확인합니다.
 
 # 지금 켜져 있는 카카오톡을 셉니다.
+# 이 카카오톡을 다시 알아볼 표식입니다.
+# 계정을 나눠 쓰려면 대개 실행 파일을 복사하거나 다른 폴더에서 띄우므로
+# 실행 파일 경로가 서로 다릅니다. 그것을 표식으로 씁니다.
+# 경로까지 똑같으면 표식이 비고, 그때는 예전처럼 순서로 매길 수밖에 없습니다.
+function Get-KakaoProcessTag([object]$Proc) {
+    $tag = ''
+    try { $tag = [string]$Proc.Path } catch { }
+    if (-not $tag) { try { $tag = [string]$Proc.MainModule.FileName } catch { } }
+    return $tag
+}
+
+# 카카오톡 창에 번호를 매깁니다.
+#
+# 예전에는 '실행한 순서'로 그때그때 다시 셌습니다.
+# 그래서 껐다 켜거나 재부팅해서 순서가 바뀌면, 저장해 둔 방의 번호가
+# 다른 계정을 가리켰습니다. 같은 설정인데 어떤 날은 되고 어떤 날은
+# 안 되던 까닭입니다.
+#
+# 이제는 한 번 매긴 번호를 설정에 적어 두고 계속 씁니다. 다시 알아보는 순서:
+#   ① 실행 번호(PID)가 그대로면 그 번호를 그대로
+#   ② 실행 파일 경로가 같으면 그 번호를 이어받음
+#   ③ 둘 다 아니면 '아직 아무도 쓰지 않은' 가장 작은 번호를 새로 줍니다
+# 한 번 준 번호는 그 카카오톡이 꺼져 있어도 남겨 둡니다.
+# 그래야 잠깐 껐다 켠 사이에 다른 계정이 그 번호를 가로채지 않습니다.
 function Get-KakaoInstances {
-    $list = @()
-    $index = 0
     $procs = @()
     try { $procs = @(Get-KakaoProcesses | Sort-Object -Property StartTime, Id) } catch { $procs = @(Get-KakaoProcesses) }
+    if ($procs.Count -eq 0) { return @() }
+
+    # 적어 둔 번호표를 읽습니다.
+    $saved = @()
+    try { $saved = @($script:config.InstanceMap) } catch { $saved = @() }
+    $rows = @()
+    foreach ($one in $saved) {
+        if ($null -eq $one) { continue }
+        $savedIndex = 0
+        try { $savedIndex = [int]$one.Index } catch { }
+        if ($savedIndex -lt 1 -or $savedIndex -gt 16) { continue }
+        $rows += [pscustomobject]@{
+            Index = $savedIndex
+            Tag = $(try { [string]$one.Tag } catch { '' })
+            Pid = $(try { [int]$one.Pid } catch { 0 })
+        }
+    }
+
+    $taken = @{}       # 이번에 이미 쓴 번호
+    $reserved = @{}    # 예전에 누군가에게 준 번호 (꺼져 있어도 비켜 둡니다)
+    foreach ($row in $rows) { $reserved[[string]$row.Index] = $true }
+
+    $list = @()
+    $newlyNumbered = 0
     foreach ($proc in $procs) {
-        $index++
+        $tag = Get-KakaoProcessTag $proc
+        $index = 0
+
+        # ① 실행 번호가 그대로인가
+        foreach ($row in $rows) {
+            if ($row.Pid -eq [int]$proc.Id -and -not $taken.ContainsKey([string]$row.Index)) { $index = $row.Index; break }
+        }
+        # ② 실행 파일 경로가 같은가
+        if ($index -lt 1 -and $tag) {
+            foreach ($row in $rows) {
+                if ($row.Tag -and $row.Tag -eq $tag -and -not $taken.ContainsKey([string]$row.Index)) { $index = $row.Index; break }
+            }
+        }
+        # ③ 아직 아무도 쓰지 않은 가장 작은 번호
+        if ($index -lt 1) {
+            $index = 1
+            while ($taken.ContainsKey([string]$index) -or $reserved.ContainsKey([string]$index)) { $index++ }
+            $newlyNumbered++
+        }
+        $taken[[string]$index] = $true
+        $reserved[[string]$index] = $true
+
         $main = $null
         try {
             foreach ($window in [NativeKakao]::GetWindows($proc.Id)) {
@@ -2872,8 +3203,36 @@ function Get-KakaoInstances {
             Index = $index
             Label = ("카카오톡 {0}" -f $index)
             ProcessId = $proc.Id
+            Tag = $tag
             MainHandle = $(if ($null -ne $main) { $main.Handle } else { [IntPtr]::Zero })
             Alive = $true
+        }
+    }
+
+    # 번호표를 새로 적습니다. 지금 꺼져 있는 카카오톡의 번호도 그대로 남깁니다.
+    $map = @()
+    foreach ($one in $list) {
+        $map += [pscustomobject]@{ Index = $one.Index; Tag = $one.Tag; Pid = $one.ProcessId }
+    }
+    foreach ($row in $rows) {
+        if ($taken.ContainsKey([string]$row.Index)) { continue }
+        $map += [pscustomobject]@{ Index = $row.Index; Tag = $row.Tag; Pid = 0 }
+    }
+    $map = @($map | Sort-Object -Property Index)
+
+    # 달라졌을 때만 저장합니다. 이 함수는 자주 불립니다.
+    $before = ''
+    $after = ''
+    try { $before = (@($rows | Sort-Object -Property Index) | ForEach-Object { "$($_.Index)|$($_.Tag)|$($_.Pid)" }) -join ';' } catch { }
+    try { $after = ($map | ForEach-Object { "$($_.Index)|$($_.Tag)|$($_.Pid)" }) -join ';' } catch { }
+    if ($before -cne $after) {
+        Set-ConfigValue 'InstanceMap' $map
+        try { Save-Config $script:config } catch { }
+        # 이어받지 못하고 새 번호를 준 경우에는 알려 줍니다.
+        # 저장해 둔 방의 번호가 안 맞을 수 있어 사용자가 알아야 합니다.
+        if ($newlyNumbered -gt 0 -and $rows.Count -gt 0 -and -not $script:instanceRenumberNoted) {
+            $script:instanceRenumberNoted = $true
+            Write-RunLog "카카오톡 $($newlyNumbered)개에 새 번호를 매겼습니다. 예전 번호를 이어받지 못했다면 방 목록의 카카오톡 번호를 확인해 주세요."
         }
     }
     return @($list)
@@ -3220,6 +3579,11 @@ function Invoke-RosterScan([bool]$Exact, [int]$MaxPages) {
     $viewType = Get-RoomTypeFromViewName $layout.ViewName
     $fromOpenTab = ($viewType -eq $script:RoomTypeOpen)
     $pageLimit = [Math]::Max(1, [Math]::Min(60, $MaxPages))
+    # 지금 훑는 목록이 몇 번 카카오톡의 것인지 적어 둡니다.
+    # 예전에는 이걸 기록하지 않아서, 어느 계정에서 읽었든 전부 1번으로 저장됐습니다.
+    # 그래서 2번 계정 목록을 훑으면 1번 계정 방을 덮어써 버렸습니다.
+    $scanInstance = 1
+    try { $scanInstance = Get-InstanceIndexOf ([int]$main.ProcessId) (Get-KakaoInstances) } catch { }
 
     # 담은 방들입니다. 열쇠는 정확한 이름입니다.
     $found = New-Object System.Collections.Specialized.OrderedDictionary([System.StringComparer]::Ordinal)
@@ -3321,6 +3685,8 @@ function Invoke-RosterScan([bool]$Exact, [int]$MaxPages) {
         $item = $found[$key]
         $out += [pscustomobject]@{
             Name = $item.Name
+            Key = (Get-RoomKeyOf $scanInstance $item.Name)
+            Instance = $scanInstance
             ListText = $item.ListText
             Kind = $item.Kind
             Order = $order
@@ -3331,6 +3697,7 @@ function Invoke-RosterScan([bool]$Exact, [int]$MaxPages) {
     }
     return [pscustomobject]@{
         Rows = @($out)
+        Instance = $scanInstance
         Pages = $pages
         ViewName = $layout.ViewName
         FromOpenTab = $fromOpenTab
@@ -3343,16 +3710,43 @@ function Invoke-RosterScan([bool]$Exact, [int]$MaxPages) {
 # 새로 읽은 목록을 저장된 목록과 견주어 무엇이 달라졌는지 알려 줍니다.
 # 오픈채팅 탭만 읽었다면 일반채팅 방은 지우지 않습니다. 안 본 것이지 없어진 것이 아닙니다.
 function Merge-RosterScan([object]$Scan, [bool]$ReplaceAll) {
+    # 이번에 몇 번 카카오톡을 훑었는지입니다. 안 적혀 있으면 1번으로 봅니다.
+    $scanInstance = 1
+    try { if ([int]$Scan.Instance -ge 1) { $scanInstance = [int]$Scan.Instance } } catch { }
+
+    # 이름이 아니라 '열쇠'(카카오톡 번호 + 이름)로 견줍니다.
+    # 이름으로 견주면 두 계정에 똑같은 '공지방' 이 있을 때 한 칸을 놓고 서로
+    # 덮어쓰고, 이번에 안 본 계정의 방은 없어진 것으로 보고 지워 버렸습니다.
     $old = @(Get-Roster)
     $oldByName = (New-NameMap)
-    foreach ($row in $old) { $oldByName[$row.Name] = $row }
+    foreach ($row in $old) { $oldByName[$row.Key] = $row }
 
-    $new = @($Scan.Rows)
+    # 넘어온 행에 번호나 열쇠가 없으면 여기서 채웁니다.
+    # (자체 점검처럼 번호 없이 만든 행도 그대로 다룰 수 있게 합니다)
+    $new = @()
+    foreach ($row in @($Scan.Rows)) {
+        if ($null -eq $row) { continue }
+        $rowInstance = $scanInstance
+        try { if ([int]$row.Instance -ge 1) { $rowInstance = [int]$row.Instance } } catch { }
+        $rowKey = ''
+        try { $rowKey = [string]$row.Key } catch { }
+        if (-not $rowKey) { $rowKey = Get-RoomKeyOf $rowInstance ([string]$row.Name) }
+        $new += [pscustomobject]@{
+            Name = [string]$row.Name
+            Key = $rowKey
+            Instance = $rowInstance
+            ListText = $(try { [string]$row.ListText } catch { '' })
+            Kind = $(try { [string]$row.Kind } catch { 'unknown' })
+            Order = $(try { [int]$row.Order } catch { 0 })
+            Verified = $(try { [bool]$row.Verified } catch { $false })
+            LastSeen = $(try { [string]$row.LastSeen } catch { '' })
+        }
+    }
     $newByName = (New-NameMap)
-    foreach ($row in $new) { $newByName[$row.Name] = $row }
+    foreach ($row in $new) { $newByName[$row.Key] = $row }
 
     $added = @()
-    foreach ($row in $new) { if (-not $oldByName.ContainsKey($row.Name)) { $added += $row.Name } }
+    foreach ($row in $new) { if (-not $oldByName.ContainsKey($row.Key)) { $added += $row.Name } }
 
     # 이번에 본 종류의 방 가운데 안 보인 것만 없어진 것으로 봅니다.
     $scanKinds = @{}
@@ -3360,10 +3754,13 @@ function Merge-RosterScan([object]$Scan, [bool]$ReplaceAll) {
     $sawOpen = ([bool]$Scan.FromOpenTab -or $scanKinds.ContainsKey('open'))
     $removed = @()
     foreach ($row in $old) {
-        if ($newByName.ContainsKey($row.Name)) { continue }
-        if ($ReplaceAll) { $removed += $row.Name; continue }
+        if ($newByName.ContainsKey($row.Key)) { continue }
+        # 이번에 훑지 않은 '다른 카카오톡' 의 방은 없어진 것이 아닙니다.
+        # 예전에는 이 줄이 없어서 A 계정을 훑을 때마다 B 계정 방이 지워졌습니다.
+        if ($row.Instance -ne $scanInstance) { continue }
+        if ($ReplaceAll) { $removed += $row.Key; continue }
         $isOpen = ($row.Kind -eq 'open')
-        if ($isOpen -eq $sawOpen) { $removed += $row.Name }
+        if ($isOpen -eq $sawOpen) { $removed += $row.Key }
     }
 
     # 합칩니다. 새로 읽은 것을 앞에 두고, 이번에 안 본 방은 뒤에 그대로 둡니다.
@@ -3375,8 +3772,17 @@ function Merge-RosterScan([object]$Scan, [bool]$ReplaceAll) {
     }
     if (-not $ReplaceAll) {
         foreach ($row in $old) {
-            if ($newByName.ContainsKey($row.Name)) { continue }
-            if (@($removed) -contains $row.Name) { continue }
+            if ($newByName.ContainsKey($row.Key)) { continue }
+            if (@($removed) -contains $row.Key) { continue }
+            $row.Order = $order; $order++
+            $merged += $row
+        }
+    }
+    if ($ReplaceAll) {
+        # '전부 새로 읽기' 라도 훑지 않은 다른 카카오톡의 방까지 지우지는 않습니다.
+        foreach ($row in $old) {
+            if ($newByName.ContainsKey($row.Key)) { continue }
+            if ($row.Instance -eq $scanInstance) { continue }
             $row.Order = $order; $order++
             $merged += $row
         }
@@ -3633,7 +4039,7 @@ function Test-AttachmentList([string[]]$Paths) {
 $script:deliveryState = (New-NameMap)
 $script:trackDelivery = $false
 
-function Reset-DeliveryState { $script:deliveryState = @{} }
+function Reset-DeliveryState { $script:deliveryState = (New-NameMap) }
 
 function Get-DeliveryState([string]$Room) {
     if (-not $script:trackDelivery) {
@@ -3654,10 +4060,15 @@ function Get-DeliveryState([string]$Room) {
 #   첨부가 없으면 첨부 관련 단계를 아예 지나갑니다.
 #   문구가 없으면 문구 단계를 지나갑니다.
 #   사용자가 열어 둔 창은 닫지 않습니다.
-function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool]$CloseWhenDone = $true) {
+# Room 은 '창 제목과 견줄 이름' 입니다. ProgressKey 는 '진행 상황 목록의 열쇠' 입니다.
+# 카카오톡이 여럿이면 이 둘이 다릅니다. 예: 이름 '거래처' / 열쇠 '카카오톡2|거래처'
+# 진행 상황 행은 처음에 열쇠로 만들어 두므로, 갱신도 열쇠로 해야 같은 줄이 바뀝니다.
+# 이름으로 갱신하면 줄이 하나 더 생기고 원래 줄은 '대기' 인 채로 남습니다.
+function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool]$CloseWhenDone = $true, [string]$ProgressKey = '') {
     $tune = Get-SpeedTuning
     Start-StageLog
-    Set-SendProgress $Room '채팅방 확인' ''
+    $Room2 = if ($ProgressKey) { $ProgressKey } else { $Room }
+    Set-SendProgress $Room2 '채팅방 확인' ''
     if (-not (Wait-KakaoResponsive $Chat 20000)) {
         $script:lastSendProblem = 'KAKAO_NOT_RESPONDING — 카카오톡이 응답하지 않습니다.'
         Write-StepLog $Room $script:lastSendProblem
@@ -3691,7 +4102,7 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
     $files = @($Content.Attachments)
     if ($files.Count -gt 0) {
         $waitMs = [Math]::Min([Math]::Max(300, [int]$Content.AttachmentWaitMs), $tune.AttachWait)
-        Set-SendProgress $Room '파일 첨부 중' ''
+        Set-SendProgress $Room2 '파일 첨부 중' ''
         # 이미 보낸 파일은 빼고 묶습니다. 다시 할 때 같은 사진을 또 보내면 안 됩니다.
         $left = @()
         foreach ($path in $files) {
@@ -3717,7 +4128,7 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
             $count = @($batch).Count
             $label = if ($count -gt 1) { "$($count)장 묶음" } else { $names[0] }
             $mark = "$($batchNo)/$($batches.Count)"
-            Set-SendProgress $Room '파일 첨부 중' "묶음 $mark — $label"
+            Set-SendProgress $Room2 '파일 첨부 중' "묶음 $mark — $label"
             $outcome = $null
             try { $outcome = Send-ChatAttachments $chat $inputBox $batch $waitMs $true } catch { $outcome = $null }
             if ($null -eq $outcome) {
@@ -3743,7 +4154,7 @@ function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool
     # 문구가 없으면 이 구역을 통째로 지나갑니다.
     $message = [string]$Content.Message
     if ((-not [string]::IsNullOrWhiteSpace($message)) -and (-not $state.MessageSent)) {
-        Set-SendProgress $Room '메시지 전송 중' ''
+        Set-SendProgress $Room2 '메시지 전송 중' ''
         # 방을 열 때 이미 대화 로딩을 기다렸습니다. 여기서 또 기다리지 않습니다.
         $how = Send-ChatText $chat $inputBox $message ([int]$Content.SettleMs) $true
         if (-not $how) {
@@ -4749,9 +5160,18 @@ function Open-RoomAtLine([object]$List, [object]$Line, [IntPtr]$MainHandle, [int
     $x = $List.Rect.Left + [int]($List.Width * 0.35)
     $y = $List.Rect.Top + $Line.Top + 8
     Invoke-ControlClick $List $x $y $true
+    # 방금 누른 그 카카오톡 안에서만 새 창을 찾습니다.
+    # 예전에는 모든 카카오톡을 뒤져서, 마침 다른 계정에 메시지가 와서 창이 뜨면
+    # 그것을 '방금 연 방' 으로 집어왔습니다. 그러면 제목이 달라 실패하고,
+    # 정작 열려던 방은 건너뛴 것으로 처리됐습니다.
+    $ownerPid = 0
+    if ($MainHandle -ne [IntPtr]::Zero) {
+        try { $ownerPid = [int][NativeKakao]::GetProcessId($MainHandle) } catch { $ownerPid = 0 }
+    }
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
         foreach ($process in (Get-KakaoProcesses)) {
+            if ($ownerPid -gt 0 -and [int]$process.Id -ne $ownerPid) { continue }
             foreach ($window in [NativeKakao]::GetWindows($process.Id)) {
                 if (-not $window.Visible -or $window.Handle -eq $MainHandle) { continue }
                 if ($before.ContainsKey([string]$window.Handle)) { continue }
@@ -4965,6 +5385,11 @@ function Invoke-ListPass([object]$Pending, [object]$Content, [int]$MaxPages,
     $ready = Test-KakaoReady $true $false
     if (-not $ready.Ok) { throw $ready.Reason }
     $main = $ready.Layout.Main
+    # 지금 훑는 목록이 몇 번째 카카오톡의 것인지 미리 알아 둡니다.
+    # 보낼 목록의 열쇠에는 번호가 붙어 있어서, 번호 없이 견주면
+    # 두 번째 카카오톡의 방은 '보낼 목록에 없는 방' 으로 지나가 버립니다.
+    $mainInstance = 1
+    try { $mainInstance = Get-InstanceIndexOf ([int]$main.ProcessId) (Get-KakaoInstances) } catch { }
     Move-ListToTop $ready.Layout.List $MaxPages
 
     for ($page = 0; $page -lt $MaxPages; $page++) {
@@ -5014,7 +5439,7 @@ function Invoke-ListPass([object]$Pending, [object]$Content, [int]$MaxPages,
                 continue
             }
             $openedName = Get-RoomTitleName ([string]$chat.Title)
-            $openedKey = ConvertTo-ExactKey $openedName
+            $openedKey = Get-RoomKeyOf $mainInstance $openedName
 
             # 보낼 목록에 정확히 같은 이름이 있어야 보냅니다.
             # 비슷하다고 보내지 않습니다. 투투 를 찾다가 토토 가 열리면 그냥 닫습니다.
@@ -5035,12 +5460,12 @@ function Invoke-ListPass([object]$Pending, [object]$Content, [int]$MaxPages,
             $tried++
             $Counter.Value = $Total - $Pending.Count + 1
             Set-StatusPill ("발송 중 $($Counter.Value)/$Total — $openedName") 'run'
-            Set-SendProgress $openedName '채팅방 여는 중' ''
+            Set-SendProgress $openedKey '채팅방 여는 중' ''
             Set-RoomKind $openedName (Get-RoomKindFromTitle ([string]$chat.Title) (Get-RoomType $openedName))
 
             $script:strictTitleMatch = $true
             $ok = $false
-            try { $ok = [bool](Send-ToChatWindow $chat $openedName $Content $true) }
+            try { $ok = [bool](Send-ToChatWindow $chat $openedName $Content $true $openedKey) }
             catch {
                 $ok = $false
                 $script:lastSendProblem = 'SEND_ERROR — ' + $_.Exception.Message
@@ -5052,14 +5477,14 @@ function Invoke-ListPass([object]$Pending, [object]$Content, [int]$MaxPages,
                 $NotTarget['N:' + $openedKey] = $true
                 $NotTarget[(Get-RowKey $pick)] = $true
                 $sent++
-                Set-SendProgress $openedName '발송 완료' ''
+                Set-SendProgress $openedKey '발송 완료' ''
                 if ($Reasons.ContainsKey($openedKey)) { $Reasons.Remove($openedKey) }
             } else {
                 # 실패한 방은 목록에 남겨 둡니다. 다음 회차에 다시 해 봅니다.
                 $why = $script:lastSendProblem
                 if (-not $why) { $why = 'SEND_FAILED 까닭을 알 수 없습니다.' }
                 $Reasons[$openedKey] = $why
-                Set-SendProgress $openedName '재시도' $why
+                Set-SendProgress $openedKey '재시도' $why
             }
             # 한 방이 끝날 때마다 적어 둡니다. 중간에 꺼져도 여기까지는 남습니다.
             Save-RunProgress $Content
@@ -5113,17 +5538,22 @@ function Invoke-OpenWindowPass([object]$Pending, [object]$Content, [int]$Interva
         if (-not $open.ContainsKey($name)) { continue }
         $window = Find-OpenChatWindow $name
         if ($null -eq $window) { continue }
+        # 열쇠에는 카카오톡 번호가 붙어 있습니다. 예: '카카오톡2|거래처'
+        # 창 제목에는 그 번호가 없으므로 제목을 견줄 때는 이름만 써야 합니다.
+        # 예전에는 열쇠를 그대로 넘겨서, 두 번째 카카오톡의 방은
+        # 창을 제대로 찾고도 제목이 다르다며 전부 실패했습니다.
+        $title = Get-RoomNameOfKey $name
 
         $tried++
         $Counter.Value = $Total - $Pending.Count + 1
-        Set-StatusPill ("발송 중 $($Counter.Value)/$Total — $name") 'run'
+        Set-StatusPill ("발송 중 $($Counter.Value)/$Total — $title") 'run'
         Set-SendProgress $name '채팅방 여는 중' '열려 있는 창'
-        Set-RoomKind $name (Get-RoomKindFromTitle ([string]$window.Title) (Get-RoomType $name))
+        Set-RoomKind $title (Get-RoomKindFromTitle ([string]$window.Title) (Get-RoomType $title))
 
         $script:strictTitleMatch = $true
         $ok = $false
         $closeIt = (-not [bool]$script:config.KeepRoomsOpen)
-        try { $ok = [bool](Send-ToChatWindow $window $name $Content $closeIt) }
+        try { $ok = [bool](Send-ToChatWindow $window $title $Content $closeIt $name) }
         catch {
             $ok = $false
             $script:lastSendProblem = 'SEND_ERROR — ' + $_.Exception.Message
@@ -5168,6 +5598,35 @@ function Invoke-OpenWindowPass([object]$Pending, [object]$Content, [int]$Interva
 #   ③ 그래도 남으면 목록의 모든 줄을 하나씩 열어 확인합니다. 느리지만 빠뜨리지 않습니다.
 #   ④ 끝까지 못 보낸 방은 실패로 마무리합니다. 조용히 사라지는 방은 없습니다.
 # 그래서 언제나  고른 수 = 성공 + 실패  입니다.
+# 보낼 방들이 몇 번 카카오톡에 흩어져 있는지 뽑습니다.
+function Get-PendingInstances([object]$Pending) {
+    $seen = @{}
+    $list = @()
+    foreach ($key in @($Pending.Keys)) {
+        $one = Get-InstanceOfKey ([string]$key)
+        if ($seen.ContainsKey([string]$one)) { continue }
+        $seen[[string]$one] = $true
+        $list += [int]$one
+    }
+    return @($list | Sort-Object)
+}
+
+# 지금 조작할 카카오톡을 이 번호의 창으로 바꿉니다.
+# Find-KakaoMainHandle 이 이 값을 먼저 보므로, 이것만 바꾸면
+# 그 뒤의 모든 화면 읽기·클릭이 그 창을 향합니다.
+function Enter-KakaoInstance([int]$Instance) {
+    $found = @()
+    try { $found = @(Get-KakaoInstances) } catch { return $false }
+    foreach ($one in $found) {
+        if ([int]$one.Index -ne $Instance) { continue }
+        $script:selectedKakaoProcessId = [int]$one.ProcessId
+        # 창이 바뀌었으니 기억해 둔 열린 방 목록은 버립니다.
+        Clear-OpenRoomCache
+        return $true
+    }
+    return $false
+}
+
 function Invoke-RosterSend([string[]]$Targets, [object]$Content, [int]$MaxPages,
                            [int]$IntervalSeconds, [int]$BatchSize, [int]$BatchRestMinutes,
                            [int]$RetryCount) {
@@ -5203,19 +5662,42 @@ function Invoke-RosterSend([string[]]$Targets, [object]$Content, [int]$MaxPages,
         if ($pending.Count -eq 0) { break }
 
         # ② · ③ 남은 방은 목록에서 찾습니다.
+        #
+        # 카카오톡이 여럿이면 계정마다 채팅 목록이 따로 있습니다.
+        # 예전에는 창을 하나만 잡고 그 목록만 훑어서, 다른 계정의 방은
+        # 창을 미리 열어 두지 않는 한 영영 찾지 못하고 'ROOM_NOT_FOUND' 가 났습니다.
+        # 이제 보낼 방이 걸쳐 있는 계정을 하나씩 돌면서 각각의 목록을 훑습니다.
         $exhaustive = ($round -gt 1)
         $howText = if ($exhaustive) { '아직 못 찾은 방을 위해 목록의 모든 줄을 하나씩 열어 확인합니다 (오래 걸립니다)' } else { '이름으로 찾아 열기' }
         Write-RunLog ("{0}회차 · 목록: 남은 방 {1}개 / {2}" -f $round, $pending.Count, $howText)
 
         $before = $pending.Count
-        $pass = Invoke-ListPass $pending $Content $MaxPages $IntervalSeconds $BatchSize $BatchRestMinutes $notTarget $reasons $exhaustive $total $counter
-        $sent += $pass.Sent
-        Write-RunLog ("{0}회차 결과: 보냄 {1} / 남음 {2}" -f $round, ($openPass.Sent + $pass.Sent), $pending.Count)
+        $passSent = 0
+        $passTried = 0
+        $passInterrupted = $false
+        $instances = @(Get-PendingInstances $pending)
+        foreach ($one in $instances) {
+            if ($pending.Count -eq 0) { break }
+            if (Test-RunInterrupted) { $passInterrupted = $true; break }
+            if ($instances.Count -gt 1) {
+                if (-not (Enter-KakaoInstance $one)) {
+                    Write-RunLog ("카카오톡 {0} 을(를) 찾지 못해 그 계정의 방은 이번 회차에 건너뜁니다." -f $one)
+                    continue
+                }
+                Write-RunLog ("카카오톡 {0} 의 목록을 훑습니다." -f $one)
+            }
+            $pass = Invoke-ListPass $pending $Content $MaxPages $IntervalSeconds $BatchSize $BatchRestMinutes $notTarget $reasons $exhaustive $total $counter
+            $passSent += $pass.Sent
+            $passTried += $pass.Tried
+            if ($pass.Interrupted) { $passInterrupted = $true; break }
+        }
+        $sent += $passSent
+        Write-RunLog ("{0}회차 결과: 보냄 {1} / 남음 {2}" -f $round, ($openPass.Sent + $passSent), $pending.Count)
 
-        if ($pass.Interrupted) { $interrupted = $true; break }
+        if ($passInterrupted) { $interrupted = $true; break }
         if ($pending.Count -eq 0) { break }
         # 훑었는데 하나도 줄지 않고 열어 본 방도 없으면 더 해도 같습니다.
-        if ($exhaustive -and $pending.Count -eq $before -and $pass.Tried -eq 0 -and $openPass.Tried -eq 0) { break }
+        if ($exhaustive -and $pending.Count -eq $before -and $passTried -eq 0 -and $openPass.Tried -eq 0) { break }
         if ($round -lt $rounds) {
             foreach ($key in @($pending.Keys)) { Set-SendProgress ([string]$key) '재시도' ("$($round + 1)회차를 기다리는 중") }
             Start-Sleep -Milliseconds 800
@@ -5260,6 +5742,10 @@ function Write-EnvironmentLog([object]$MainWindow) {
         $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
         $osText = if ($null -ne $os) { "$($os.Caption) 빌드 $($os.BuildNumber)" } else { '알 수 없음' }
         Write-RunLog "환경: $osText / 파워셸 $($PSVersionTable.PSVersion)"
+        # 이 값이 비어 있으면 화면 배율을 그대로 인식하지 못한 것입니다.
+        # 그러면 윈도우가 화면을 대신 늘려 주어 글자 인식과 자리 계산이 어긋납니다.
+        $dpiModeText = if ($script:DpiMode) { $script:DpiMode } else { '설정 못함(주의)' }
+        Write-RunLog "환경: 화면 배율 인식 = $dpiModeText / 시작할 때 잰 배율 $($script:UiScalePercent)%"
     } catch { }
     try {
         $screens = @([System.Windows.Forms.Screen]::AllScreens)
@@ -5276,15 +5762,43 @@ function Write-EnvironmentLog([object]$MainWindow) {
         if ($scale -ne 100) {
             Write-RunLog '  (배율이 100%가 아니면 화면 글자 인식이 어려워질 수 있습니다)'
         }
+        # 모니터가 여럿일 때 무엇이 문제였는지 나중에 알 수 있게 하나씩 남깁니다.
+        # 주 모니터 왼쪽·위에 놓인 모니터는 위치가 음수입니다. 그 자체는 정상입니다.
+        if ($screens.Count -gt 1) {
+            foreach ($one in $screens) {
+                Write-RunLog ("  · 모니터: {0}x{1} @{2},{3}{4}" -f `
+                    $one.Bounds.Width, $one.Bounds.Height, $one.Bounds.Left, $one.Bounds.Top,
+                    $(if ($one.Primary) { ' (주)' } else { '' }))
+            }
+        }
     } catch { }
     try {
         if ($null -ne $MainWindow) {
             $min = [NativeKakao]::IsWindowMinimized($MainWindow.Handle)
-            Write-RunLog ("환경: 카카오톡 창 {0}x{1} @{2},{3} / 최소화={4}" -f `
-                $MainWindow.Width, $MainWindow.Height, $MainWindow.Rect.Left, $MainWindow.Rect.Top, $min)
+            # 창이 놓인 모니터의 배율입니다. 프로그램이 켜질 때 잰 배율과 다르면
+            # 두 모니터의 배율이 서로 다른 것입니다. 그때 자리 계산이 어긋납니다.
+            $winDpi = 96
+            try { $winDpi = [int][NativeKakao]::WindowDpi($MainWindow.Handle) } catch { }
+            Write-RunLog ("환경: 카카오톡 창 {0}x{1} @{2},{3} / 최소화={4} / 이 창의 배율 {5}%" -f `
+                $MainWindow.Width, $MainWindow.Height, $MainWindow.Rect.Left, $MainWindow.Rect.Top, $min,
+                [int][Math]::Round($winDpi / 96 * 100))
+            if ($winDpi -ne $script:SystemDpi) {
+                Write-RunLog ("  (경고: 이 창의 배율 {0}% 가 시작할 때 잰 배율 {1}% 와 다릅니다. 모니터마다 배율이 다르면 자리 계산이 어긋나 방을 못 열 수 있습니다. 카카오톡을 주 모니터로 옮겨 보세요)" -f `
+                    [int][Math]::Round($winDpi / 96 * 100), $script:UiScalePercent)
+            }
             if ($MainWindow.Width -lt 340 -or $MainWindow.Height -lt 480) {
                 Write-RunLog '  (카카오톡 창이 작습니다. 창을 키우면 목록을 더 정확히 읽습니다)'
             }
+            # 이 프로그램 창이 놓인 모니터의 배율도 함께 봅니다.
+            # 프로그램 화면은 켤 때 잰 배율로 그려지므로, 다른 배율의 모니터로
+            # 옮겨 두면 글자와 상자 크기가 어긋납니다. 그때는 다시 켜야 맞습니다.
+            try {
+                $appDpi = [int][NativeKakao]::WindowDpi($script:form.Handle)
+                if ($appDpi -ne $script:SystemDpi) {
+                    Write-RunLog ("  (이 프로그램 창은 배율 {0}% 모니터에 있는데 켤 때는 {1}% 였습니다. 화면이 어긋나 보이면 프로그램을 다시 켜 주세요)" -f `
+                        [int][Math]::Round($appDpi / 96 * 100), $script:UiScalePercent)
+                }
+            } catch { }
         }
     } catch { }
 }
@@ -5376,7 +5890,7 @@ function Update-ProgressView {
                 '대기'      { $waiting++ }
                 default     { $running++; if (-not $current) { $current = $name } }
             }
-            $item = New-Object System.Windows.Forms.ListViewItem($name)
+            $item = New-Object System.Windows.Forms.ListViewItem((Get-RoomDisplayName $name))
             $kindText = '일반채팅'
             $entry = Find-RosterEntry $name
             if ($null -ne $entry) { $kindText = Get-RosterKindText $entry.Kind }
@@ -5439,6 +5953,9 @@ function Invoke-RoomNameVerify([string[]]$Names, [int]$MaxPages) {
     $ready = Test-KakaoReady $true $false
     if (-not $ready.Ok) { throw $ready.Reason }
     $main = $ready.Layout.Main
+    # 지금 확인하는 목록이 몇 번 카카오톡의 것인지 적어 둡니다.
+    $verifyInstance = 1
+    try { $verifyInstance = Get-InstanceIndexOf ([int]$main.ProcessId) (Get-KakaoInstances) } catch { }
     Move-ListToTop $ready.Layout.List $MaxPages
 
     for ($page = 0; $page -lt $MaxPages; $page++) {
@@ -5485,7 +6002,7 @@ function Invoke-RoomNameVerify([string[]]$Names, [int]$MaxPages) {
                 # 이름이 이미 맞습니다.
                 $pending.Remove($title)
                 $confirmed += $title
-                Set-RosterVerified $title $kind $title
+                Set-RosterVerified $title $kind $title $verifyInstance
                 Write-RunLog "이름 확인: '$title' 맞습니다."
                 continue
             }
@@ -5499,7 +6016,7 @@ function Invoke-RoomNameVerify([string[]]$Names, [int]$MaxPages) {
             if ($looksLikeTarget -and $clashes -eq 1) {
                 $pending.Remove($pickedFor)
                 $renamed += ("$pickedFor -> $title")
-                Set-RosterVerified $title $kind $pickedFor
+                Set-RosterVerified $title $kind $pickedFor $verifyInstance
                 Write-RunLog "이름 바로잡음: '$pickedFor' → '$title'"
             } else {
                 Write-RunLog "지나감: 열린 방 '$title' 은(는) 확인하려던 방이 아닙니다."
@@ -5521,18 +6038,26 @@ function Invoke-RoomNameVerify([string[]]$Names, [int]$MaxPages) {
 }
 
 # 확인한 이름을 저장된 목록에 적어 둡니다. 예전 이름이 있으면 바꿔치웁니다.
-function Set-RosterVerified([string]$Name, [string]$Kind, [string]$OldName) {
+# 이름 확인이 끝난 방을 목록에 반영합니다.
+# Instance 를 0 으로 주면 원래 적혀 있던 카카오톡 번호를 그대로 둡니다.
+# 예전에는 여기서 번호 칸을 아예 빼고 다시 썼습니다.
+# 그래서 이름 확인을 한 번 돌리면 2번 계정 방까지 전부 1번으로 바뀌었습니다.
+function Set-RosterVerified([string]$Name, [string]$Kind, [string]$OldName, [int]$Instance = 0) {
     $name = ConvertTo-ExactKey $Name
     if (-not $name) { return }
     $old = ConvertTo-ExactKey $OldName
     $rows = @()
     $found = $false
     foreach ($row in (Get-Roster)) {
-        if ((Test-NameEquals $row.Name $name) -or ($old -and (Test-NameEquals $row.Name $old))) {
+        $sameName = ((Test-NameEquals $row.Name $name) -or ($old -and (Test-NameEquals $row.Name $old)))
+        # 번호를 지정했으면 그 카카오톡의 방만 건드립니다.
+        if ($sameName -and $Instance -ge 1 -and [int]$row.Instance -ne $Instance) { $sameName = $false }
+        if ($sameName) {
             if ($found) { continue }
             $found = $true
             $rows += [pscustomobject]@{
                 Name = $name
+                Instance = [int]$row.Instance
                 ListText = $(if ($old -and -not (Test-NameEquals $old $name)) { $old } else { $row.ListText })
                 Kind = $(if ($Kind -and $Kind -ne 'unknown') { $Kind } else { $row.Kind })
                 Order = $row.Order
@@ -5545,7 +6070,9 @@ function Set-RosterVerified([string]$Name, [string]$Kind, [string]$OldName) {
     }
     if (-not $found) {
         $rows += [pscustomobject]@{
-            Name = $name; ListText = $(if ($old) { $old } else { $name })
+            Name = $name
+            Instance = $(if ($Instance -ge 1) { $Instance } else { 1 })
+            ListText = $(if ($old) { $old } else { $name })
             Kind = $(if ($Kind) { $Kind } else { 'unknown' })
             Order = @($rows).Count; Verified = $true
             LastSeen = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
@@ -5711,10 +6238,15 @@ function Invoke-Broadcast([string[]]$Targets = $null, [bool]$Resume = $false) {
     try { $script:savedClipboardFiles = @([System.Windows.Forms.Clipboard]::GetFileDropList()) } catch { }
 
     $result = $null
+    # 보내는 동안 카카오톡 여러 개를 오가며 조작하므로,
+    # 끝나면 사용자가 처음에 고른 창으로 되돌려 놓습니다.
+    $savedInstancePick = $script:selectedKakaoProcessId
     try {
         $result = Invoke-RosterSend $rooms $content ([int]$script:config.ScanPages) $interval $batchSize $batchRest $retry
     } finally {
         $script:trackDelivery = $false
+        $script:selectedKakaoProcessId = $savedInstancePick
+        Clear-OpenRoomCache
         Restore-SavedClipboard
     }
 
@@ -6025,7 +6557,7 @@ $script:TourSteps = @(
 $script:config = Import-AppConfig
 
 if ($SelfTest) {
-    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'Roster', 'RosterScannedAt', 'ScanExactNames', 'Templates', 'RetryCount', 'CloseAfterSend', 'GroupPhotos', 'PhotoBatchSize', 'AutoCheckUpdate', 'TourDone', 'Calibration')
+    $required = @('Rooms', 'KnownRooms', 'RoomTypes', 'RoomListNames', 'Groups', 'QuietEnabled', 'QuietStart', 'QuietEnd', 'HolidayMode', 'HolidayIntervalMultiplier', 'SkipWeekend', 'ExtraHolidays', 'AutoDownloadUpdate', 'SkipSendConfirm', 'RepeatEnabled', 'RepeatMinutes', 'RepeatCount', 'BatchSize', 'BatchRestMinutes', 'Message', 'Attachments', 'ScheduledAt', 'IntervalSeconds', 'DryRun', 'ScanPages', 'TestRoom', 'AttachmentWaitMs', 'OpenTimeoutMs', 'SettleMs', 'PreloadRooms', 'PreloadDone', 'TruncatedRooms', 'HolidayRules', 'SentDays', 'RoomKinds', 'Roster', 'RosterScannedAt', 'ScanExactNames', 'Templates', 'RetryCount', 'CloseAfterSend', 'GroupPhotos', 'PhotoBatchSize', 'AutoCheckUpdate', 'TourDone', 'InstanceMap', 'Calibration')
     foreach ($name in $required) {
         if ($null -eq $script:config.PSObject.Properties[$name]) { throw "필수 설정 항목 누락: $name" }
     }
@@ -6320,6 +6852,122 @@ if ($SelfTest) {
     #    ❤️ 는 한 글자로도, 두 글자로도 적힐 수 있습니다. 눈에는 똑같습니다.
     $probeNfd = ('가' + [char]0x1100 + [char]0x1161)
     if ((ConvertTo-ExactKey '홍보방') -cne '홍보방') { throw '보통 이름이 바뀝니다' }
+
+    # ----- 고른 방이 켤 때마다 사라지던 문제 -----
+    # 넣을 때와 꺼낼 때 서로 다른 열쇠를 쓰면, 이름에 빈칸·괄호·이모지가
+    # 하나라도 있는 방은 켤 때마다 조용히 선택이 풀렸습니다.
+    # 여기서 도는 이름들은 실제로 흔한 방 이름입니다.
+    $probePick = @(
+        '홍보방',
+        '우리반 공지방',
+        '공지방(2기)',
+        '[공지] 홍보방',
+        'A/S 문의',
+        '5K디자인',
+        '홍보방★',
+        ('자유로운홍보방' + [char]0x2764 + [char]0xFE0F),
+        ('홍보방' + [char]::ConvertFromUtf32(0x1F525))
+    )
+    $probePicked = (New-NameMap)
+    foreach ($probeOne in $probePick) {
+        $probeKey = ConvertTo-ExactKey $probeOne
+        if ($probeKey) { $probePicked[$probeKey] = $true }
+    }
+    $probeKept = @($probePick | Where-Object { $probePicked[(ConvertTo-ExactKey $_)] })
+    if ($probeKept.Count -ne $probePick.Count) {
+        throw "고른 방이 사라집니다: $($probePick.Count)개 중 $($probeKept.Count)개만 남았습니다"
+    }
+
+    # ----- 이모지 변형표시로 서로 다른 방이 갈리는지 -----
+    # 이것이 무너지면 엉뚱한 방으로 메시지가 나갑니다.
+    $probeHeart1 = '자유로운홍보방' + [char]0x2764
+    $probeHeart2 = '자유로운홍보방' + [char]0x2764 + [char]0xFE0F
+    if (Test-NameEquals $probeHeart1 $probeHeart2) { throw '변형표시만 다른 두 방을 같은 방으로 봅니다' }
+    # 실제로 보내기 직전에는 엄격 비교를 켭니다. 그 상태에서 반드시 갈려야 합니다.
+    # (엄격 비교를 끄면 일부러 너그럽게 봅니다. 어느 줄을 열어 볼지 고르는 용도라
+    #  그래도 됩니다. 열고 난 뒤 이 엄격 비교를 통과해야만 실제로 보냅니다.)
+    $script:strictTitleMatch = $true
+    try {
+        if (Test-RoomTitle $probeHeart1 $probeHeart2) { throw '변형표시만 다른 방에 보내려 합니다 (엉뚱한 방 발송)' }
+        if (-not (Test-RoomTitle $probeHeart2 $probeHeart2)) { throw '같은 이모지 방을 다른 방이라고 합니다' }
+    } finally { $script:strictTitleMatch = $false }
+
+    # ----- 카카오톡이 여러 개일 때 열쇠와 이름 -----
+    # 창 제목에는 '카카오톡2|' 가 붙지 않습니다. 제목을 견줄 때는 이름만 써야 합니다.
+    $probeKey2 = Get-RoomKeyOf 2 '거래처'
+    if ($probeKey2 -cne '카카오톡2|거래처') { throw "두 번째 카카오톡의 열쇠가 다릅니다: $probeKey2" }
+    if ((Get-RoomNameOfKey $probeKey2) -cne '거래처') { throw '열쇠에서 이름을 못 꺼냅니다' }
+    if (Test-RoomTitle '거래처' $probeKey2) { throw '창 제목을 열쇠와 견주고 있습니다' }
+    if (-not (Test-RoomTitle '거래처' (Get-RoomNameOfKey $probeKey2))) { throw '두 번째 카카오톡의 방을 못 알아봅니다' }
+    # 카카오톡이 하나뿐인 사람에게는 예전과 글자 하나까지 같아야 합니다.
+    foreach ($probeOne in $probePick) {
+        if ((Get-RoomKeyOf 1 $probeOne) -cne (ConvertTo-ExactKey $probeOne)) {
+            throw "카카오톡 1개일 때 열쇠가 예전과 달라졌습니다: '$probeOne'"
+        }
+    }
+
+    # ----- 카카오톡 번호가 껐다 켜도 그대로인지 -----
+    # 예전에는 '실행한 순서'로 번호를 다시 세어서, 재부팅해서 순서가 바뀌면
+    # 저장해 둔 방의 번호가 다른 계정을 가리켰습니다.
+    $probeSavedMap = @($script:config.InstanceMap)
+    try {
+        $script:config.InstanceMap = @(
+            [pscustomobject]@{ Index = 1; Tag = 'C:\KakaoA\KakaoTalk.exe'; Pid = 100 },
+            [pscustomobject]@{ Index = 2; Tag = 'C:\KakaoB\KakaoTalk.exe'; Pid = 200 }
+        )
+        # B 가 먼저 뜨고 실행 번호도 전부 바뀐 상황을 흉내 냅니다.
+        $probeMapRows = @()
+        foreach ($probeOne in @($script:config.InstanceMap)) {
+            $probeMapRows += [pscustomobject]@{ Index = [int]$probeOne.Index; Tag = [string]$probeOne.Tag; Pid = [int]$probeOne.Pid }
+        }
+        $probeTaken = @{}
+        $probeGot = @{}
+        foreach ($probeTag in @('C:\KakaoB\KakaoTalk.exe', 'C:\KakaoA\KakaoTalk.exe')) {
+            $probeIndex = 0
+            foreach ($probeRow in $probeMapRows) {
+                if ($probeRow.Tag -eq $probeTag -and -not $probeTaken.ContainsKey([string]$probeRow.Index)) { $probeIndex = $probeRow.Index; break }
+            }
+            if ($probeIndex -lt 1) { throw "실행 파일 경로로 카카오톡 번호를 이어받지 못합니다: $probeTag" }
+            $probeTaken[[string]$probeIndex] = $true
+            $probeGot[$probeTag] = $probeIndex
+        }
+        if ($probeGot['C:\KakaoA\KakaoTalk.exe'] -ne 1) { throw '재부팅 뒤 A 의 카카오톡 번호가 바뀌었습니다' }
+        if ($probeGot['C:\KakaoB\KakaoTalk.exe'] -ne 2) { throw '재부팅 뒤 B 의 카카오톡 번호가 바뀌었습니다' }
+    } finally { $script:config.InstanceMap = $probeSavedMap }
+
+    # ----- 보낼 방이 어느 카카오톡에 걸쳐 있는지 -----
+    $probePending = New-Object System.Collections.Specialized.OrderedDictionary([System.StringComparer]::Ordinal)
+    $probePending.Add('공지방', $true)
+    $probePending.Add('카카오톡2|거래처', $true)
+    $probePending.Add('카카오톡2|동창회', $true)
+    $probeInstances = @(Get-PendingInstances $probePending)
+    if (($probeInstances -join ',') -ne '1,2') {
+        throw "보낼 방이 걸쳐 있는 카카오톡을 잘못 셌습니다: $($probeInstances -join ',')"
+    }
+
+    # ----- 방 목록 합치기가 다른 카카오톡의 방을 지우지 않는지 -----
+    $probeSavedRoster3 = @($script:config.Roster)
+    try {
+        $script:config.Roster = @()
+        $probeMkRow = {
+            param($n, $i)
+            [pscustomobject]@{ Name = $n; Instance = $i; ListText = $n; Kind = 'group'; Order = 0; Verified = $true; LastSeen = '' }
+        }
+        [void](Merge-RosterScan ([pscustomobject]@{ Rows = @((& $probeMkRow '공지방' 1), (& $probeMkRow '거래처' 1)); Instance = 1; FromOpenTab = $false }) $false)
+        [void](Merge-RosterScan ([pscustomobject]@{ Rows = @((& $probeMkRow '공지방' 2)); Instance = 2; FromOpenTab = $false }) $false)
+        $probeAll = @(Get-Roster)
+        if (@($probeAll | Where-Object { $_.Instance -eq 1 }).Count -ne 2) {
+            throw '다른 카카오톡을 훑었더니 1번 카카오톡의 방이 사라졌습니다'
+        }
+        if (@($probeAll | Where-Object { $_.Name -ceq '공지방' }).Count -ne 2) {
+            throw '이름이 같은 두 계정의 방이 한 칸으로 합쳐졌습니다'
+        }
+        # 이름 확인이 카카오톡 번호를 지우면 안 됩니다.
+        Set-RosterVerified '공지방' 'group' '공지방' 2
+        if (@(Get-Roster | Where-Object { $_.Instance -eq 2 }).Count -ne 1) {
+            throw '이름 확인이 카카오톡 번호를 지웠습니다'
+        }
+    } finally { $script:config.Roster = $probeSavedRoster3 }
     # ④ 저장하고 다시 읽어도 그대로여야 합니다.
     $probeSavedRoster2 = @($script:config.Roster)
     try {
@@ -6735,7 +7383,7 @@ if ($SelfTest) {
         return $null
     }
     function Close-ChatWindow([object]$Window) { }
-    function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool]$CloseWhenDone = $true) {
+    function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool]$CloseWhenDone = $true, [string]$ProgressKey = '') {
         # 사용자가 열어 둔 창을 닫으려 하면 잘못입니다.
         if ((@($script:fakeOpen) -contains $Room) -and $CloseWhenDone) {
             throw "'$Room' 은(는) 사용자가 열어 둔 창인데 닫으려 했습니다"
@@ -6860,7 +7508,7 @@ if ($SelfTest) {
         $script:listPassCalled = $true
         throw '열린 창만으로 끝나야 하는데 목록까지 훑었습니다'
     }
-    function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool]$CloseWhenDone = $true) {
+    function Send-ToChatWindow([object]$Chat, [string]$Room, [object]$Content, [bool]$CloseWhenDone = $true, [string]$ProgressKey = '') {
         if ($CloseWhenDone) { throw "'$Room' 은(는) 사용자가 열어 둔 창인데 닫으려 했습니다" }
         $script:onlyOpenSent = @($script:onlyOpenSent) + $Room
         return $true
@@ -8911,11 +9559,17 @@ $script:roomEntries = New-Object System.Collections.Generic.List[object]
 $script:roomFilter = '전체'
 $script:suppressRoomEvents = $false
 
-function Add-RoomEntry([string]$Name, [string]$Type, [bool]$Checked) {
+# 열쇠(Key)를 주면 그 열쇠로, 안 주면 이름으로 같은 방인지 봅니다.
+# 카카오톡이 여럿이면 이름이 같아도 서로 다른 방이라 열쇠로 가려야 합니다.
+# 예전에는 이름으로만 봐서 두 계정의 같은 이름 방이 한 줄로 합쳐졌고,
+# 화면에서 둘을 따로 고를 방법이 아예 없었습니다.
+function Add-RoomEntry([string]$Name, [string]$Type, [bool]$Checked, [string]$Key = '') {
     $clean = ConvertTo-ExactKey $Name
     if (-not $clean) { return $false }
+    $wantKey = [string]$Key
     foreach ($entry in $script:roomEntries) {
-        if ((Test-NameEquals $entry.Name $clean)) {
+        $same = if ($wantKey) { (Test-NameEquals $entry.Key $wantKey) } else { (Test-NameEquals $entry.Name $clean) }
+        if ($same) {
             # [채팅] 목록에는 오픈채팅방도 함께 들어 있습니다.
             # 그래서 이미 오픈채팅으로 확인된 방을 일반채팅으로 덮어쓰지 않습니다.
             if ($Type -and $Type -ne $script:RoomTypeUnknown) {
@@ -8928,14 +9582,14 @@ function Add-RoomEntry([string]$Name, [string]$Type, [bool]$Checked) {
     }
     $kind = Get-RoomKind $clean
     $verified = $false
-    $instance = 1
-    $found = Find-RosterEntry $clean
+    $instance = if ($wantKey) { Get-InstanceOfKey $wantKey } else { 1 }
+    $found = Find-RosterEntry $(if ($wantKey) { $wantKey } else { $clean })
     if ($null -ne $found) {
         $kind = $found.Kind
         $verified = $found.Verified
         $instance = [int]$found.Instance
     }
-    $script:roomEntries.Add((New-RoomEntry $clean $Type $Checked $kind $verified $instance ''))
+    $script:roomEntries.Add((New-RoomEntry $clean $Type $Checked $kind $verified $instance $wantKey))
     return $true
 }
 # 저장된 채팅방 목록을 화면 목록에 그대로 옮깁니다.
@@ -9007,7 +9661,12 @@ function Update-RoomListView {
         if ($script:roomFilter -eq 'direct' -and $kind -ne 'direct') { continue }
         if ($script:roomFilter -eq 'group' -and $kind -ne 'group') { continue }
         if (-not (Test-RoomMatchesSearch $entry.Name $key)) { continue }
-        $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Name)
+        # 카카오톡이 하나뿐이면 이름만 그대로 보입니다.
+        # 여럿일 때만 앞에 '카카오톡 2 · ' 가 붙어 어느 계정인지 알 수 있습니다.
+        $item = New-Object System.Windows.Forms.ListViewItem((Get-RoomDisplayName $entry.Key))
+        # 화면 글자가 아니라 이 열쇠로 방을 다시 찾습니다.
+        # 글자로 찾으면 두 계정의 같은 이름 방을 구분하지 못합니다.
+        $item.Tag = [string]$entry.Key
         [void]$item.SubItems.Add((Get-RosterKindText $kind))
         [void]$item.SubItems.Add($(if ($entry.Verified) { '확인됨' } else { '화면 글자' }))
         $item.Checked = [bool]$entry.Checked
@@ -9029,8 +9688,8 @@ function Update-RoomListView {
     }
 }
 
-function Get-RoomEntry([string]$Name) {
-    foreach ($entry in $script:roomEntries) { if ((Test-NameEquals $entry.Name $Name)) { return $entry } }
+function Get-RoomEntry([string]$Key) {
+    foreach ($entry in $script:roomEntries) { if ((Test-NameEquals $entry.Key $Key)) { return $entry } }
     return $null
 }
 
@@ -9100,7 +9759,9 @@ function Show-RoomPicker([string]$Title) {
         $list.Items.Clear()
         foreach ($entry in ($script:roomEntries | Sort-Object -Property Name)) {
             if ($query -and ([string]$entry.Name).IndexOf($query, [System.StringComparison]::CurrentCultureIgnoreCase) -lt 0) { continue }
-            $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Name)
+            # 카카오톡이 하나면 이름 그대로, 여럿이면 어느 계정인지 함께 보입니다.
+            $item = New-Object System.Windows.Forms.ListViewItem((Get-RoomDisplayName $entry.Key))
+            $item.Tag = [string]$entry.Key
             [void]$item.SubItems.Add([string]$entry.Type)
             [void]$list.Items.Add($item)
         }
@@ -9117,14 +9778,16 @@ function Show-RoomPicker([string]$Title) {
             [System.Windows.Forms.MessageBox]::Show('목록에서 방을 한 개 골라 주세요.', '선택 필요') | Out-Null
             return
         }
-        $script:pickedRoom = [string]$list.SelectedItems[0].Text
+        # 화면에 보이는 글자가 아니라 열쇠를 돌려줍니다.
+        # 보이는 글자에는 '카카오톡 2 · ' 가 붙어 있어 그대로 쓰면 방을 못 찾습니다.
+        $script:pickedRoom = [string]$list.SelectedItems[0].Tag
         $dialog.DialogResult = 'OK'
         $dialog.Close()
     })
     $btnCancelPick.Add_Click({ $script:pickedRoom = ''; $dialog.DialogResult = 'Cancel'; $dialog.Close() })
     $list.Add_DoubleClick({
         if ($list.SelectedItems.Count -gt 0) {
-            $script:pickedRoom = [string]$list.SelectedItems[0].Text
+            $script:pickedRoom = [string]$list.SelectedItems[0].Tag
             $dialog.DialogResult = 'OK'
             $dialog.Close()
         }
@@ -9277,15 +9940,19 @@ function Request-AutoSave { $autoSaveTimer.Stop(); $autoSaveTimer.Start() }
 
 # 저장된 방 목록 채우기
 # 저장된 채팅방 목록(Roster)이 먼저입니다. 여기에 종류와 이름 확인 여부가 들어 있습니다.
-$selectedSet = @{}
+# 고른 방은 '열쇠'로 적혀 있습니다 (예: '카카오톡2|거래처').
+# 예전에는 이것을 이름으로 찾아서, 2번 카카오톡 방은 켤 때마다 체크가 풀렸습니다.
+$selectedSet = (New-NameMap)
 foreach ($room in @($script:config.Rooms)) { $selectedSet[(ConvertTo-ExactKey ([string]$room))] = $true }
 foreach ($row in (Get-Roster)) {
     $rowType = if ($row.Kind -eq 'open') { $script:RoomTypeOpen } else { $script:RoomTypeNormal }
-    [void](Add-RoomEntry $row.Name $rowType ($selectedSet.ContainsKey($row.Name)))
+    [void](Add-RoomEntry $row.Name $rowType ($selectedSet.ContainsKey($row.Key)) $row.Key)
 }
 # 예전 버전에서 넘어온 방도 빠뜨리지 않고 넣습니다.
-foreach ($room in @(@($script:config.KnownRooms) + @($script:config.Rooms) | ForEach-Object { ConvertTo-ExactKey ([string]$_) } | Where-Object { $_ } | Sort-Object -Unique)) {
-    [void](Add-RoomEntry $room (Get-RoomType $room) ($selectedSet.ContainsKey($room)))
+# 저장된 값은 열쇠이므로, 이름과 번호를 열쇠에서 갈라 냅니다.
+foreach ($roomKey in @(@($script:config.KnownRooms) + @($script:config.Rooms) | ForEach-Object { ConvertTo-ExactKey ([string]$_) } | Where-Object { $_ } | Sort-Object -Unique)) {
+    $roomName = Get-RoomNameOfKey $roomKey
+    [void](Add-RoomEntry $roomName (Get-RoomType $roomName) ($selectedSet.ContainsKey($roomKey)) $roomKey)
 }
 Update-RoomListView
 Update-GroupCombo
@@ -9459,7 +10126,7 @@ $btnPickTestRoom.Add_Click({
 $script:lstRooms.Add_ItemChecked({
     param($sender, $e)
     if ($script:suppressRoomEvents) { return }
-    $entry = Get-RoomEntry ([string]$e.Item.Text)
+    $entry = Get-RoomEntry ([string]$e.Item.Tag)
     if ($null -ne $entry) { $entry.Checked = $e.Item.Checked }
     Update-RoomCountLabel
     Request-AutoSave
@@ -9646,7 +10313,9 @@ $btnGroupNew.Add_Click({
     if (-not $name) { return }
     if ($name -eq '(그룹 없음)') { [System.Windows.Forms.MessageBox]::Show('그 이름은 사용할 수 없습니다.', '새 그룹') | Out-Null; return }
     if ((Get-GroupNames) -contains $name) { [System.Windows.Forms.MessageBox]::Show('같은 이름의 그룹이 이미 있습니다.', '새 그룹') | Out-Null; return }
-    $checked = @($script:roomEntries | Where-Object { $_.Checked } | ForEach-Object { [string]$_.Name })
+    # 그룹에도 이름이 아니라 열쇠를 넣습니다.
+    # 이름만 넣으면 두 계정에 같은 이름 방이 있을 때 둘 다 딸려 들어갑니다.
+    $checked = @($script:roomEntries | Where-Object { $_.Checked } | ForEach-Object { if ($_.Key) { [string]$_.Key } else { [string]$_.Name } })
     Set-GroupRooms $name $checked
     Save-Config $script:config
     Update-GroupCombo
@@ -9657,7 +10326,7 @@ $btnGroupNew.Add_Click({
 $btnGroupAdd.Add_Click({
     $group = Get-SelectedGroupName
     if (-not $group) { [System.Windows.Forms.MessageBox]::Show('먼저 그룹을 고르거나 새로 만들어 주세요.', '그룹에 넣기') | Out-Null; return }
-    $checked = @($script:roomEntries | Where-Object { $_.Checked } | ForEach-Object { [string]$_.Name })
+    $checked = @($script:roomEntries | Where-Object { $_.Checked } | ForEach-Object { if ($_.Key) { [string]$_.Key } else { [string]$_.Name } })
     if ($checked.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('그룹에 넣을 방을 먼저 체크해 주세요.', '그룹에 넣기') | Out-Null; return }
     Set-GroupRooms $group @(@(Get-GroupRooms $group) + $checked)
     Save-Config $script:config
@@ -9668,10 +10337,17 @@ $btnGroupCheck.Add_Click({
     $group = Get-SelectedGroupName
     if (-not $group) { [System.Windows.Forms.MessageBox]::Show('먼저 그룹을 골라 주세요.', '그룹 체크') | Out-Null; return }
     $rooms = @(Get-GroupRooms $group)
-    foreach ($entry in $script:roomEntries) { $entry.Checked = ($rooms -contains $entry.Name) }
+    # 열쇠로 먼저 맞춰 보고, 예전에 이름으로 저장된 그룹도 그대로 통하게 합니다.
+    # 다만 이름으로 맞춘 경우에는 카카오톡이 여럿일 때 같은 이름 방이 함께 켜집니다.
+    foreach ($entry in $script:roomEntries) {
+        $entry.Checked = (($rooms -contains $entry.Key) -or ($rooms -contains $entry.Name))
+    }
     Update-RoomListView
     Sync-ConfigFromForm
-    $missing = @($rooms | Where-Object { $null -eq (Get-RoomEntry $_) })
+    $missing = @($rooms | Where-Object {
+        $one = $_
+        ($null -eq (Get-RoomEntry $one)) -and -not @($script:roomEntries | Where-Object { $_.Name -ceq $one })
+    })
     $message = "그룹 '$group' 의 방 $($rooms.Count)개를 체크했습니다."
     if ($missing.Count -gt 0) { $message += "`r`n`r`n목록에 없는 방 $($missing.Count)개는 건너뛰었습니다." }
     [System.Windows.Forms.MessageBox]::Show($message, '그룹 체크') | Out-Null
@@ -9770,7 +10446,7 @@ $btnPickNormal.Add_Click({ Select-RoomsByKind @('direct', 'group', 'unknown') })
 $btnPickOpen.Add_Click({ Select-RoomsByKind @('open') })
 $btnCheckAll.Add_Click({
     foreach ($item in $script:lstRooms.Items) {
-        $entry = Get-RoomEntry ([string]$item.Text)
+        $entry = Get-RoomEntry ([string]$item.Tag)
         if ($null -ne $entry) { $entry.Checked = $true }
     }
     Update-RoomListView
@@ -9791,22 +10467,33 @@ $btnAddRoom.Add_Click({
 })
 $btnEditRoom.Add_Click({
     if ($script:lstRooms.SelectedItems.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('수정할 항목을 먼저 선택하세요.', '이름 수정') | Out-Null; return }
-    $current = [string]$script:lstRooms.SelectedItems[0].Text
-    $entry = Get-RoomEntry $current
+    # 줄을 되찾을 때는 화면 글자가 아니라 열쇠를 씁니다.
+    # 화면 글자에는 '카카오톡 2 · ' 가 붙어 있어 그대로 쓰면 못 찾습니다.
+    $currentKey = [string]$script:lstRooms.SelectedItems[0].Tag
+    $entry = Get-RoomEntry $currentKey
     if ($null -eq $entry) { return }
+    $current = [string]$entry.Name
     $name = ([string][Microsoft.VisualBasic.Interaction]::InputBox('채팅방 이름을 수정하세요.', '이름 수정', $current)).Trim()
     if ($name -and $name -ne $current) {
-        if ($null -ne (Get-RoomEntry $name)) { [System.Windows.Forms.MessageBox]::Show('같은 이름이 이미 목록에 있습니다.', '이름 수정') | Out-Null; return }
+        # 같은 카카오톡 안에 같은 이름이 있는지만 봅니다.
+        # 다른 계정에 같은 이름이 있는 것은 정상입니다.
+        $newKey = Get-RoomKeyOf ([int]$entry.Instance) $name
+        if ($null -ne (Get-RoomEntry $newKey)) { [System.Windows.Forms.MessageBox]::Show('같은 이름이 이미 목록에 있습니다.', '이름 수정') | Out-Null; return }
+        Rename-RoomInGroups $currentKey $newKey
         Rename-RoomInGroups $current $name
         $entry.Name = $name
+        $entry.Key = $newKey
         Update-RoomListView
         Sync-ConfigFromForm
     }
 })
 $btnDeleteRoom.Add_Click({
     # 체크한 항목을 먼저 쓰고, 체크가 없으면 클릭으로 선택한 줄을 씁니다.
-    $names = @($script:roomEntries | Where-Object { $_.Checked } | ForEach-Object { [string]$_.Name })
-    if ($names.Count -eq 0) { $names = @($script:lstRooms.SelectedItems | ForEach-Object { [string]$_.Text }) }
+    # 방을 찾을 때는 화면 글자가 아니라 열쇠를 씁니다.
+    # 화면 글자에는 '카카오톡 2 · ' 가 붙어 있어 그대로 쓰면 못 찾습니다.
+    $names = @($script:roomEntries | Where-Object { $_.Checked } | ForEach-Object { if ($_.Key) { [string]$_.Key } else { [string]$_.Name } })
+    if ($names.Count -eq 0) { $names = @($script:lstRooms.SelectedItems | ForEach-Object { [string]$_.Tag }) }
+    $names = @($names | Where-Object { $_ })
     if ($names.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("지울 항목을 체크하거나 줄을 클릭해 선택해 주세요.", '삭제할 항목이 없습니다') | Out-Null
         return
@@ -9816,7 +10503,10 @@ $btnDeleteRoom.Add_Click({
     foreach ($name in $names) {
         $entry = Get-RoomEntry $name
         if ($null -ne $entry) { [void]$script:roomEntries.Remove($entry) }
+        # 그룹에는 예전에 이름으로 적힌 것이 남아 있을 수 있어 둘 다 빼 줍니다.
         Remove-RoomFromGroups $name
+        $plainName = Get-RoomNameOfKey $name
+        if ($plainName -cne $name) { Remove-RoomFromGroups $plainName }
     }
     Update-RoomListView
     Sync-ConfigFromForm
@@ -10010,7 +10700,8 @@ $btnScanRooms.Add_Click({
 $btnVerifyRoom.Add_Click({
     try {
         Sync-ConfigFromForm
-        $targets = @($script:roomEntries | Where-Object { $_.Checked } | ForEach-Object { [string]$_.Name })
+        # 체크한 방을 열쇠로 모읍니다. 열쇠에 카카오톡 번호가 들어 있습니다.
+        $targets = @($script:roomEntries | Where-Object { $_.Checked } | ForEach-Object { if ($_.Key) { [string]$_.Key } else { [string]$_.Name } })
         if ($targets.Count -eq 0) { throw '확인할 채팅방을 먼저 체크해 주세요.' }
         if ($targets.Count -gt 60) { throw '한 번에 최대 60개까지만 확인합니다.' }
         $body = "체크한 $($targets.Count)개 방을 하나씩 열어 창 제목으로 이름을 확인합니다." + "`r`n`r`n" +
@@ -10021,11 +10712,43 @@ $btnVerifyRoom.Add_Click({
 
         $script:form.Enabled = $false
         Set-StatusPill '이름 확인 중' 'run'
-        $result = $null
-        try { $result = Invoke-RoomNameVerify $targets ([int]$script:config.ScanPages) }
-        finally {
+        # 카카오톡마다 채팅 목록이 따로 있으므로 계정별로 나눠서 확인합니다.
+        # 예전에는 창 하나만 훑어서 다른 계정 방은 전부 '못 찾음' 이 됐습니다.
+        $verifyGroups = @{}
+        foreach ($one in $targets) {
+            $slot = [string](Get-InstanceOfKey $one)
+            if (-not $verifyGroups.ContainsKey($slot)) { $verifyGroups[$slot] = @() }
+            $verifyGroups[$slot] += (Get-RoomNameOfKey $one)
+        }
+        $verifyConfirmed = @()
+        $verifyRenamed = @()
+        $verifyNotFound = @()
+        $verifySavedPick = $script:selectedKakaoProcessId
+        try {
+            foreach ($slot in (@($verifyGroups.Keys) | Sort-Object { [int]$_ })) {
+                if ($verifyGroups.Count -gt 1) {
+                    if (-not (Enter-KakaoInstance ([int]$slot))) {
+                        Write-RunLog ("카카오톡 {0} 을(를) 찾지 못해 그 계정의 이름 확인은 건너뜁니다." -f $slot)
+                        $verifyNotFound += $verifyGroups[$slot]
+                        continue
+                    }
+                }
+                $one = Invoke-RoomNameVerify $verifyGroups[$slot] ([int]$script:config.ScanPages)
+                if ($null -eq $one) { continue }
+                $verifyConfirmed += @($one.Confirmed)
+                $verifyRenamed += @($one.Renamed)
+                $verifyNotFound += @($one.NotFound)
+            }
+        } finally {
+            $script:selectedKakaoProcessId = $verifySavedPick
+            Clear-OpenRoomCache
             $script:form.Enabled = $true
             $script:form.Activate()
+        }
+        $result = [pscustomobject]@{
+            Confirmed = @($verifyConfirmed)
+            Renamed = @($verifyRenamed)
+            NotFound = @($verifyNotFound)
         }
         Sync-RoomEntriesFromRoster
         Update-RoomListView
@@ -10205,7 +10928,7 @@ function Show-SendConfirm([string]$Action) {
     [void]$list.Columns.Add('종류', 120)
     # 보내기 전 확인 목록도 종류로 묶지 않고 이름 순서로 보여 줍니다.
     foreach ($entry in ($rooms | Sort-Object -Property Name)) {
-        $item = New-Object System.Windows.Forms.ListViewItem([string]$entry.Name)
+        $item = New-Object System.Windows.Forms.ListViewItem((Get-RoomDisplayName $entry.Key))
         [void]$item.SubItems.Add([string]$entry.Type)
         [void]$list.Items.Add($item)
     }
@@ -10498,6 +11221,9 @@ function Start-Schedule([bool]$Confirm = $true) {
     }
 
     $script:armed = $true
+    # 지난번에 세던 횟수가 남아 있으면 다시 걸어도 얼마 못 가 끝나 버립니다.
+    # (5회로 맞춰 두고 3회째에 멈췄다가 다시 켜면 2회만 보내고 끝났습니다)
+    $script:repeatDone = 0
     $script:overlapNoted = $false
     $btnArm.Enabled = $false
     $btnCancelArm.Enabled = $true
@@ -10543,7 +11269,17 @@ function Start-RepeatIfNeeded {
         return
     }
     $minutes = [Math]::Max(1, [int]$script:config.RepeatMinutes)
-    $next = (Get-Date).AddMinutes($minutes)
+    # 다음 시각은 '이번 회차가 끝난 시각' 이 아니라 '원래 예정이던 시각' 에서 셉니다.
+    # 끝난 시각에서 세면 회차에 걸린 시간만큼 매번 뒤로 밀립니다.
+    # (30분마다로 맞춰도 한 회차가 25분 걸리면 실제로는 55분마다가 됩니다)
+    $next = $script:dtSchedule.Value.AddMinutes($minutes)
+    $now = Get-Date
+    if ($next -le $now) {
+        # 회차가 간격보다 오래 걸렸습니다. 이미 지나간 회차는 건너뜁니다.
+        $skipped = 0
+        while ($next -le $now) { $next = $next.AddMinutes($minutes); $skipped++ }
+        Write-RunLog "이번 회차가 간격($($minutes)분)보다 오래 걸려 $skipped 번을 건너뛰고 다음 시각으로 맞췄습니다."
+    }
     $script:dtSchedule.Value = $next
     $script:armed = $true
     $btnArm.Enabled = $false
@@ -10565,6 +11301,9 @@ function Start-BroadcastAsync([string[]]$Targets = $null, [bool]$Resume = $false
     $btnCancelArm.Enabled = $false
     $script:cancelRequested = $false
     $script:pauseRequested = $false
+    # 보내는 동안에는 컴퓨터가 잠들지 않게 붙잡아 둡니다.
+    # 아래 finally 에서 반드시 풀어 줍니다. 풀지 않으면 계속 안 잡니다.
+    try { [NativeKakao]::KeepAwake($true) } catch { }
     Set-StatusPill '실행 중' 'run'
     $pageHost.Enabled = $false
     $sidebar.Enabled = $false
@@ -10596,11 +11335,17 @@ function Start-BroadcastAsync([string[]]$Targets = $null, [bool]$Resume = $false
         $script:running = $false
         $script:pauseRequested = $false
         $script:unattended = $false
+        # 붙잡아 둔 것을 풀어 줍니다. 오류로 끝났어도 반드시 풀립니다.
+        try { [NativeKakao]::KeepAwake($false) } catch { }
         Update-RunButtons
         Update-ResumeButtons
     }
     # 반복 예약을 먼저 걸어 둡니다. 창 때문에 반복이 늦어지면 안 됩니다.
-    if ($ok) { try { Start-RepeatIfNeeded } catch { } }
+    #
+    # 성공했을 때만 다시 걸면, 밤새 돌리다 한 번만 실패해도 예약이 그대로 꺼집니다.
+    # 그 뒤로는 아침까지 한 통도 나가지 않습니다. 실패한 방은 어차피 다음 회차에
+    # 다시 시도하므로, 끝난 까닭과 상관없이 다음 회차를 걸어 둡니다.
+    try { Start-RepeatIfNeeded } catch { }
     # 이제 알립니다. 잘 끝났으면 아무 창도 뜨지 않습니다.
     #
     # 자리를 비운 예약 발송에서는 창을 아예 띄우지 않습니다.
@@ -11303,7 +12048,11 @@ function Show-GuideTour([string]$CaptureDir = '') {
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 $timer.Add_Tick({
-    if (-not $script:armed) { return }
+    # 보내는 중인지를 '예약이 켜져 있는지' 보다 먼저 봅니다.
+    # 발송이 시작되면 중복 실행을 막으려고 예약을 잠시 꺼 두는데,
+    # 예전에는 꺼져 있다는 이유로 아래 전체를 그냥 빠져나갔습니다.
+    # 그래서 회차가 길어져 다음 예약 시각을 넘겨도 아무 말이 없었습니다.
+    #
     # 이미 보내는 중이면 예약 시각이 와도 또 시작하지 않습니다.
     # 카카오톡을 두 군데서 동시에 만지면 엉킵니다.
     if ($script:running) {
@@ -11318,6 +12067,7 @@ $timer.Add_Tick({
         }
         return
     }
+    if (-not $script:armed) { return }
     if ($script:overlapNoted) {
         # 끝났습니다. 건너뛴 회차만큼 다음 시각으로 옮겨 둡니다.
         $script:overlapNoted = $false
